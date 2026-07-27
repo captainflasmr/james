@@ -56,8 +56,24 @@ pub fn main(init: std.process.Init) !void {
                     continue;
                 }
 
+                const was_kill = buf.kill_active;
+                buf.kill_active = false;
+
                 if (key.matches('x', .{ .ctrl = true })) {
                     pending_ctrl_x = true;
+                } else if (key.matches(' ', .{ .ctrl = true }) or key.matches('@', .{ .ctrl = true })) {
+                    buf.setMark();
+                } else if (key.matches('k', .{ .ctrl = true })) {
+                    try buf.killLine(gpa, was_kill);
+                    buf.kill_active = true;
+                } else if (key.matches('w', .{ .ctrl = true })) {
+                    try buf.killRegion(gpa, was_kill);
+                    buf.kill_active = true;
+                } else if (key.matches('w', .{ .alt = true })) {
+                    try buf.copyRegion(gpa, was_kill);
+                    buf.kill_active = true;
+                } else if (key.matches('y', .{ .ctrl = true })) {
+                    try buf.yank(gpa);
                 } else if (key.matches('f', .{ .ctrl = true }) or key.matches(vaxis.Key.right, .{})) {
                     buf.moveRight();
                 } else if (key.matches('b', .{ .ctrl = true }) or key.matches(vaxis.Key.left, .{})) {
@@ -95,9 +111,10 @@ pub fn main(init: std.process.Init) !void {
             row += 1;
         }
 
-        const modeline = try std.fmt.allocPrint(init.arena.allocator(), "-- {s}{s}  L{d}:C{d} --", .{
+        const modeline = try std.fmt.allocPrint(init.arena.allocator(), "-- {s}{s}{s}  L{d}:C{d} --", .{
             path,
             if (buf.dirty) " [modified]" else "",
+            if (buf.mark != null) " [mark set]" else "",
             buf.cursor_row + 1,
             buf.cursor_col + 1,
         });

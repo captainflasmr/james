@@ -41,8 +41,17 @@ separate folder if you're building several at once.
 | `C-d` / Delete | delete forward |
 | Backspace | delete backward |
 | Enter | new line |
+| `C-space` | set mark |
+| `C-k` | kill to end of line (or kill the newline, at end of line) |
+| `C-w` | kill region (point to mark) |
+| `M-w` | copy region, without deleting |
+| `C-y` | yank (insert most recent kill) |
 | `C-x C-s` | save |
 | `C-x C-c` | quit |
+
+Consecutive `C-k`/`C-w`/`M-w` presses append to the same kill instead of
+overwriting it, same as real Emacs — typing or moving the cursor in between
+starts a fresh kill.
 
 ## Architecture
 
@@ -69,26 +78,24 @@ from another shell will always work as a fallback.
 
 ## Roadmap
 
-Roughly in the order I'd build them:
-
-1. **Kill ring + yank** (`C-k`, `C-w`, `M-w`, `C-y`) — needs a `mark` field on
-   `Buffer` (set by `C-space`) so `region` = point↔mark, plus a kill-ring
-   slot. Consecutive `C-k` presses should append to the same kill-ring entry
-   rather than overwriting it, matching real Emacs.
+1. ~~**Kill ring + yank**~~ — done (`C-space`, `C-k`, `C-w`, `M-w`, `C-y`).
+   `Buffer.mark` is a plain snapshot, not a self-adjusting marker, so it can
+   go stale if you edit the buffer between setting mark and using the
+   region — acceptable for now, worth revisiting if it bites you.
 2. **Undo** (`C-x u` or `C-/`) — simplest correct approach for a line-array
    buffer: snapshot the affected lines + cursor before each coalesced edit
    (group consecutive typing into one undo step) and push onto an undo
    stack; restore on undo. A proper diff-based undo log is a later
    optimization, not a v1 requirement.
-3. **Incremental search** (`C-s` / `C-r`) — the most invasive of the three,
-   because it introduces a real "mode": while searching, keystrokes go to
-   the query instead of the buffer, with a prompt on the status line. Worth
-   building this as a small generalized "minibuffer mode" since `M-x` will
-   want the exact same plumbing later.
+3. **Incremental search** (`C-s` / `C-r`) — the most invasive of the
+   remaining items, because it introduces a real "mode": while searching,
+   keystrokes go to the query instead of the buffer, with a prompt on the
+   status line. Worth building this as a small generalized "minibuffer
+   mode" since `M-x` will want the exact same plumbing later.
 4. Unsaved-changes confirmation on `C-x C-c`.
 5. Multiple buffers and `C-x b` to switch.
 6. Config: start with a plain keymap-override file, consider embedded Lua
    later if you want real elisp-like programmability.
 
-Happy to implement any of these next — kill ring and undo are both
-self-contained; incremental search is the one I'd budget the most time for.
+Happy to implement any of these next — undo is self-contained; incremental
+search is the one I'd budget the most time for.

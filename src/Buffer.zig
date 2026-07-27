@@ -8,6 +8,13 @@ cursor_col: usize = 0,
 top_line: usize = 0,
 filename: ?[]const u8 = null,
 dirty: bool = false,
+mark: ?Pos = null,
+kill_ring: std.ArrayList(u8) = .empty,
+/// True if the previous command was a kill, so a fresh kill should append to
+/// kill_ring instead of replacing it (matches Emacs's last-command tracking).
+kill_active: bool = false,
+
+pub const Pos = struct { row: usize, col: usize };
 
 pub fn initEmpty() Buffer {
     return .{ .lines = .empty };
@@ -16,6 +23,7 @@ pub fn initEmpty() Buffer {
 pub fn deinit(self: *Buffer, gpa: std.mem.Allocator) void {
     for (self.lines.items) |*line| line.deinit(gpa);
     self.lines.deinit(gpa);
+    self.kill_ring.deinit(gpa);
     if (self.filename) |f| gpa.free(f);
 }
 
@@ -108,6 +116,114 @@ pub fn deleteForward(self: *Buffer, gpa: std.mem.Allocator) void {
         var removed = self.lines.orderedRemove(self.cursor_row + 1);
         removed.deinit(gpa);
         self.dirty = true;
+    }
+}
+
+pub fn setMark(self: *Buffer) void {
+    self.mark = .{ .row = self.cursor_row, .col = self.cursor_col };
+}
+
+/// Region bounds in document order (start <= end). Null if no mark is set.
+/// Note: mark is a plain (row, col) snapshot, not a self-adjusting marker, so
+/// it can go stale if you edit the buffer between setting it and using it.
+fn orderedRegion(self: Buffer) ?struct { start: Pos, end: Pos } {
+    const m = self.mark orelse return null;
+    const p = Pos{ .row = self.cursor_row, .col = self.cursor_col };
+    if (m.row < p.row or (m.row == p.row and m.col <= p.col)) return .{ .start = m, .end = p };
+    return .{ .start = p, .end = m };
+}
+
+/// Copy of the text between start and end (lines joined with '\n'). Caller owns the result.
+fn extractRange(self: *Buffer, gpa: std.mem.Allocator, start: Pos, end: Pos) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    if (start.row == end.row) {
+        try out.appendSlice(gpa, self.lines.items[start.row].items[start.col..end.col]);
+        return out.toOwnedSlice(gpa);
+    }
+    try out.appendSlice(gpa, self.lines.items[start.row].items[start.col..]);
+    var r = start.row + 1;
+    while (r < end.row) : (r += 1) {
+        try out.append(gpa, '\n');
+        try out.appendSlice(gpa, self.lines.items[r].items);
+    }
+    try out.append(gpa, '\n');
+    try out.appendSlice(gpa, self.lines.items[end.row].items[0..end.col]);
+    return out.toOwnedSlice(gpa);
+}
+
+/// Remove the text between start and end, merging what's left into one line.
+fn deleteRange(self: *Buffer, gpa: std.mem.Allocator, start: Pos, end: Pos) !void {
+    if (start.row == end.row) {
+        try self.lines.items[start.row].replaceRange(gpa, start.col, end.col - start.col, &.{});
+        return;
+    }
+    const tail = try gpa.dupe(u8, self.lines.items[end.row].items[end.col..]);
+    defer gpa.free(tail);
+    self.lines.items[start.row].shrinkRetainingCapacity(start.col);
+    try self.lines.items[start.row].appendSlice(gpa, tail);
+
+    var r = end.row;
+    while (r > start.row) : (r -= 1) {
+        var removed = self.lines.orderedRemove(r);
+        removed.deinit(gpa);
+    }
+}
+
+fn rememberKill(self: *Buffer, gpa: std.mem.Allocator, text: []const u8, append: bool) !void {
+    if (!append) self.kill_ring.clearRetainingCapacity();
+    try self.kill_ring.appendSlice(gpa, text);
+}
+
+/// C-k: kill to end of line, or kill the newline itself when already at end of line.
+pub fn killLine(self: *Buffer, gpa: std.mem.Allocator, append: bool) !void {
+    const row = self.cursor_row;
+    const col = self.cursor_col;
+    if (col < self.lines.items[row].items.len) {
+        const owned = try gpa.dupe(u8, self.lines.items[row].items[col..]);
+        defer gpa.free(owned);
+        self.lines.items[row].shrinkRetainingCapacity(col);
+        try self.rememberKill(gpa, owned, append);
+    } else if (row + 1 < self.lines.items.len) {
+        try self.lines.items[row].appendSlice(gpa, self.lines.items[row + 1].items);
+        var removed = self.lines.orderedRemove(row + 1);
+        removed.deinit(gpa);
+        try self.rememberKill(gpa, "\n", append);
+    } else {
+        return;
+    }
+    self.dirty = true;
+}
+
+/// C-w: kill the region between point and mark.
+pub fn killRegion(self: *Buffer, gpa: std.mem.Allocator, append: bool) !void {
+    const region = self.orderedRegion() orelse return;
+    const text = try self.extractRange(gpa, region.start, region.end);
+    defer gpa.free(text);
+    try self.deleteRange(gpa, region.start, region.end);
+    self.cursor_row = region.start.row;
+    self.cursor_col = region.start.col;
+    self.mark = null;
+    try self.rememberKill(gpa, text, append);
+    self.dirty = true;
+}
+
+/// M-w: copy the region between point and mark without deleting it.
+pub fn copyRegion(self: *Buffer, gpa: std.mem.Allocator, append: bool) !void {
+    const region = self.orderedRegion() orelse return;
+    const text = try self.extractRange(gpa, region.start, region.end);
+    defer gpa.free(text);
+    try self.rememberKill(gpa, text, append);
+}
+
+/// C-y: insert the most recent kill at point.
+pub fn yank(self: *Buffer, gpa: std.mem.Allocator) !void {
+    if (self.kill_ring.items.len == 0) return;
+    var it = std.mem.splitScalar(u8, self.kill_ring.items, '\n');
+    try self.insertSlice(gpa, it.next().?);
+    while (it.next()) |seg| {
+        try self.insertNewline(gpa);
+        try self.insertSlice(gpa, seg);
     }
 }
 
