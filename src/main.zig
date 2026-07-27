@@ -16,7 +16,7 @@ pub fn main(init: std.process.Init) !void {
     defer args_it.deinit();
     _ = args_it.next();
     const path = args_it.next() orelse {
-        std.debug.print("usage: zemacs <file>\n", .{});
+        std.debug.print("usage: james <file>\n", .{});
         return;
     };
 

@@ -1,4 +1,6 @@
-# zemacs
+# james
+
+*Just Another Micro Emacs Subset*
 
 A very minimal, Emacs/MicroEmacs-inspired text editor, written in Zig on top
 of [libvaxis](https://github.com/rockorager/libvaxis). This is a starting
