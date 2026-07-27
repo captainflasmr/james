@@ -98,6 +98,3 @@ from another shell will always work as a fallback.
 5. Multiple buffers and `C-x b` to switch.
 6. Config: start with a plain keymap-override file, consider embedded Lua
    later if you want real elisp-like programmability.
-
-Happy to implement any of these next — undo is self-contained; incremental
-search is the one I'd budget the most time for.
