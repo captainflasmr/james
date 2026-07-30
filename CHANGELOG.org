@@ -1,0 +1,74 @@
+#+title: Change log for james
+#+author: James Dyer
+#+email: captainflasmr@gmail.com
+#+language: en
+#+options: ':t toc:nil author:nil email:nil num:nil title:nil
+#+todo: TODO DOING | DONE
+#+startup: showall
+
+This document contains the release notes for james.
+
+* Versions
+
+** 0.1.0 — <2026-07-27>
+
+Initial release.
+
+- A very minimal, Emacs/MicroEmacs-inspired text editor written in Zig on top of [[https://github.com/rockorager/libvaxis][libvaxis]].
+- Basic cursor movement: =C-f= / =C-b= / =C-n= / =C-p= and arrow keys for right / left / down / up, =C-a= / =C-e= for start / end of line.
+- Editing: =C-d= / Delete deletes forward, Backspace deletes backward, Enter inserts a new line.
+- Save and quit: =C-x C-s= saves, =C-x C-c= quits.
+- Each filename on the command line opens as its own buffer; the first is shown initially. First run fetches libvaxis automatically; =zig build --fetch= pre-fetches dependencies for offline builds.
+- Cross-compiles with no extra toolchains or Docker: confirmed working on =x86_64-windows=, =aarch64-macos=, =x86_64-linux-musl=, and native with =-Doptimize=ReleaseSmall=; binaries land in =zig-out/bin/=.
+- Architecture split: =src/Buffer.zig= holds all text state (lines, cursor, load/save, edit and movement operations) with no knowledge of the terminal or other buffers; =src/main.zig= is the only platform-facing file (terminal setup, event loop, key dispatch, rendering) — the same portability discipline MicroEmacs used in the 1980s.
+- Requires Zig 0.16.0 exactly, pinned in =build.zig.zon=.
+
+** 0.2.0 — <2026-07-27>
+
+Kill ring and yank.
+
+- =C-space= sets the mark; the region between mark and point is shown in reverse video as the cursor moves, and clears on kill, copy, or dropping the mark.
+- =C-k= kills to end of line (or kills the newline at end of line); =C-w= kills the region (point to mark); =M-w= copies the region without deleting; =C-y= yanks the most recent kill.
+- Consecutive =C-k= / =C-w= / =M-w= presses append to the same kill instead of overwriting it, same as real Emacs; typing or moving the cursor starts a fresh kill.
+- The kill ring is shared across all open buffers, so text killed in one file can be yanked into another.
+- =Buffer.mark= is a plain snapshot, not a self-adjusting marker, so it can go stale if the buffer is edited between setting mark and using the region — acceptable for now.
+
+** 0.3.0 — <2026-07-27>
+
+Undo.
+
+- =C-x u= restores whole-buffer snapshots taken before each edit.
+- Coalesces a run of the same kind of edit (a burst of typing, a run of backspaces) into a single undo step, so undoing a word just typed is one keypress, not one per character.
+- Switching to a different kind of edit — or moving the cursor — starts a new undo step.
+- No redo yet: undo is a one-way trip back through history, and it does not (yet) clear the =[modified]= flag even if it lands back on the exact text loaded.
+- Undo history, the mark, cursor position, and the dirty flag are all separate per buffer; only the kill ring is shared.
+
+** 0.4.0 — <2026-07-27>
+
+Incremental search.
+
+- =C-s= / =C-r= for incremental search forward / backward.
+- While searching: typing extends the query, =C-s= / =C-r= again jumps to the next / previous match, Backspace shrinks the query, =C-g= cancels back to the start, and Enter (or any other key) confirms and leaves the cursor at the match.
+- A search with no match shows "Failing I-search" and stops moving the cursor until the query is backspaced back to something that matches.
+- Search never crosses a line boundary and wraps around the buffer when it runs off either end.
+- The =isearch_active= branch at the top of the key-dispatch loop in =main.zig= is the "mode" plumbing — when =M-x= arrives, it will be a second branch of the same shape, not a redesign.
+
+** 0.5.0 — <2026-07-27>
+
+Unsaved-changes confirmation on quit.
+
+- =C-x C-c= asks "Save file ... before exiting?" on the status line when the buffer has unsaved changes: =y= saves and quits, =n= quits without saving, =C-g= (or Escape) cancels the quit and returns to editing.
+- Any other key is ignored while the prompt is up, rather than risk a stray keystroke accidentally choosing for you.
+- A save that fails (disk full, permissions, etc.) is still silently swallowed, same as =C-x C-s= today — worth real error reporting eventually.
+- Known caveat: quitting relies on libvaxis's normal shutdown path, which sends a terminal status query to wake its background input thread; real terminal emulators answer this automatically, but the exit path could not be fully confirmed from inside a sandboxed test harness lacking a real terminal emulator. Closing the terminal window or =C-c= from another shell always works as a fallback.
+
+** 0.6.0 — <2026-07-27>
+
+Multiple buffers.
+
+- =C-x b= and =C-x C-f= both prompt for a filename on the status line and do the same thing: Enter switches to it if already open (matched by exact path, whitespace-trimmed), or loads and opens it fresh otherwise. =C-g= / Escape cancels.
+- A single "open or switch by path" command covers both cases for a minimal editor, where real Emacs splits these (=C-x C-f= opens by path, =C-x b= switches by buffer name with separate completion).
+- When more than one buffer is open, the status line shows =(current/total)= so it's visible at a glance.
+- Every open buffer is its own heap-allocated =Buffer= stored in =main.zig= as =std.ArrayList(*Buffer)= — a list of pointers, not values, so appending (opening a new file) can't invalidate earlier pointers when the list's backing array reallocates.
+- Only the kill ring lives above the buffer list, shared by every buffer, matching real Emacs.
+- No way to close a buffer yet (=C-x k= in real Emacs) — buffers accumulate for the life of the process; a natural next step.
