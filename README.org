@@ -47,6 +47,7 @@ Binaries land in =zig-out/bin/=. Use =-p some/dir= to send each target to a sepa
 | =C-s= / =C-r= | incremental search forward / backward |
 | =C-x u= | undo |
 | =C-x b= / =C-x C-f= | switch to buffer, or open it if it isn't already open |
+| =C-x d= | open directory browser (dired) |
 | =C-x C-s= | save |
 | =C-x C-c= | quit (asks first if there are unsaved changes) |
 
@@ -60,9 +61,12 @@ Undo (=C-x u=) restores whole-buffer snapshots taken before each edit, and coale
 
 =C-x b= and =C-x C-f= both prompt for a filename on the status line and do the same thing: Enter switches to it if it's already open (matched by exact path, whitespace-trimmed), or loads and opens it fresh otherwise — real Emacs splits these (=C-x C-f= opens by path, =C-x b= switches by buffer name, with its own separate completion), but a single "open or switch by path" command covers both cases for a minimal editor. =C-g=/Escape cancels. When more than one buffer is open, the status line shows =(current/total)= so it's visible at a glance. There's no way to close a buffer yet (=C-x k= in real Emacs) — a natural next step.
 
+=C-x d= opens a directory browser (dired) in the editing pane, rooted at the directory of the current buffer's file (or =.= if the buffer has no file). While in dired: =n= / =C-n= / ↓ and =p= / =C-p= / ↑ move the selection, =^= goes straight to the parent directory, Enter descends into a directory or opens the selected file as a buffer (reusing the same open-or-switch path as =C-x b= / =C-x C-f=, so a file already open is switched to rather than loaded twice), and =C-g= / =q= leaves dired and returns to the buffer. Entries are sorted with =..= first, then case-insensitive by name; directories and files are interleaved rather than grouped, directories are shown with a trailing =/=, and hidden (dot) files are listed too. The modeline shows =Dired: <path>= while browsing.
+
 * Architecture
 
 - =src/Buffer.zig= — all text state: lines, cursor, load/save, edit and movement operations. Knows nothing about the terminal, and nothing about any *other* buffer — each open file is a fully independent instance.
+- =src/Dired.zig= — all directory-browser state: the current path, the entry list, the selection, and navigation (open, reload, move, go to parent, choose). Knows nothing about the terminal or about buffers, the same split as =Buffer.zig=.
 - =src/main.zig= — the only platform-facing file: sets up the terminal via vaxis, runs the event loop, maps keys to =Buffer= calls, renders.
 
 Keeping that split matters: it's the same portability discipline MicroEmacs used in the 1980s to run unmodified across CP/M, MS-DOS, VMS and Unix. Everything except =main.zig='s terminal setup should port to any future front end (a different TUI library, or eventually a GUI) unchanged.
@@ -80,4 +84,5 @@ Quitting (=C-x C-c=) relies on libvaxis's normal shutdown path, which sends a te
 3. +*Incremental search*+ — done (=C-s= / =C-r=). Search never crosses a line boundary and wraps around the buffer when it runs off either end. The =isearch_active= branch at the top of the key-dispatch loop in =main.zig= is the "mode" plumbing mentioned above — when =M-x= arrives, it's a second branch of the same shape, not a redesign.
 4. +Unsaved-changes confirmation on =C-x C-c=+ — done. A save that fails (disk full, permissions, etc.) is still silently swallowed either way, same as =C-x C-s= today — worth real error reporting eventually.
 5. +*Multiple buffers*+ — done (=C-x b=, =C-x C-f=). Every open buffer is its own heap-allocated =Buffer=; only the kill ring is shared. No way to close one yet (=C-x k=), so buffers only accumulate for the life of the process — fine for now, worth adding once it's annoying.
-6. Config: start with a plain keymap-override file, consider embedded Lua later if you want real elisp-like programmability.
+6. +*Directory browser (dired)*+ — done (=C-x d=). =src/Dired.zig= holds all directory state with no knowledge of the terminal or of buffers, the same split as =Buffer.zig=; =main.zig= just wires keys and rendering. =n= / =p= move, =^= goes to the parent, Enter opens a file (reusing the =C-x b= / =C-x C-f= open-or-switch path) or descends into a directory, =C-g= / =q= leaves. Entries sort with =..= first then case-insensitive; directories and files are interleaved (not grouped) and directories get a trailing =/=. =Dired.parentOf= doesn't canonicalise — once =dirname= can't go further up a relative path it just accumulates literal =..= components, which the OS resolves fine; it returns null only at the absolute filesystem root.
+7. Config: start with a plain keymap-override file, consider embedded Lua later if you want real elisp-like programmability.

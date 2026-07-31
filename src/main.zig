@@ -1,6 +1,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const Buffer = @import("Buffer.zig");
+const Dired = @import("Dired.zig");
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -112,7 +113,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try openBuffer(gpa, io, &buffers, arg);
     }
     if (buffers.items.len == 0) {
-        std.debug.print("usage: zemacs <file> [file...]\n", .{});
+        std.debug.print("usage: james <file> [file...]\n", .{});
         return;
     }
     var current: usize = 0;
@@ -138,6 +139,11 @@ pub fn main(init: std.process.Init) !void {
 
     var pending_ctrl_x = false;
     var confirming_quit = false;
+
+    // Directory-browser (dired) state.
+    var dired_active = false;
+    var dired: Dired = .{};
+    defer dired.deinit(gpa);
 
     // Switch/open-buffer prompt state (C-x b).
     var switching_buffer = false;
@@ -171,6 +177,26 @@ pub fn main(init: std.process.Init) !void {
                     }
                     // Any other key is ignored — stay in the prompt rather
                     // than risk a stray keystroke saving or discarding work.
+                } else if (dired_active) {
+                    if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
+                        dired_active = false;
+                    } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
+                        dired.moveDown();
+                    } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
+                        dired.moveUp();
+                    } else if (key.matches('^', .{})) {
+                        dired.goUp(gpa, io) catch {};
+                    } else if (key.matches(vaxis.Key.enter, .{})) {
+                        const choice = dired.choose(gpa, io) catch Dired.Choice.none;
+                        switch (choice) {
+                            .navigated, .none => {},
+                            .open_file => |file_path| {
+                                defer gpa.free(file_path);
+                                current = openBuffer(gpa, io, &buffers, file_path) catch current;
+                                dired_active = false;
+                            },
+                        }
+                    }
                 } else if (switching_buffer) {
                     if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                         switching_buffer = false;
@@ -180,7 +206,7 @@ pub fn main(init: std.process.Init) !void {
                         switching_buffer = false;
                         const name = std.mem.trim(u8, switch_query.items, " ");
                         if (name.len > 0) {
-                            current = try openBuffer(gpa, io, &buffers, name);
+                            current = openBuffer(gpa, io, &buffers, name) catch current;
                             kill_active = false;
                         }
                     } else if (key.text) |t| {
@@ -269,6 +295,11 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('b', .{}) or key.matches('f', .{ .ctrl = true })) {
                         switching_buffer = true;
                         switch_query.clearRetainingCapacity();
+                    } else if (key.matches('d', .{})) {
+                        const start = try Dired.startingDir(gpa, buf.filename orelse ".");
+                        defer gpa.free(start);
+                        dired.open(gpa, io, start) catch {};
+                        dired_active = true;
                     }
                 } else {
                     const was_kill = kill_active;
@@ -333,48 +364,74 @@ pub fn main(init: std.process.Init) !void {
         win.clear();
 
         const text_height: usize = if (win.height > 1) win.height - 1 else win.height;
-        buf.scrollToCursor(text_height);
 
-        var row: u16 = 0;
-        var i = buf.top_line;
-        while (i < buf.lines.items.len and row < text_height) : (i += 1) {
-            const h = highlightFor(buf, i, isearch_active, if (isearch_failed) null else isearch_match, isearch_query.items.len);
-            var seg_storage: [3]vaxis.Segment = undefined;
-            const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage);
-            _ = win.print(segs, .{ .row_offset = row });
-            row += 1;
+        if (dired_active) {
+            dired.scrollToSelected(text_height);
+            var name_bufs: [256][300]u8 = undefined;
+            var row: u16 = 0;
+            var i = dired.top;
+            while (i < dired.entries.items.len and row < text_height and row < name_bufs.len) : (i += 1) {
+                const e = dired.entries.items[i];
+                const label = std.fmt.bufPrint(&name_bufs[row], "{s}{s}", .{ e.name, if (e.is_dir) "/" else "" }) catch e.name;
+                const style: vaxis.Style = if (i == dired.selected) highlight_style else .{};
+                _ = win.printSegment(.{ .text = label, .style = style }, .{ .row_offset = row });
+                row += 1;
+            }
+        } else {
+            buf.scrollToCursor(text_height);
+            var row: u16 = 0;
+            var i = buf.top_line;
+            while (i < buf.lines.items.len and row < text_height) : (i += 1) {
+                const h = highlightFor(buf, i, isearch_active, if (isearch_failed) null else isearch_match, isearch_query.items.len);
+                var seg_storage: [3]vaxis.Segment = undefined;
+                const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage);
+                _ = win.print(segs, .{ .row_offset = row });
+                row += 1;
+            }
         }
 
+        // Fixed scratch space for the modeline text: it's redrawn every
+        // frame, so this avoids growing `init.arena` (which lives for the
+        // whole process) by one small allocation per keystroke forever.
+        var modeline_buf: [1024]u8 = undefined;
+        var count_buf: [32]u8 = undefined;
+
         const modeline = if (confirming_quit)
-            try std.fmt.allocPrint(init.arena.allocator(), "Save file {s} before exiting? (y / n / C-g cancels)", .{buf.filename orelse "?"})
+            std.fmt.bufPrint(&modeline_buf, "Save file {s} before exiting? (y / n / C-g cancels)", .{buf.filename orelse "?"}) catch "Save before exiting? (y/n)"
+        else if (dired_active)
+            std.fmt.bufPrint(&modeline_buf, "Dired: {s}   (Enter opens, ^ up, q quits)", .{dired.path.items}) catch "Dired"
         else if (switching_buffer)
-            try std.fmt.allocPrint(init.arena.allocator(), "Switch to buffer (open if new): {s}", .{switch_query.items})
+            std.fmt.bufPrint(&modeline_buf, "Switch to buffer (open if new): {s}", .{switch_query.items}) catch "Switch to buffer: ..."
         else if (isearch_active) blk: {
             const label = if (isearch_failed)
                 (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")
             else
                 (if (isearch_dir == .backward) "I-search backward" else "I-search");
-            break :blk try std.fmt.allocPrint(init.arena.allocator(), "{s}: {s}", .{ label, isearch_query.items });
+            break :blk std.fmt.bufPrint(&modeline_buf, "{s}: {s}", .{ label, isearch_query.items }) catch label;
         } else blk: {
             const buf_count = if (buffers.items.len > 1)
-                try std.fmt.allocPrint(init.arena.allocator(), "  ({d}/{d})", .{ current + 1, buffers.items.len })
+                (std.fmt.bufPrint(&count_buf, "  ({d}/{d})", .{ current + 1, buffers.items.len }) catch "")
             else
                 "";
-            break :blk try std.fmt.allocPrint(init.arena.allocator(), "-- {s}{s}{s}{s}  L{d}:C{d} --", .{
+            break :blk std.fmt.bufPrint(&modeline_buf, "-- {s}{s}{s}{s}  L{d}:C{d} --", .{
                 buf.filename orelse "?",
                 if (buf.dirty) " [modified]" else "",
                 if (buf.mark != null) " [mark set]" else "",
                 buf_count,
                 buf.cursor_row + 1,
                 buf.cursor_col + 1,
-            });
+            }) catch "-- james --";
         };
         _ = win.printSegment(.{ .text = modeline }, .{ .row_offset = win.height -| 1 });
 
-        win.showCursor(
-            @intCast(buf.cursor_col),
-            @intCast(buf.cursor_row - buf.top_line),
-        );
+        if (dired_active) {
+            win.showCursor(0, @intCast(dired.selected - dired.top));
+        } else {
+            win.showCursor(
+                @intCast(buf.cursor_col),
+                @intCast(buf.cursor_row - buf.top_line),
+            );
+        }
 
         try vx.render(tty.writer());
     }

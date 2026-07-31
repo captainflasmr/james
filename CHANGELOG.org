@@ -72,3 +72,14 @@ Multiple buffers.
 - Every open buffer is its own heap-allocated =Buffer= stored in =main.zig= as =std.ArrayList(*Buffer)= — a list of pointers, not values, so appending (opening a new file) can't invalidate earlier pointers when the list's backing array reallocates.
 - Only the kill ring lives above the buffer list, shared by every buffer, matching real Emacs.
 - No way to close a buffer yet (=C-x k= in real Emacs) — buffers accumulate for the life of the process; a natural next step.
+
+** 0.7.0 — <2026-07-31>
+
+Directory browser (dired).
+
+- =C-x d= opens a directory listing in the editing pane, rooted at the directory of the current buffer's file (or =.= if the buffer has no file). It's another "mode branch" at the top of the key-dispatch loop in =main.zig= — the same shape as incremental search, the buffer-switch prompt, and the quit-confirmation, not a redesign.
+- While in dired: =n= / =C-n= / ↓ and =p= / =C-p= / ↑ move the selection, =^= goes straight to the parent directory (the =^= shortcut in real dired), Enter descends into a directory or opens the selected file as a buffer, and =C-g= / =q= leaves dired and returns to the buffer.
+- Opening a file from dired reuses the same open-or-switch path as =C-x b= / =C-x C-f=: if a buffer already visits that exact path it's switched to, otherwise the file is loaded fresh as a new buffer.
+- Entries are sorted with =..= first, then case-insensitive by name; directories and files are interleaved rather than grouped, and directories are shown with a trailing =/=. Hidden (dot) files are listed too.
+- =src/Dired.zig= holds all directory state (path, entries, selection, scroll, navigation) with no knowledge of the terminal or of buffers — the same portability split as =Buffer.zig=; =main.zig= just wires keys and rendering.
+- =Dired.parentOf= doesn't resolve to a canonical absolute path: once a plain =dirname= can't go further up a relative path, further "up" requests just accumulate literal =..= components, which the OS resolves fine. It returns null only at the absolute filesystem root, where there's genuinely nowhere to go.
