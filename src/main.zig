@@ -79,6 +79,38 @@ fn highlightFor(
 
 /// Switch to the buffer visiting `path` if one is already open, otherwise
 /// load it fresh and open it as a new buffer. Returns its index.
+/// Render one buffer's text plus its own compact modeline into `win`, which
+/// may be the whole screen or one pane of a split. Used for split panes,
+/// where there's no room for isearch/mark-set decoration — just enough to
+/// tell panes apart and see where you are.
+fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8) void {
+    const text_height: usize = if (height > 1) height - 1 else height;
+    buf.scrollToCursor(text_height);
+
+    var row: u16 = 0;
+    var i = buf.top_line;
+    while (i < buf.lines.items.len and row < text_height) : (i += 1) {
+        const h = highlightFor(buf, i, false, null, 0);
+        var seg_storage: [3]vaxis.Segment = undefined;
+        const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage);
+        _ = win.print(segs, .{ .row_offset = row_base + row });
+        row += 1;
+    }
+
+    const modeline = std.fmt.bufPrint(modeline_buf, "{s}{s}  L{d}:C{d}", .{
+        buf.filename orelse "?",
+        if (buf.dirty) " [modified]" else "",
+        buf.cursor_row + 1,
+        buf.cursor_col + 1,
+    }) catch "?";
+    const style: vaxis.Style = if (is_focused) highlight_style else .{};
+    _ = win.printSegment(.{ .text = modeline, .style = style }, .{ .row_offset = row_base + (height -| 1) });
+
+    if (is_focused) {
+        win.showCursor(@intCast(buf.cursor_col), @intCast(row_base + buf.cursor_row - buf.top_line));
+    }
+}
+
 fn openBuffer(gpa: std.mem.Allocator, io: std.Io, buffers: *std.ArrayList(*Buffer), path: []const u8) !usize {
     for (buffers.items, 0..) |b, idx| {
         if (b.filename) |f| {
@@ -113,7 +145,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try openBuffer(gpa, io, &buffers, arg);
     }
     if (buffers.items.len == 0) {
-        std.debug.print("usage: james <file> [file...]\n", .{});
+        std.debug.print("usage: zemacs <file> [file...]\n", .{});
         return;
     }
     var current: usize = 0;
@@ -146,6 +178,15 @@ pub fn main(init: std.process.Init) !void {
     defer dired.deinit(gpa);
 
     // Switch/open-buffer prompt state (C-x b).
+    // Split-window state. `windows` holds one buffer index per visible
+    // pane; fewer than 2 entries means "not split", and the screen just
+    // shows `current` full-size as it always has.
+    const SplitDir = enum { horizontal, vertical };
+    var windows: std.ArrayList(usize) = .empty;
+    defer windows.deinit(gpa);
+    var split_dir: SplitDir = .vertical;
+    var focused_window: usize = 0;
+
     var switching_buffer = false;
     var switch_query: std.ArrayList(u8) = .empty;
     defer switch_query.deinit(gpa);
@@ -193,6 +234,7 @@ pub fn main(init: std.process.Init) !void {
                             .open_file => |file_path| {
                                 defer gpa.free(file_path);
                                 current = openBuffer(gpa, io, &buffers, file_path) catch current;
+                                if (focused_window < windows.items.len) windows.items[focused_window] = current;
                                 dired_active = false;
                             },
                         }
@@ -207,6 +249,7 @@ pub fn main(init: std.process.Init) !void {
                         const name = std.mem.trim(u8, switch_query.items, " ");
                         if (name.len > 0) {
                             current = openBuffer(gpa, io, &buffers, name) catch current;
+                            if (focused_window < windows.items.len) windows.items[focused_window] = current;
                             kill_active = false;
                         }
                     } else if (key.text) |t| {
@@ -300,6 +343,30 @@ pub fn main(init: std.process.Init) !void {
                         defer gpa.free(start);
                         dired.open(gpa, io, start) catch {};
                         dired_active = true;
+                    } else if (key.matches('2', .{}) or key.matches('3', .{})) {
+                        if (windows.items.len < 2) {
+                            windows.clearRetainingCapacity();
+                            try windows.append(gpa, current);
+                            try windows.append(gpa, current);
+                            focused_window = 0;
+                            split_dir = if (key.matches('2', .{})) .horizontal else .vertical;
+                        } else {
+                            try windows.append(gpa, current);
+                        }
+                    } else if (key.matches('1', .{})) {
+                        windows.clearRetainingCapacity();
+                    } else if (key.matches('0', .{})) {
+                        if (windows.items.len >= 2) {
+                            _ = windows.orderedRemove(focused_window);
+                            if (focused_window >= windows.items.len) focused_window = windows.items.len -| 1;
+                            current = windows.items[focused_window];
+                            if (windows.items.len < 2) windows.clearRetainingCapacity();
+                        }
+                    } else if (key.matches('o', .{})) {
+                        if (windows.items.len >= 2) {
+                            focused_window = (focused_window + 1) % windows.items.len;
+                            current = windows.items[focused_window];
+                        }
                     }
                 } else {
                     const was_kill = kill_active;
@@ -364,6 +431,35 @@ pub fn main(init: std.process.Init) !void {
         win.clear();
 
         const text_height: usize = if (win.height > 1) win.height - 1 else win.height;
+        const is_modal = confirming_quit or dired_active or switching_buffer or isearch_active;
+
+        if (!is_modal and windows.items.len >= 2) {
+            const n = windows.items.len;
+            var modeline_bufs: [16][300]u8 = undefined;
+            switch (split_dir) {
+                .vertical => {
+                    const gap: u16 = 1;
+                    const usable = if (win.width > gap * (n - 1)) win.width - gap * @as(u16, @intCast(n - 1)) else win.width;
+                    const pane_w = usable / @as(u16, @intCast(n));
+                    for (windows.items, 0..) |buf_idx, pane_idx| {
+                        const x_off: i17 = @intCast(pane_idx * (pane_w + gap));
+                        const w = if (pane_idx == n - 1) win.width -| @as(u16, @intCast(x_off)) else pane_w;
+                        const child = win.child(.{ .x_off = x_off, .y_off = 0, .width = w, .height = win.height });
+                        renderPane(child, buffers.items[buf_idx], pane_idx == focused_window, 0, win.height, &modeline_bufs[pane_idx % 16]);
+                    }
+                },
+                .horizontal => {
+                    const pane_h = win.height / @as(u16, @intCast(n));
+                    for (windows.items, 0..) |buf_idx, pane_idx| {
+                        const y_off: u16 = @intCast(pane_idx * pane_h);
+                        const h = if (pane_idx == n - 1) win.height -| y_off else pane_h;
+                        renderPane(win, buffers.items[buf_idx], pane_idx == focused_window, y_off, h, &modeline_bufs[pane_idx % 16]);
+                    }
+                },
+            }
+            try vx.render(tty.writer());
+            continue;
+        }
 
         if (dired_active) {
             dired.scrollToSelected(text_height);
@@ -420,7 +516,7 @@ pub fn main(init: std.process.Init) !void {
                 buf_count,
                 buf.cursor_row + 1,
                 buf.cursor_col + 1,
-            }) catch "-- james --";
+            }) catch "-- zemacs --";
         };
         _ = win.printSegment(.{ .text = modeline }, .{ .row_offset = win.height -| 1 });
 
