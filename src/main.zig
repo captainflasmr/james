@@ -111,6 +111,116 @@ fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, 
     }
 }
 
+/// How a split pane divides its space. `.horizontal` stacks its children
+/// (divider runs left-to-right); `.vertical` places them side-by-side
+/// (divider runs top-to-bottom).
+const SplitDir = enum { horizontal, vertical };
+
+/// A pane in the window tree. A leaf shows one buffer; a split pane lays
+/// its two children out in `dir`. Splitting always subdivides the focused
+/// leaf, so directions can nest freely (e.g. a vertical split inside a
+/// horizontal one).
+const Pane = struct {
+    dir: SplitDir = .vertical,
+    buf_idx: usize = 0,
+    left: ?*Pane = null,
+    right: ?*Pane = null,
+
+    fn isLeaf(self: *const Pane) bool {
+        return self.left == null and self.right == null;
+    }
+
+    fn leafCount(self: *const Pane) usize {
+        if (self.isLeaf()) return 1;
+        return self.left.?.leafCount() + self.right.?.leafCount();
+    }
+
+    /// Split this leaf pane into two, both showing its buffer. The original
+    /// pane keeps the focus; the new one appears below (`.horizontal`) or to
+    /// the right (`.vertical`), matching Emacs C-x 2 / C-x 3.
+    fn split(self: *Pane, gpa: std.mem.Allocator, dir: SplitDir) !void {
+        if (!self.isLeaf()) return error.AlreadySplit;
+        const left = try gpa.create(Pane);
+        left.* = .{ .buf_idx = self.buf_idx };
+        const right = try gpa.create(Pane);
+        right.* = .{ .buf_idx = self.buf_idx };
+        self.left = left;
+        self.right = right;
+        self.dir = dir;
+        self.buf_idx = 0;
+    }
+
+    /// Free this pane and all of its descendants.
+    fn destroy(self: *Pane, gpa: std.mem.Allocator) void {
+        if (self.isLeaf()) {
+            gpa.destroy(self);
+        } else {
+            self.left.?.destroy(gpa);
+            self.right.?.destroy(gpa);
+            gpa.destroy(self);
+        }
+    }
+
+    /// The parent of `target` in the subtree rooted at `self`, if any.
+    fn findParent(self: *Pane, target: *const Pane) ?*Pane {
+        if (self == target) return null;
+        if (self.isLeaf()) return null;
+        if (self.left.? == target or self.right.? == target) return self;
+        return self.left.?.findParent(target) orelse self.right.?.findParent(target);
+    }
+
+    /// Append the leaves of this subtree to `out` in render order.
+    fn collectLeaves(self: *Pane, out: []*Pane, n: *usize) void {
+        if (self.isLeaf()) {
+            out[n.*] = self;
+            n.* += 1;
+        } else {
+            self.left.?.collectLeaves(out, n);
+            self.right.?.collectLeaves(out, n);
+        }
+    }
+};
+
+const MAX_PANES = 16;
+
+/// Render the pane tree rooted at `pane` into `win`. Each leaf gets a child
+/// window at its computed rect and renders through `renderPane`; the focused
+/// pane is the one showing the cursor. `modeline_bufs` gives every leaf
+/// somewhere scratchy to format its modeline.
+fn renderTree(
+    win: vaxis.Window,
+    pane: *Pane,
+    x_off: i17,
+    y_off: u16,
+    width: u16,
+    height: u16,
+    modeline_bufs: *[MAX_PANES][300]u8,
+    slot: usize,
+    buffers: []*Buffer,
+    focused: *Pane,
+) void {
+    if (pane.isLeaf()) {
+        const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
+        renderPane(child, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES]);
+        return;
+    }
+
+    switch (pane.dir) {
+        .vertical => {
+            const left_w = width / 2;
+            const right_w = width -| (left_w + 1);
+            const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
+            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot * 2, buffers, focused);
+            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot * 2 + 1, buffers, focused);
+        },
+        .horizontal => {
+            const top_h = height / 2;
+            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot * 2, buffers, focused);
+            renderTree(win, pane.right.?, x_off, y_off + top_h, width, height -| top_h, modeline_bufs, slot * 2 + 1, buffers, focused);
+        },
+    }
+}
+
 fn openBuffer(gpa: std.mem.Allocator, io: std.Io, buffers: *std.ArrayList(*Buffer), path: []const u8) !usize {
     for (buffers.items, 0..) |b, idx| {
         if (b.filename) |f| {
@@ -178,14 +288,15 @@ pub fn main(init: std.process.Init) !void {
     defer dired.deinit(gpa);
 
     // Switch/open-buffer prompt state (C-x b).
-    // Split-window state. `windows` holds one buffer index per visible
-    // pane; fewer than 2 entries means "not split", and the screen just
-    // shows `current` full-size as it always has.
-    const SplitDir = enum { horizontal, vertical };
-    var windows: std.ArrayList(usize) = .empty;
-    defer windows.deinit(gpa);
-    var split_dir: SplitDir = .vertical;
-    var focused_window: usize = 0;
+    // Split-window state. `root` is a tree of panes; a leaf shows one
+    // buffer, a split pane lays its two children out side-by-side
+    // (`.vertical`) or stacked (`.horizontal`). `focused` is the currently
+    // selected leaf. With a single pane the screen just shows `current`
+    // full-size as it always has.
+    var root = try gpa.create(Pane);
+    root.* = .{ .buf_idx = current };
+    defer root.destroy(gpa);
+    var focused = root;
 
     var switching_buffer = false;
     var switch_query: std.ArrayList(u8) = .empty;
@@ -234,7 +345,7 @@ pub fn main(init: std.process.Init) !void {
                             .open_file => |file_path| {
                                 defer gpa.free(file_path);
                                 current = openBuffer(gpa, io, &buffers, file_path) catch current;
-                                if (focused_window < windows.items.len) windows.items[focused_window] = current;
+                                focused.buf_idx = current;
                                 dired_active = false;
                             },
                         }
@@ -249,7 +360,7 @@ pub fn main(init: std.process.Init) !void {
                         const name = std.mem.trim(u8, switch_query.items, " ");
                         if (name.len > 0) {
                             current = openBuffer(gpa, io, &buffers, name) catch current;
-                            if (focused_window < windows.items.len) windows.items[focused_window] = current;
+                            focused.buf_idx = current;
                             kill_active = false;
                         }
                     } else if (key.text) |t| {
@@ -344,28 +455,51 @@ pub fn main(init: std.process.Init) !void {
                         dired.open(gpa, io, start) catch {};
                         dired_active = true;
                     } else if (key.matches('2', .{}) or key.matches('3', .{})) {
-                        if (windows.items.len < 2) {
-                            windows.clearRetainingCapacity();
-                            try windows.append(gpa, current);
-                            try windows.append(gpa, current);
-                            focused_window = 0;
-                            split_dir = if (key.matches('2', .{})) .horizontal else .vertical;
-                        } else {
-                            try windows.append(gpa, current);
+                        if (root.leafCount() < MAX_PANES) {
+                            const dir: SplitDir = if (key.matches('2', .{})) .horizontal else .vertical;
+                            try focused.split(gpa, dir);
+                            focused = focused.left.?;
+                            current = focused.buf_idx;
                         }
                     } else if (key.matches('1', .{})) {
-                        windows.clearRetainingCapacity();
+                        if (!root.isLeaf()) {
+                            const keep = focused.buf_idx;
+                            root.left.?.destroy(gpa);
+                            root.right.?.destroy(gpa);
+                            root.left = null;
+                            root.right = null;
+                            root.buf_idx = keep;
+                            focused = root;
+                            current = keep;
+                        }
                     } else if (key.matches('0', .{})) {
-                        if (windows.items.len >= 2) {
-                            _ = windows.orderedRemove(focused_window);
-                            if (focused_window >= windows.items.len) focused_window = windows.items.len -| 1;
-                            current = windows.items[focused_window];
-                            if (windows.items.len < 2) windows.clearRetainingCapacity();
+                        if (!root.isLeaf()) {
+                            const parent = root.findParent(focused) orelse unreachable;
+                            const sib = if (parent.left == focused) parent.right.? else parent.left.?;
+                            const gp = root.findParent(parent);
+                            if (gp) |g| {
+                                if (g.left == parent) g.left = sib else g.right = sib;
+                            } else {
+                                root = sib;
+                            }
+                            gpa.destroy(focused);
+                            gpa.destroy(parent);
+                            focused = sib;
+                            while (!focused.isLeaf()) focused = focused.left.?;
+                            current = focused.buf_idx;
                         }
                     } else if (key.matches('o', .{})) {
-                        if (windows.items.len >= 2) {
-                            focused_window = (focused_window + 1) % windows.items.len;
-                            current = windows.items[focused_window];
+                        if (!root.isLeaf()) {
+                            var leaves: [MAX_PANES]*Pane = undefined;
+                            var n: usize = 0;
+                            root.collectLeaves(&leaves, &n);
+                            for (leaves[0..n], 0..) |leaf, i| {
+                                if (leaf == focused) {
+                                    focused = leaves[(i + 1) % n];
+                                    current = focused.buf_idx;
+                                    break;
+                                }
+                            }
                         }
                     }
                 } else {
@@ -433,30 +567,9 @@ pub fn main(init: std.process.Init) !void {
         const text_height: usize = if (win.height > 1) win.height - 1 else win.height;
         const is_modal = confirming_quit or dired_active or switching_buffer or isearch_active;
 
-        if (!is_modal and windows.items.len >= 2) {
-            const n = windows.items.len;
-            var modeline_bufs: [16][300]u8 = undefined;
-            switch (split_dir) {
-                .vertical => {
-                    const gap: u16 = 1;
-                    const usable = if (win.width > gap * (n - 1)) win.width - gap * @as(u16, @intCast(n - 1)) else win.width;
-                    const pane_w = usable / @as(u16, @intCast(n));
-                    for (windows.items, 0..) |buf_idx, pane_idx| {
-                        const x_off: i17 = @intCast(pane_idx * (pane_w + gap));
-                        const w = if (pane_idx == n - 1) win.width -| @as(u16, @intCast(x_off)) else pane_w;
-                        const child = win.child(.{ .x_off = x_off, .y_off = 0, .width = w, .height = win.height });
-                        renderPane(child, buffers.items[buf_idx], pane_idx == focused_window, 0, win.height, &modeline_bufs[pane_idx % 16]);
-                    }
-                },
-                .horizontal => {
-                    const pane_h = win.height / @as(u16, @intCast(n));
-                    for (windows.items, 0..) |buf_idx, pane_idx| {
-                        const y_off: u16 = @intCast(pane_idx * pane_h);
-                        const h = if (pane_idx == n - 1) win.height -| y_off else pane_h;
-                        renderPane(win, buffers.items[buf_idx], pane_idx == focused_window, y_off, h, &modeline_bufs[pane_idx % 16]);
-                    }
-                },
-            }
+        if (!is_modal and !root.isLeaf()) {
+            var modeline_bufs: [MAX_PANES][300]u8 = undefined;
+            renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, 0, buffers.items, focused);
             try vx.render(tty.writer());
             continue;
         }
