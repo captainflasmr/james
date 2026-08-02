@@ -7,6 +7,9 @@ cursor_row: usize = 0,
 cursor_col: usize = 0,
 top_line: usize = 0,
 filename: ?[]const u8 = null,
+/// Name shown in the modeline for buffers with no real file (e.g. the
+/// home screen), since there's nothing to visit.
+display_name: ?[]const u8 = null,
 dirty: bool = false,
 mark: ?Pos = null,
 undo_stack: std.ArrayList(Snapshot) = .empty,
@@ -34,12 +37,29 @@ pub fn initEmpty() Buffer {
     return .{ .lines = .empty };
 }
 
+/// Build a buffer from static text, splitting on newlines. The text is
+/// copied, so the caller may free its source afterwards. Used for the home
+/// screen, which is a real buffer with no backing file.
+pub fn fromText(gpa: std.mem.Allocator, text: []const u8) !Buffer {
+    var buf = Buffer.initEmpty();
+    errdefer buf.deinit(gpa);
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line_slice| {
+        var line: std.ArrayList(u8) = .empty;
+        try line.appendSlice(gpa, line_slice);
+        try buf.lines.append(gpa, line);
+    }
+    if (buf.lines.items.len == 0) try buf.lines.append(gpa, .empty);
+    return buf;
+}
+
 pub fn deinit(self: *Buffer, gpa: std.mem.Allocator) void {
     for (self.lines.items) |*line| line.deinit(gpa);
     self.lines.deinit(gpa);
     for (self.undo_stack.items) |*snap| snap.deinit(gpa);
     self.undo_stack.deinit(gpa);
     if (self.filename) |f| gpa.free(f);
+    if (self.display_name) |d| gpa.free(d);
 }
 
 /// Load a file from disk into a fresh buffer. If the file does not exist yet,

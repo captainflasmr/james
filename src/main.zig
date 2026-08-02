@@ -98,7 +98,7 @@ fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, 
     }
 
     const modeline = std.fmt.bufPrint(modeline_buf, "{s}{s}  L{d}:C{d}", .{
-        buf.filename orelse "?",
+        buf.display_name orelse buf.filename orelse "?",
         if (buf.dirty) " [modified]" else "",
         buf.cursor_row + 1,
         buf.cursor_col + 1,
@@ -183,10 +183,40 @@ const Pane = struct {
 
 const MAX_PANES = 16;
 
+/// Render one dired listing plus its own compact modeline into `win`, which
+/// may be the whole screen or one pane of a split. Same shape as
+/// `renderPane`, so dired lives inside the current window instead of
+/// taking over the whole screen; when a file is chosen it's simply
+/// replaced by the newly opened buffer.
+fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8) void {
+    const text_height: usize = if (height > 1) height - 1 else height;
+    dired.scrollToSelected(text_height);
+    var name_bufs: [256][300]u8 = undefined;
+    var row: u16 = 0;
+    var i = dired.top;
+    while (i < dired.entries.items.len and row < text_height and row < name_bufs.len) : (i += 1) {
+        const e = dired.entries.items[i];
+        const label = std.fmt.bufPrint(&name_bufs[row], "{s}{s}", .{ e.name, if (e.is_dir) "/" else "" }) catch e.name;
+        const style: vaxis.Style = if (i == dired.selected) highlight_style else .{};
+        _ = win.printSegment(.{ .text = label, .style = style }, .{ .row_offset = row_base + row });
+        row += 1;
+    }
+
+    const modeline = std.fmt.bufPrint(modeline_buf, "Dired: {s}   (Enter opens, ^ up, q quits)", .{dired.path.items}) catch "Dired";
+    const style: vaxis.Style = if (is_focused) highlight_style else .{};
+    _ = win.printSegment(.{ .text = modeline, .style = style }, .{ .row_offset = row_base + (height -| 1) });
+
+    if (is_focused) {
+        win.showCursor(0, @intCast(dired.selected - dired.top));
+    }
+}
+
 /// Render the pane tree rooted at `pane` into `win`. Each leaf gets a child
 /// window at its computed rect and renders through `renderPane`; the focused
 /// pane is the one showing the cursor. `modeline_bufs` gives every leaf
-/// somewhere scratchy to format its modeline.
+/// somewhere scratchy to format its modeline. While dired is open it takes
+/// over the focused pane (via `renderDiredPane`) and every other pane keeps
+/// showing its buffer.
 fn renderTree(
     win: vaxis.Window,
     pane: *Pane,
@@ -198,10 +228,16 @@ fn renderTree(
     slot: usize,
     buffers: []*Buffer,
     focused: *Pane,
+    dired: *Dired,
+    dired_active: bool,
 ) void {
     if (pane.isLeaf()) {
         const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
-        renderPane(child, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES]);
+        if (pane == focused and dired_active) {
+            renderDiredPane(child, dired, true, 0, height, &modeline_bufs[slot % MAX_PANES]);
+        } else {
+            renderPane(child, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES]);
+        }
         return;
     }
 
@@ -210,15 +246,54 @@ fn renderTree(
             const left_w = width / 2;
             const right_w = width -| (left_w + 1);
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
-            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot * 2, buffers, focused);
-            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot * 2 + 1, buffers, focused);
+            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot * 2, buffers, focused, dired, dired_active);
+            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot * 2 + 1, buffers, focused, dired, dired_active);
         },
         .horizontal => {
             const top_h = height / 2;
-            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot * 2, buffers, focused);
-            renderTree(win, pane.right.?, x_off, y_off + top_h, width, height -| top_h, modeline_bufs, slot * 2 + 1, buffers, focused);
+            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot * 2, buffers, focused, dired, dired_active);
+            renderTree(win, pane.right.?, x_off, y_off + top_h, width, height -| top_h, modeline_bufs, slot * 2 + 1, buffers, focused, dired, dired_active);
         },
     }
+}
+
+/// The home screen shown when james starts without any file arguments.
+/// It's a plain buffer (so movement, search and every C-x command work on
+/// it) with no backing file; C-x d / C-x C-f lead somewhere real.
+const welcome_text =
+    \\          ██╗ █████╗ ███╗   ███╗███████╗███████╗
+    \\          ██║██╔══██╗████╗ ████║██╔════╝██╔════╝
+    \\          ██║███████║██╔████╔██║█████╗  ███████╗
+    \\          ██║██╔══██║██║╚██╔╝██║██╔══╝  ╚════██║
+    \\          ██║██║  ██║██║ ╚═╝ ██║███████╗███████║
+    \\          ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚══════╝
+    \\
+    \\  Welcome to james, a minimal Emacs-inspired editor for the terminal.
+    \\
+    \\  No file was given, so this is the home screen. Get to work with:
+    \\
+    \\    C-x d         browse files (dired)
+    \\    C-x C-f       open or create a file
+    \\    C-x b         switch to an open buffer
+    \\
+    \\  The essentials, once you're editing:
+    \\
+    \\    C-s / C-r     incremental search
+    \\    C-x 2 / C-x 3 split the window, C-x o moves to the next one
+    \\    C-space       set the mark; C-w kills the region, C-y yanks
+    \\    C-x u         undo
+    \\    C-x C-s       save
+    \\    C-x C-c       quit
+;
+
+/// Add a fresh buffer containing `welcome_text` to `buffers`. Used only at
+/// startup when no files were given.
+fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer)) !void {
+    const new_buf = try gpa.create(Buffer);
+    errdefer gpa.destroy(new_buf);
+    new_buf.* = try Buffer.fromText(gpa, welcome_text);
+    new_buf.display_name = try gpa.dupe(u8, "*welcome*");
+    try buffers.append(gpa, new_buf);
 }
 
 fn openBuffer(gpa: std.mem.Allocator, io: std.Io, buffers: *std.ArrayList(*Buffer), path: []const u8) !usize {
@@ -255,8 +330,9 @@ pub fn main(init: std.process.Init) !void {
         _ = try openBuffer(gpa, io, &buffers, arg);
     }
     if (buffers.items.len == 0) {
-        std.debug.print("usage: zemacs <file> [file...]\n", .{});
-        return;
+        // No files given: land on the home screen, where C-x d makes it
+        // easy to navigate to something real.
+        try openWelcome(gpa, &buffers);
     }
     var current: usize = 0;
 
@@ -439,7 +515,9 @@ pub fn main(init: std.process.Init) !void {
                     if (key.matches('s', .{ .ctrl = true })) {
                         buf.save(gpa, io) catch {};
                     } else if (key.matches('c', .{ .ctrl = true })) {
-                        if (buf.dirty) {
+                        // Buffers with no backing file (the home screen) are
+                        // scratch space — quitting them never prompts.
+                        if (buf.dirty and buf.filename != null) {
                             confirming_quit = true;
                         } else {
                             return;
@@ -565,38 +643,34 @@ pub fn main(init: std.process.Init) !void {
         win.clear();
 
         const text_height: usize = if (win.height > 1) win.height - 1 else win.height;
-        const is_modal = confirming_quit or dired_active or switching_buffer or isearch_active;
+        // Dired is not modal: it renders inside the focused pane, leaving
+        // any other split panes untouched. Only the prompt-style modes take
+        // over the whole screen.
+        const is_modal = confirming_quit or switching_buffer or isearch_active;
 
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][300]u8 = undefined;
-            renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, 0, buffers.items, focused);
+            renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, 0, buffers.items, focused, &dired, dired_active);
             try vx.render(tty.writer());
             continue;
         }
 
         if (dired_active) {
-            dired.scrollToSelected(text_height);
-            var name_bufs: [256][300]u8 = undefined;
-            var row: u16 = 0;
-            var i = dired.top;
-            while (i < dired.entries.items.len and row < text_height and row < name_bufs.len) : (i += 1) {
-                const e = dired.entries.items[i];
-                const label = std.fmt.bufPrint(&name_bufs[row], "{s}{s}", .{ e.name, if (e.is_dir) "/" else "" }) catch e.name;
-                const style: vaxis.Style = if (i == dired.selected) highlight_style else .{};
-                _ = win.printSegment(.{ .text = label, .style = style }, .{ .row_offset = row });
-                row += 1;
-            }
-        } else {
-            buf.scrollToCursor(text_height);
-            var row: u16 = 0;
-            var i = buf.top_line;
-            while (i < buf.lines.items.len and row < text_height) : (i += 1) {
-                const h = highlightFor(buf, i, isearch_active, if (isearch_failed) null else isearch_match, isearch_query.items.len);
-                var seg_storage: [3]vaxis.Segment = undefined;
-                const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage);
-                _ = win.print(segs, .{ .row_offset = row });
-                row += 1;
-            }
+            var modeline_buf: [1024]u8 = undefined;
+            renderDiredPane(win, &dired, true, 0, win.height, &modeline_buf);
+            try vx.render(tty.writer());
+            continue;
+        }
+
+        buf.scrollToCursor(text_height);
+        var row: u16 = 0;
+        var i = buf.top_line;
+        while (i < buf.lines.items.len and row < text_height) : (i += 1) {
+            const h = highlightFor(buf, i, isearch_active, if (isearch_failed) null else isearch_match, isearch_query.items.len);
+            var seg_storage: [3]vaxis.Segment = undefined;
+            const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage);
+            _ = win.print(segs, .{ .row_offset = row });
+            row += 1;
         }
 
         // Fixed scratch space for the modeline text: it's redrawn every
@@ -607,8 +681,6 @@ pub fn main(init: std.process.Init) !void {
 
         const modeline = if (confirming_quit)
             std.fmt.bufPrint(&modeline_buf, "Save file {s} before exiting? (y / n / C-g cancels)", .{buf.filename orelse "?"}) catch "Save before exiting? (y/n)"
-        else if (dired_active)
-            std.fmt.bufPrint(&modeline_buf, "Dired: {s}   (Enter opens, ^ up, q quits)", .{dired.path.items}) catch "Dired"
         else if (switching_buffer)
             std.fmt.bufPrint(&modeline_buf, "Switch to buffer (open if new): {s}", .{switch_query.items}) catch "Switch to buffer: ..."
         else if (isearch_active) blk: {
@@ -623,7 +695,7 @@ pub fn main(init: std.process.Init) !void {
             else
                 "";
             break :blk std.fmt.bufPrint(&modeline_buf, "-- {s}{s}{s}{s}  L{d}:C{d} --", .{
-                buf.filename orelse "?",
+                buf.display_name orelse buf.filename orelse "?",
                 if (buf.dirty) " [modified]" else "",
                 if (buf.mark != null) " [mark set]" else "",
                 buf_count,
@@ -633,14 +705,10 @@ pub fn main(init: std.process.Init) !void {
         };
         _ = win.printSegment(.{ .text = modeline }, .{ .row_offset = win.height -| 1 });
 
-        if (dired_active) {
-            win.showCursor(0, @intCast(dired.selected - dired.top));
-        } else {
-            win.showCursor(
-                @intCast(buf.cursor_col),
-                @intCast(buf.cursor_row - buf.top_line),
-            );
-        }
+        win.showCursor(
+            @intCast(buf.cursor_col),
+            @intCast(buf.cursor_row - buf.top_line),
+        );
 
         try vx.render(tty.writer());
     }

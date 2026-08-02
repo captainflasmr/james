@@ -15,7 +15,7 @@ A very minimal, Emacs/MicroEmacs-inspired text editor, written in Zig on top of 
 zig build run -- path/to/file.txt [more-files...]
 #+end_src
 
-Every filename given on the command line opens as its own buffer; the first one is shown initially. First run will fetch libvaxis automatically. To fetch dependencies ahead of time (e.g. for an offline build later): =zig build --fetch=.
+Every filename given on the command line opens as its own buffer; the first one is shown initially. With no filenames, james starts on a home screen with a keybinding cheat sheet — =C-x d= from there browses files, or use =C-x C-f= / =C-x b=. First run will fetch libvaxis automatically. To fetch dependencies ahead of time (e.g. for an offline build later): =zig build --fetch=.
 
 * Cross-compiling
 

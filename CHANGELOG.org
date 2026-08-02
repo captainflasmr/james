@@ -10,6 +10,15 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.9.0 — <2026-08-01>
+
+Home screen and file-less startup.
+
+- james now starts without any file arguments: instead of a usage message it opens a home screen — a big block-letter =james= logo, a one-line description, and a keybinding cheat sheet — shown in a file-less buffer named =*welcome*=.
+- The home screen is a real buffer, so movement, search, and every =C-x= command work on it; =C-x d= from there opens dired rooted at the current directory and is the fastest way in.
+- Quitting never asks to save a file-less buffer: =C-x C-c= on =*welcome*= (or any scratch buffer) exits directly, so jotting notes there can't trip the save prompt.
+- =Buffer.fromText= builds a buffer from static text; =Buffer.display_name= gives file-less buffers something to show in the modeline instead of =?=.
+
 ** 0.8.0 — <2026-08-01>
 
 Nested window splits.
@@ -18,6 +27,7 @@ Nested window splits.
 - The split model is a binary tree of panes (the =Pane= struct in =main.zig=) rather than a flat list of buffer indices with one global split direction; each node divides its children either horizontally or vertically and the tree is rendered recursively into child windows.
 - =C-x o= moves focus to the next pane, wrapping around; =C-x 0= deletes the focused pane, giving the space to its sibling; =C-x 1= collapses back to a single pane.
 - Each pane keeps its own buffer; opening a file from =C-x b= / =C-x d= replaces only the focused pane's buffer. Panes draw their own compact modeline, and only the focused one shows the cursor.
+- =C-x d= dired now renders inside the focused pane rather than taking over the whole screen, so any other split panes stay visible while browsing; choosing a file swaps dired for the newly opened buffer and the standard layout is restored.
 - Splits are capped at 16 panes; further split requests are ignored.
 
 ** 0.7.0 — <2026-07-31>
