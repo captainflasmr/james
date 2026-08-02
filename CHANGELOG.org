@@ -10,6 +10,14 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.12.0 — <2026-08-02>
+
+Bookmarks.
+
+- =C-x r m= bookmarks the current file and cursor position under a name; the prompt is prefilled with the file name (like Emacs), and setting an existing name replaces it. =C-x r b= prompts for a name and jumps: the file (or dired) opens and point moves to the recorded position. =C-x r l= (or =C-c o=, the "favorites" key from the Jasspa setup) shows all bookmarks in a picker (n/p move, Enter jumps, q / C-g closes).
+- Bookmarks persist across sessions in =~/.james-bookmarks= (tab-separated =name/path/row/col= lines), saved on every set and on exit, loaded at startup.
+- Dired bookmarks work too: jumping restores the selection to the recorded entry.
+
 ** 0.11.0 — <2026-08-02>
 
 Dired as a buffer.

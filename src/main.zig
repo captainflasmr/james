@@ -498,6 +498,112 @@ fn syncDiredSelection(direds: []?Dired, current: usize, buf: *Buffer) void {
     if (direds[current]) |*d| d.selected = buf.cursor_row;
 }
 
+/// A named (file, position) pair, like an Emacs bookmark. Persisted to
+/// ~/.james-bookmarks as "name<TAB>path<TAB>row<TAB>col" lines.
+const Bookmark = struct {
+    name: []u8,
+    path: []u8,
+    row: usize,
+    col: usize,
+};
+
+/// C-x r m: record the current buffer's file and cursor position under
+/// `name`. Setting a name that already exists replaces it, like Emacs.
+fn bookmarkSet(gpa: std.mem.Allocator, bookmarks: *std.ArrayList(Bookmark), name: []const u8, buf: *Buffer) void {
+    const path = buf.filename orelse return;
+    for (bookmarks.items) |*b| {
+        if (std.mem.eql(u8, b.name, name)) {
+            const new_path = gpa.dupe(u8, path) catch return;
+            gpa.free(b.path);
+            b.path = new_path;
+            b.row = buf.cursor_row;
+            b.col = buf.cursor_col;
+            return;
+        }
+    }
+    const b: Bookmark = .{
+        .name = gpa.dupe(u8, name) catch return,
+        .path = gpa.dupe(u8, path) catch return,
+        .row = buf.cursor_row,
+        .col = buf.cursor_col,
+    };
+    bookmarks.append(gpa, b) catch return;
+}
+
+/// C-x r b / Enter in the bookmark list: open the bookmarked file (or
+/// dired) and move point to the recorded position. Returns the buffer
+/// index, or null if `name` isn't a bookmark.
+fn bookmarkJump(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    buffers: *std.ArrayList(*Buffer),
+    direds: *std.ArrayList(?Dired),
+    bookmarks: []const Bookmark,
+    name: []const u8,
+) ?usize {
+    for (bookmarks) |b| {
+        if (std.mem.eql(u8, b.name, name)) {
+            const idx = openBufferOrDired(gpa, io, buffers, direds, b.path) catch return null;
+            const tgt = buffers.items[idx];
+            if (direds.items[idx]) |*d| {
+                d.selected = @min(b.row, d.entries.items.len -| 1);
+            } else if (tgt.lines.items.len > 0) {
+                tgt.cursor_row = @min(b.row, tgt.lines.items.len - 1);
+                tgt.cursor_col = @min(b.col, tgt.lines.items[tgt.cursor_row].items.len);
+            }
+            return idx;
+        }
+    }
+    return null;
+}
+
+/// Persist bookmarks to ~/.james-bookmarks (tab-separated lines).
+fn saveBookmarks(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map, bookmarks: *const std.ArrayList(Bookmark)) void {
+    const home_raw = env_map.get("HOME") orelse return;
+    const home = gpa.dupe(u8, home_raw) catch return;
+    defer gpa.free(home);
+    const path = std.fs.path.join(gpa, &.{ home, ".james-bookmarks" }) catch return;
+    defer gpa.free(path);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    for (bookmarks.items) |b| {
+        const line = std.fmt.allocPrint(gpa, "{s}\t{s}\t{d}\t{d}\n", .{ b.name, b.path, b.row, b.col }) catch continue;
+        defer gpa.free(line);
+        out.appendSlice(gpa, line) catch return;
+    }
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items }) catch {};
+}
+
+/// Load bookmarks from ~/.james-bookmarks, if it exists.
+fn loadBookmarks(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map, bookmarks: *std.ArrayList(Bookmark)) void {
+    const home_raw = env_map.get("HOME") orelse return;
+    const home = gpa.dupe(u8, home_raw) catch return;
+    defer gpa.free(home);
+    const path = std.fs.path.join(gpa, &.{ home, ".james-bookmarks" }) catch return;
+    defer gpa.free(path);
+
+    const contents = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch return;
+    defer gpa.free(contents);
+
+    var it = std.mem.splitScalar(u8, contents, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const name = fields.next() orelse continue;
+        const fpath = fields.next() orelse continue;
+        const row = fields.next() orelse continue;
+        const col = fields.next() orelse continue;
+        if (name.len == 0) continue;
+        bookmarks.append(gpa, .{
+            .name = gpa.dupe(u8, name) catch continue,
+            .path = gpa.dupe(u8, fpath) catch continue,
+            .row = std.fmt.parseUnsigned(usize, row, 10) catch 0,
+            .col = std.fmt.parseUnsigned(usize, col, 10) catch 0,
+        }) catch continue;
+    }
+}
+
 fn fixupBufIndices(pane: *Pane, removed: usize, len: usize) void {
     if (pane.isLeaf()) {
         if (pane.buf_idx > removed) pane.buf_idx -= 1;
@@ -563,6 +669,7 @@ pub fn main(init: std.process.Init) !void {
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
 
     var pending_ctrl_x = false;
+    var pending_ctrl_x_r = false;
     var pending_ctrl_c = false;
     var confirming_quit = false;
 
@@ -585,6 +692,27 @@ pub fn main(init: std.process.Init) !void {
     var switching_buffer = false;
     var switch_query: std.ArrayList(u8) = .empty;
     defer switch_query.deinit(gpa);
+
+    // Bookmarks (C-x r m / C-x r b / C-x r l), like Emacs: a named
+    // (file, position) pair, persisted to ~/.james-bookmarks. `bookmark_
+    // prompt` is a modal name prompt (set or jump); `bookmark_list` is a
+    // modal picker over all bookmarks.
+    var bookmarks: std.ArrayList(Bookmark) = .empty;
+    defer {
+        for (bookmarks.items) |b| {
+            gpa.free(b.name);
+            gpa.free(b.path);
+        }
+        bookmarks.deinit(gpa);
+    }
+    defer saveBookmarks(gpa, io, init.environ_map, &bookmarks);
+    loadBookmarks(gpa, io, init.environ_map, &bookmarks);
+    var bookmark_prompt: ?enum { set, jump } = null;
+    var bookmark_query: std.ArrayList(u8) = .empty;
+    defer bookmark_query.deinit(gpa);
+    var bookmark_list_active = false;
+    var bookmark_list_selected: usize = 0;
+    var bookmark_list_top: usize = 0;
 
     // Incremental search state.
     var isearch_active = false;
@@ -637,6 +765,13 @@ pub fn main(init: std.process.Init) !void {
                         if (direds.items[current] != null) {
                             current = closeDiredBuffer(gpa, &buffers, &direds, root, focused, current);
                         }
+                    } else if (key.matches('o', .{})) {
+                        // C-c o: open the bookmark picker (the "favorites"
+                        // key from the Jasspa setup — bookmarks are this
+                        // editor's favourites).
+                        bookmark_list_active = true;
+                        bookmark_list_selected = 0;
+                        bookmark_list_top = 0;
                     }
                 } else if (switching_buffer) {
                     if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
@@ -655,6 +790,46 @@ pub fn main(init: std.process.Init) !void {
                         try switch_query.appendSlice(gpa, t);
                     } else {
                         switching_buffer = false;
+                    }
+                } else if (bookmark_prompt) |mode| {
+                    if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        bookmark_prompt = null;
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        if (bookmark_query.items.len > 0) _ = bookmark_query.pop();
+                    } else if (key.matches(vaxis.Key.enter, .{})) {
+                        const name = std.mem.trim(u8, bookmark_query.items, " ");
+                        bookmark_prompt = null;
+                        if (name.len > 0) switch (mode) {
+                            .set => {
+                                bookmarkSet(gpa, &bookmarks, name, buf);
+                                saveBookmarks(gpa, io, init.environ_map, &bookmarks);
+                            },
+                            .jump => if (bookmarkJump(gpa, io, &buffers, &direds, bookmarks.items, name)) |idx| {
+                                current = idx;
+                                focused.buf_idx = idx;
+                            },
+                        };
+                    } else if (key.text) |t| {
+                        try bookmark_query.appendSlice(gpa, t);
+                    } else {
+                        bookmark_prompt = null;
+                    }
+                } else if (bookmark_list_active) {
+                    if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
+                        bookmark_list_active = false;
+                    } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
+                        if (bookmark_list_selected + 1 < bookmarks.items.len) bookmark_list_selected += 1;
+                    } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
+                        if (bookmark_list_selected > 0) bookmark_list_selected -= 1;
+                    } else if (key.matches(vaxis.Key.enter, .{})) {
+                        if (bookmark_list_selected < bookmarks.items.len) {
+                            const name = bookmarks.items[bookmark_list_selected].name;
+                            bookmark_list_active = false;
+                            if (bookmarkJump(gpa, io, &buffers, &direds, bookmarks.items, name)) |idx| {
+                                current = idx;
+                                focused.buf_idx = idx;
+                            }
+                        }
                     }
                 } else if (isearch_active) {
                     if (key.matches('g', .{ .ctrl = true })) {
@@ -747,6 +922,8 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('b', .{}) or key.matches('f', .{ .ctrl = true })) {
                         switching_buffer = true;
                         switch_query.clearRetainingCapacity();
+                    } else if (key.matches('r', .{})) {
+                        pending_ctrl_x_r = true;
                     } else if (key.matches('d', .{}) or key.matches('m', .{})) {
                         // C-x d / C-x m: open (or switch to) a dired buffer
                         // for the current file's directory.
@@ -783,6 +960,25 @@ pub fn main(init: std.process.Init) !void {
                             focused = nf;
                             current = focused.buf_idx;
                         }
+                    }
+                } else if (pending_ctrl_x_r) {
+                    pending_ctrl_x_r = false;
+                    if (key.matches('m', .{})) {
+                        // C-x r m: bookmark the current position. The name
+                        // prompt is prefilled with the file name, like
+                        // Emacs.
+                        bookmark_prompt = .set;
+                        bookmark_query.clearRetainingCapacity();
+                        if (buf.filename) |f| {
+                            bookmark_query.appendSlice(gpa, std.fs.path.basename(f)) catch {};
+                        }
+                    } else if (key.matches('b', .{})) {
+                        bookmark_prompt = .jump;
+                        bookmark_query.clearRetainingCapacity();
+                    } else if (key.matches('l', .{})) {
+                        bookmark_list_active = true;
+                        bookmark_list_selected = 0;
+                        bookmark_list_top = 0;
                     }
                 } else {
                     const was_kill = kill_active;
@@ -958,11 +1154,35 @@ pub fn main(init: std.process.Init) !void {
         // Dired is not modal: it renders inside whichever pane shows the
         // dired buffer, leaving any other split panes untouched. Only the
         // prompt-style modes take over the whole screen.
-        const is_modal = confirming_quit or switching_buffer or isearch_active;
+        const is_modal = confirming_quit or switching_buffer or bookmark_prompt != null or bookmark_list_active or isearch_active;
 
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, 0, buffers.items, direds.items, focused);
+            try vx.render(tty.writer());
+            continue;
+        }
+
+        if (bookmark_list_active) {
+            // The bookmark picker: one name per row, Enter jumps.
+            if (bookmark_list_selected < bookmark_list_top) {
+                bookmark_list_top = bookmark_list_selected;
+            } else if (bookmark_list_selected >= bookmark_list_top + text_height) {
+                bookmark_list_top = bookmark_list_selected - text_height + 1;
+            }
+            var list_row: u16 = 0;
+            var i = bookmark_list_top;
+            while (i < bookmarks.items.len and list_row < text_height) : (i += 1) {
+                const style: vaxis.Style = if (i == bookmark_list_selected) highlight_style else .{};
+                _ = win.printSegment(.{ .text = bookmarks.items[i].name, .style = style }, .{ .row_offset = list_row });
+                list_row += 1;
+            }
+            var list_ml_buf: [2048]u8 = undefined;
+            const list_ml = std.fmt.bufPrint(&list_ml_buf, "Bookmarks ({d}/{d})   (Enter jumps, n/p move, q closes)", .{
+                bookmark_list_selected + 1,
+                bookmarks.items.len,
+            }) catch "Bookmarks";
+            _ = win.printSegment(.{ .text = list_ml, .style = highlight_style }, .{ .row_offset = win.height -| 1 });
             try vx.render(tty.writer());
             continue;
         }
@@ -1001,7 +1221,12 @@ pub fn main(init: std.process.Init) !void {
             std.fmt.bufPrint(&modeline_buf, "Save file {s} before exiting? (y / n / C-g cancels)", .{buf.filename orelse "?"}) catch "Save before exiting? (y/n)"
         else if (switching_buffer)
             std.fmt.bufPrint(&modeline_buf, "Switch to buffer (open if new): {s}", .{switch_query.items}) catch "Switch to buffer: ..."
-        else if (isearch_active) blk: {
+        else if (bookmark_prompt) |mode| blk: {
+            break :blk if (mode == .set)
+                (std.fmt.bufPrint(&modeline_buf, "Bookmark name (C-g cancels): {s}", .{bookmark_query.items}) catch "Bookmark name")
+            else
+                (std.fmt.bufPrint(&modeline_buf, "Jump to bookmark (C-g cancels): {s}", .{bookmark_query.items}) catch "Jump to bookmark");
+        } else if (isearch_active) blk: {
             const label = if (isearch_failed)
                 (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")
             else

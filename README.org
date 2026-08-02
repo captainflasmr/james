@@ -51,6 +51,9 @@ Binaries land in =zig-out/bin/=. Use =-p some/dir= to send each target to a sepa
 | =C-x d= / =C-x m= | open directory browser (dired) |
 | =C-x g= | re-read the file from disk, discarding in-memory changes |
 | =C-x h= | select the whole buffer (mark at start, point at end) |
+| =C-x r m= | bookmark the current position (name prompt, defaults to the file name) |
+| =C-x r b= | jump to a bookmark |
+| =C-x r l= / =C-c o= | list bookmarks (Enter jumps, n/p move, q closes) |
 | =C-c b= | copy the whole buffer to the kill ring |
 | =C-c w= | copy the region and deselect it |
 | =C-c C-k= | close the dired browser |
