@@ -3,6 +3,25 @@ const vaxis = @import("vaxis");
 const Buffer = @import("Buffer.zig");
 const Dired = @import("Dired.zig");
 
+/// Suppress vaxis's std.log output: stderr shares the terminal, so its
+/// startup chatter ("kitty keyboard capability", resize notices, ...)
+/// would otherwise be painted on top of the editor screen.
+pub const std_options: std.Options = .{
+    .logFn = silence,
+};
+
+fn silence(
+    comptime message_level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    _ = message_level;
+    _ = scope;
+    _ = format;
+    _ = args;
+}
+
 const Event = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
@@ -103,8 +122,17 @@ fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, 
         buf.cursor_row + 1,
         buf.cursor_col + 1,
     }) catch "?";
-    const style: vaxis.Style = if (is_focused) highlight_style else .{};
-    _ = win.printSegment(.{ .text = modeline, .style = style }, .{ .row_offset = row_base + (height -| 1) });
+    // The modeline is a bar spanning the pane's full width, like Emacs's
+    // mode line: reverse video when focused, dimmed otherwise. The whole
+    // row (text + spaces) is one segment built in `modeline_buf`, which the
+    // caller keeps alive until after render — vaxis stores grapheme slices,
+    // not copies, so a stack-local fill buffer would dangle and show
+    // garbage once this frame returns.
+    const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true, .reverse = true };
+    const text_w = win.gwidth(modeline);
+    const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
+    if (fill_n > 0) @memset(modeline_buf[modeline.len .. modeline.len + fill_n], ' ');
+    _ = win.printSegment(.{ .text = modeline_buf[0 .. modeline.len + fill_n], .style = style }, .{ .row_offset = row_base + (height -| 1) });
 
     if (is_focused) {
         win.showCursor(@intCast(buf.cursor_col), @intCast(row_base + buf.cursor_row - buf.top_line));
@@ -125,6 +153,9 @@ const Pane = struct {
     buf_idx: usize = 0,
     left: ?*Pane = null,
     right: ?*Pane = null,
+    /// Share of the space given to the left/top child, in 256ths
+    /// (128 = half). Adjusted by the resize bindings (M-C-h / M-C-l / ...).
+    left_frac: u8 = 128,
 
     fn isLeaf(self: *const Pane) bool {
         return self.left == null and self.right == null;
@@ -169,6 +200,25 @@ const Pane = struct {
         return self.left.?.findParent(target) orelse self.right.?.findParent(target);
     }
 
+    /// The nearest ancestor of `target` whose divider runs in `dir`, if any.
+    /// Width-resizing looks for a `.vertical` ancestor, depth-resizing a
+    /// `.horizontal` one.
+    fn nearestDirAncestor(self: *Pane, target: *const Pane, dir: SplitDir) ?*Pane {
+        const parent = self.findParent(target) orelse return null;
+        if (parent.dir == dir) return parent;
+        return self.nearestDirAncestor(parent, dir);
+    }
+
+    /// Move the divider of the nearest matching ancestor by `frac_delta`
+    /// 256ths, so the focused pane's window grows or shrinks.
+    fn resizeDivider(self: *Pane, focused: *const Pane, dir: SplitDir, frac_delta: i16) void {
+        const ancestor = self.nearestDirAncestor(focused, dir) orelse return;
+        const lo: i16 = 16;
+        const hi: i16 = 240;
+        const next: i16 = std.math.clamp(@as(i16, ancestor.left_frac) + frac_delta, lo, hi);
+        ancestor.left_frac = @intCast(next);
+    }
+
     /// Append the leaves of this subtree to `out` in render order.
     fn collectLeaves(self: *Pane, out: []*Pane, n: *usize) void {
         if (self.isLeaf()) {
@@ -182,6 +232,58 @@ const Pane = struct {
 };
 
 const MAX_PANES = 16;
+
+/// C-x 0 / M-q: delete the focused pane, giving its space to the sibling.
+/// Returns the new focused leaf (the sibling's leftmost pane), or null if
+/// there was only one pane. `root` is in/out: it can shrink to a leaf.
+fn deleteFocusedPane(gpa: std.mem.Allocator, root: **Pane, focused: *Pane) ?*Pane {
+    const r = root.*;
+    if (r.isLeaf()) return null;
+    const parent = r.findParent(focused) orelse unreachable;
+    const sib = if (parent.left == focused) parent.right.? else parent.left.?;
+    const gp = r.findParent(parent);
+    if (gp) |g| {
+        if (g.left == parent) g.left = sib else g.right = sib;
+    } else {
+        root.* = sib;
+    }
+    gpa.destroy(focused);
+    gpa.destroy(parent);
+    var leaf = sib;
+    while (!leaf.isLeaf()) leaf = leaf.left.?;
+    return leaf;
+}
+
+/// C-x o / M-n / M-p: the pane `step` places away from `focused` in render
+/// order (wrapping around), or null if there aren't two panes to choose
+/// between.
+fn moveFocus(root: *Pane, focused: *Pane, step: isize) ?*Pane {
+    var leaves: [MAX_PANES]*Pane = undefined;
+    var n: usize = 0;
+    root.collectLeaves(&leaves, &n);
+    if (n < 2) return null;
+    for (leaves[0..n], 0..) |leaf, i| {
+        if (leaf == focused) {
+            const idx: isize = @as(isize, @intCast(i)) + step;
+            return leaves[@intCast(@mod(idx, @as(isize, @intCast(n))))];
+        }
+    }
+    return null;
+}
+
+/// C-x 1 / M-a: collapse the whole tree back to a single pane showing the
+/// focused buffer. Returns the buffer index the single pane should show.
+fn deleteOtherWindows(gpa: std.mem.Allocator, root: *Pane, focused: *Pane) usize {
+    const keep = focused.buf_idx;
+    if (!root.isLeaf()) {
+        root.left.?.destroy(gpa);
+        root.right.?.destroy(gpa);
+        root.left = null;
+        root.right = null;
+        root.buf_idx = keep;
+    }
+    return keep;
+}
 
 /// Render one dired listing plus its own compact modeline into `win`, which
 /// may be the whole screen or one pane of a split. Same shape as
@@ -203,8 +305,11 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
     }
 
     const modeline = std.fmt.bufPrint(modeline_buf, "Dired: {s}   (Enter opens, ^ up, q quits)", .{dired.path.items}) catch "Dired";
-    const style: vaxis.Style = if (is_focused) highlight_style else .{};
-    _ = win.printSegment(.{ .text = modeline, .style = style }, .{ .row_offset = row_base + (height -| 1) });
+    const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true, .reverse = true };
+    const text_w = win.gwidth(modeline);
+    const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
+    if (fill_n > 0) @memset(modeline_buf[modeline.len .. modeline.len + fill_n], ' ');
+    _ = win.printSegment(.{ .text = modeline_buf[0 .. modeline.len + fill_n], .style = style }, .{ .row_offset = row_base + (height -| 1) });
 
     if (is_focused) {
         win.showCursor(0, @intCast(dired.selected - dired.top));
@@ -224,7 +329,7 @@ fn renderTree(
     y_off: u16,
     width: u16,
     height: u16,
-    modeline_bufs: *[MAX_PANES][300]u8,
+    modeline_bufs: *[MAX_PANES][1024]u8,
     slot: usize,
     buffers: []*Buffer,
     focused: *Pane,
@@ -243,14 +348,14 @@ fn renderTree(
 
     switch (pane.dir) {
         .vertical => {
-            const left_w = width / 2;
+            const left_w: u16 = @intCast((@as(u32, width) * pane.left_frac) / 256);
             const right_w = width -| (left_w + 1);
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot * 2, buffers, focused, dired, dired_active);
             renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot * 2 + 1, buffers, focused, dired, dired_active);
         },
         .horizontal => {
-            const top_h = height / 2;
+            const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
             renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot * 2, buffers, focused, dired, dired_active);
             renderTree(win, pane.right.?, x_off, y_off + top_h, width, height -| top_h, modeline_bufs, slot * 2 + 1, buffers, focused, dired, dired_active);
         },
@@ -356,6 +461,7 @@ pub fn main(init: std.process.Init) !void {
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
 
     var pending_ctrl_x = false;
+    var pending_ctrl_c = false;
     var confirming_quit = false;
 
     // Directory-browser (dired) state.
@@ -390,7 +496,15 @@ pub fn main(init: std.process.Init) !void {
     while (true) {
         const event = try loop.nextEvent();
         switch (event) {
-            .winsize => |ws| try vx.resize(gpa, tty.writer(), ws),
+            .winsize => |ws| {
+                // Trust the kernel's ioctl size over the reported one: some
+                // terminals emit a stale "CSI 48;...t" in-band report (e.g.
+                // while the window is still being created), which would
+                // otherwise leave the editor stuck at a fraction of the real
+                // size.
+                const real = tty.getWinsize() catch ws;
+                try vx.resize(gpa, tty.writer(), real);
+            },
             .key_press => |key| {
                 const buf: *Buffer = buffers.items[current];
 
@@ -405,6 +519,18 @@ pub fn main(init: std.process.Init) !void {
                     }
                     // Any other key is ignored — stay in the prompt rather
                     // than risk a stray keystroke saving or discarding work.
+                } else if (pending_ctrl_c) {
+                    pending_ctrl_c = false;
+                    if (key.matches('b', .{})) {
+                        try buf.copyWholeBuffer(gpa, &kill_ring);
+                        kill_active = true;
+                    } else if (key.matches('w', .{})) {
+                        try buf.copyRegion(gpa, &kill_ring, false);
+                        buf.mark = null;
+                        kill_active = true;
+                    } else if (key.matches('k', .{ .ctrl = true })) {
+                        if (dired_active) dired_active = false;
+                    }
                 } else if (dired_active) {
                     if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
                         dired_active = false;
@@ -412,7 +538,7 @@ pub fn main(init: std.process.Init) !void {
                         dired.moveDown();
                     } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
                         dired.moveUp();
-                    } else if (key.matches('^', .{})) {
+                    } else if (key.matches('e', .{ .alt = true }) or key.matches('^', .{})) {
                         dired.goUp(gpa, io) catch {};
                     } else if (key.matches(vaxis.Key.enter, .{})) {
                         const choice = dired.choose(gpa, io) catch Dired.Choice.none;
@@ -527,11 +653,20 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('b', .{}) or key.matches('f', .{ .ctrl = true })) {
                         switching_buffer = true;
                         switch_query.clearRetainingCapacity();
-                    } else if (key.matches('d', .{})) {
+                    } else if (key.matches('d', .{}) or key.matches('m', .{})) {
                         const start = try Dired.startingDir(gpa, buf.filename orelse ".");
                         defer gpa.free(start);
                         dired.open(gpa, io, start) catch {};
                         dired_active = true;
+                    } else if (key.matches('g', .{})) {
+                        buf.reread(gpa, io) catch {};
+                    } else if (key.matches('h', .{})) {
+                        buf.moveBufStart();
+                        buf.setMark();
+                        buf.moveBufEnd();
+                    } else if (key.matches('k', .{ .ctrl = true })) {
+                        try buf.killRegion(gpa, &kill_ring, kill_active);
+                        kill_active = true;
                     } else if (key.matches('2', .{}) or key.matches('3', .{})) {
                         if (root.leafCount() < MAX_PANES) {
                             const dir: SplitDir = if (key.matches('2', .{})) .horizontal else .vertical;
@@ -540,44 +675,17 @@ pub fn main(init: std.process.Init) !void {
                             current = focused.buf_idx;
                         }
                     } else if (key.matches('1', .{})) {
-                        if (!root.isLeaf()) {
-                            const keep = focused.buf_idx;
-                            root.left.?.destroy(gpa);
-                            root.right.?.destroy(gpa);
-                            root.left = null;
-                            root.right = null;
-                            root.buf_idx = keep;
-                            focused = root;
-                            current = keep;
-                        }
+                        current = deleteOtherWindows(gpa, root, focused);
+                        focused = root;
                     } else if (key.matches('0', .{})) {
-                        if (!root.isLeaf()) {
-                            const parent = root.findParent(focused) orelse unreachable;
-                            const sib = if (parent.left == focused) parent.right.? else parent.left.?;
-                            const gp = root.findParent(parent);
-                            if (gp) |g| {
-                                if (g.left == parent) g.left = sib else g.right = sib;
-                            } else {
-                                root = sib;
-                            }
-                            gpa.destroy(focused);
-                            gpa.destroy(parent);
-                            focused = sib;
-                            while (!focused.isLeaf()) focused = focused.left.?;
+                        if (deleteFocusedPane(gpa, &root, focused)) |nf| {
+                            focused = nf;
                             current = focused.buf_idx;
                         }
                     } else if (key.matches('o', .{})) {
-                        if (!root.isLeaf()) {
-                            var leaves: [MAX_PANES]*Pane = undefined;
-                            var n: usize = 0;
-                            root.collectLeaves(&leaves, &n);
-                            for (leaves[0..n], 0..) |leaf, i| {
-                                if (leaf == focused) {
-                                    focused = leaves[(i + 1) % n];
-                                    current = focused.buf_idx;
-                                    break;
-                                }
-                            }
+                        if (moveFocus(root, focused, 1)) |nf| {
+                            focused = nf;
+                            current = focused.buf_idx;
                         }
                     }
                 } else {
@@ -586,6 +694,12 @@ pub fn main(init: std.process.Init) !void {
 
                     if (key.matches('x', .{ .ctrl = true })) {
                         pending_ctrl_x = true;
+                    } else if (key.matches('c', .{ .ctrl = true })) {
+                        pending_ctrl_c = true;
+                    } else if (key.matches('/', .{ .ctrl = true }) or key.matches(0x1F, .{})) {
+                        buf.undo(gpa);
+                    } else if (key.matches(';', .{ .ctrl = true })) {
+                        try buf.toggleComment(gpa);
                     } else if (key.matches('s', .{ .ctrl = true })) {
                         isearch_active = true;
                         isearch_dir = .forward;
@@ -602,6 +716,10 @@ pub fn main(init: std.process.Init) !void {
                         isearch_query.clearRetainingCapacity();
                     } else if (key.matches(' ', .{ .ctrl = true }) or key.matches('@', .{ .ctrl = true })) {
                         buf.setMark();
+                    } else if (key.matches('g', .{ .ctrl = true })) {
+                        // C-g cancels the mark (deselects the region), like
+                        // the quit/cancel key in every prompt mode.
+                        buf.mark = null;
                     } else if (key.matches('k', .{ .ctrl = true })) {
                         try buf.killLine(gpa, &kill_ring, was_kill);
                         kill_active = true;
@@ -629,6 +747,55 @@ pub fn main(init: std.process.Init) !void {
                         try buf.deleteForward(gpa);
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
                         try buf.deleteBackward(gpa);
+                    } else if (key.matches(';', .{ .alt = true }) or key.matches('m', .{ .alt = true })) {
+                        if (root.leafCount() < MAX_PANES) {
+                            const dir: SplitDir = if (key.matches(';', .{ .alt = true })) .vertical else .horizontal;
+                            try focused.split(gpa, dir);
+                            focused = focused.right.?;
+                            current = focused.buf_idx;
+                        }
+                    } else if (key.matches('q', .{ .alt = true })) {
+                        if (deleteFocusedPane(gpa, &root, focused)) |nf| {
+                            focused = nf;
+                            current = focused.buf_idx;
+                        }
+                    } else if (key.matches('a', .{ .alt = true })) {
+                        current = deleteOtherWindows(gpa, root, focused);
+                        focused = root;
+                    } else if (key.matches('e', .{ .alt = true })) {
+                        // M-e: dired-jump — open dired at the current
+                        // file's directory (in dired mode M-e already goes
+                        // up a directory, matching my/dired-jump-or-up).
+                        const start = try Dired.startingDir(gpa, buf.filename orelse ".");
+                        defer gpa.free(start);
+                        dired.open(gpa, io, start) catch {};
+                        dired_active = true;
+                    } else if (key.matches('n', .{ .alt = true })) {
+                        if (moveFocus(root, focused, 1)) |nf| {
+                            focused = nf;
+                            current = focused.buf_idx;
+                        }
+                    } else if (key.matches('p', .{ .alt = true })) {
+                        if (moveFocus(root, focused, -1)) |nf| {
+                            focused = nf;
+                            current = focused.buf_idx;
+                        }
+                    } else if (key.matches('j', .{ .alt = true })) {
+                        buf.moveLines(5);
+                    } else if (key.matches('k', .{ .alt = true })) {
+                        buf.moveLines(-5);
+                    } else if (key.matches('<', .{ .alt = true })) {
+                        buf.moveBufStart();
+                    } else if (key.matches('>', .{ .alt = true })) {
+                        buf.moveBufEnd();
+                    } else if (key.matches('h', .{ .alt = true, .ctrl = true })) {
+                        root.resizeDivider(focused, .vertical, -8);
+                    } else if (key.matches('l', .{ .alt = true, .ctrl = true })) {
+                        root.resizeDivider(focused, .vertical, 8);
+                    } else if (key.matches('k', .{ .alt = true, .ctrl = true })) {
+                        root.resizeDivider(focused, .horizontal, -8);
+                    } else if (key.matches('j', .{ .alt = true, .ctrl = true })) {
+                        root.resizeDivider(focused, .horizontal, 8);
                     } else if (key.matches(vaxis.Key.enter, .{})) {
                         try buf.insertNewline(gpa);
                     } else if (key.text) |t| {
@@ -649,14 +816,14 @@ pub fn main(init: std.process.Init) !void {
         const is_modal = confirming_quit or switching_buffer or isearch_active;
 
         if (!is_modal and !root.isLeaf()) {
-            var modeline_bufs: [MAX_PANES][300]u8 = undefined;
+            var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, 0, buffers.items, focused, &dired, dired_active);
             try vx.render(tty.writer());
             continue;
         }
 
         if (dired_active) {
-            var modeline_buf: [1024]u8 = undefined;
+            var modeline_buf: [2048]u8 = undefined;
             renderDiredPane(win, &dired, true, 0, win.height, &modeline_buf);
             try vx.render(tty.writer());
             continue;
@@ -676,7 +843,7 @@ pub fn main(init: std.process.Init) !void {
         // Fixed scratch space for the modeline text: it's redrawn every
         // frame, so this avoids growing `init.arena` (which lives for the
         // whole process) by one small allocation per keystroke forever.
-        var modeline_buf: [1024]u8 = undefined;
+        var modeline_buf: [2048]u8 = undefined;
         var count_buf: [32]u8 = undefined;
 
         const modeline = if (confirming_quit)
@@ -703,7 +870,13 @@ pub fn main(init: std.process.Init) !void {
                 buf.cursor_col + 1,
             }) catch "-- zemacs --";
         };
-        _ = win.printSegment(.{ .text = modeline }, .{ .row_offset = win.height -| 1 });
+        // Same full-width bar as the pane modelines: the whole row is one
+        // segment in `modeline_buf`, kept alive until after the render.
+        const style: vaxis.Style = highlight_style;
+        const text_w = win.gwidth(modeline);
+        const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
+        if (fill_n > 0) @memset(modeline_buf[modeline.len .. modeline.len + fill_n], ' ');
+        _ = win.printSegment(.{ .text = modeline_buf[0 .. modeline.len + fill_n], .style = style }, .{ .row_offset = win.height -| 1 });
 
         win.showCursor(
             @intCast(buf.cursor_col),

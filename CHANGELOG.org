@@ -10,6 +10,20 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.10.0 — <2026-08-02>
+
+Jasspa MicroEmacs keybindings.
+
+- New bindings mirroring the =meuser.emf= setup, layered on top of the existing Emacs-style ones without rebinding anything: =C-/= undoes (also =C-x u=), =C-;= toggles a line comment (marker guessed from the file extension: =#= for Python/shell/org, =//= otherwise), =C-c b= copies the whole buffer, =C-c w= copies the region and deselects, =C-x C-k= kills the region, =C-x h= selects the whole buffer, =C-x g= re-reads the file from disk, and =C-x m= opens dired (alias of =C-x d=).
+- Window movement aliases: =M-m= and =M-;= split (horizontally / vertically, matching the =C-x 2= / =C-x 3= directions) and switch to the new window, =M-n= / =M-p= move to the next / previous window, =M-q= deletes the current window, =M-a= collapses back to a single window (=C-x 1=).
+- =M-<= / =M->= jump to the beginning / end of the buffer, =M-j= / =M-k= move 5 lines down / up, and =M-e= inside dired goes up a directory (alias of =^=); =C-c C-k= closes dired.
+- =M-e= is now a full =dired-jump-or-up=: in dired it goes up a directory, and in a file buffer it opens dired rooted at that file's directory (matching the =my/dired-jump-or-up= binding in the Emacs config).
+- Window resizing: =M-C-h= / =M-C-l= shrink / enlarge the focused window's width, =M-C-k= / =M-C-j= its depth. Splits now carry a divider ratio (256ths) instead of always halving, and resize the nearest matching divider. Alt+Ctrl chords need a terminal that speaks the kitty keyboard protocol; elsewhere they simply don't fire.
+- New =Buffer= methods behind it all: =moveBufStart= / =moveBufEnd= / =moveLines= / =toggleComment= / =copyWholeBuffer= / =reread=.
+- =C-g= now also deselects a marked region: in the prompt modes it already cancels (quit confirmation, dired, buffer switch, search), and in normal editing it drops the mark so the reverse-video region highlight clears.
+- The modeline is now a bar spanning the full window width, like Emacs's mode line: reverse video in the current window, dimmed reverse in the others, in splits and in the single-window view alike. (The bar is one segment built in a buffer that outlives the frame — vaxis stores grapheme slices, not copies, so an earlier stack-local fill buffer rendered garbage at the pane edge. The unfocused bars are dimmed /and/ reversed so they stay visible on terminals that ignore =dim= alone.)
+- vaxis's own =std.log= output (the "(vaxis): kitty keyboard capability" startup notices) is suppressed via =std_options= — stderr shares the terminal, so that chatter used to be painted on the editor screen.
+
 ** 0.9.0 — <2026-08-01>
 
 Home screen and file-less startup.

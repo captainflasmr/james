@@ -89,6 +89,20 @@ pub fn loadFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Buffer {
     return buf;
 }
 
+/// C-x g: discard the in-memory state and reload the file from disk,
+/// exactly as if the buffer had just been visited. A file that has since
+/// disappeared reverts to a single empty line, like visiting a new file.
+pub fn reread(self: *Buffer, gpa: std.mem.Allocator, io: std.Io) !void {
+    const path = self.filename orelse return error.NoFilename;
+    const fresh = try loadFile(gpa, io, path);
+    for (self.lines.items) |*line| line.deinit(gpa);
+    self.lines.deinit(gpa);
+    if (self.filename) |f| gpa.free(f);
+    for (self.undo_stack.items) |*snap| snap.deinit(gpa);
+    self.undo_stack.deinit(gpa);
+    self.* = fresh;
+}
+
 pub fn save(self: *Buffer, gpa: std.mem.Allocator, io: std.Io) !void {
     const path = self.filename orelse return error.NoFilename;
     var out: std.ArrayList(u8) = .empty;
@@ -312,6 +326,18 @@ pub fn copyRegion(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *std.ArrayLi
     try rememberKill(gpa, kill_ring, text, append);
 }
 
+/// C-c b: copy the whole buffer to the kill ring, leaving point where it
+/// is (and no mark set).
+pub fn copyWholeBuffer(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *std.ArrayList(u8)) !void {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (self.lines.items, 0..) |line, i| {
+        try out.appendSlice(gpa, line.items);
+        if (i != self.lines.items.len - 1) try out.append(gpa, '\n');
+    }
+    try rememberKill(gpa, kill_ring, out.items, false);
+}
+
 /// C-y: insert the most recent kill at point.
 pub fn yank(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *std.ArrayList(u8)) !void {
     if (kill_ring.items.len == 0) return;
@@ -322,6 +348,33 @@ pub fn yank(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *std.ArrayList(u8)
         try self.insertNewlineRaw(gpa);
         try self.insertSliceRaw(gpa, seg);
     }
+}
+
+/// C-;: comment (or uncomment) the current line by prefixing it with the
+/// comment marker guessed from the file's extension. Point doesn't move.
+pub fn toggleComment(self: *Buffer, gpa: std.mem.Allocator) !void {
+    try self.recordUndo(gpa, .typing);
+    const row = self.cursor_row;
+    const line = &self.lines.items[row];
+    const prefix = self.commentPrefix();
+    if (line.items.len >= prefix.len and std.mem.eql(u8, line.items[0..prefix.len], prefix)) {
+        line.replaceRange(gpa, 0, prefix.len, &.{}) catch {};
+        self.dirty = true;
+    } else {
+        line.insertSlice(gpa, 0, prefix) catch {};
+        self.dirty = true;
+    }
+}
+
+/// The comment marker for the buffer's file, guessed from the extension;
+/// defaults to =// = since most source files use it.
+fn commentPrefix(self: *const Buffer) []const u8 {
+    const name = self.filename orelse return "// ";
+    const hash: []const []const u8 = &.{ ".py", ".sh", ".rb", ".pl", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".org" };
+    for (hash) |ext| {
+        if (std.mem.endsWith(u8, name, ext)) return "# ";
+    }
+    return "// ";
 }
 
 fn clampCol(self: *Buffer) void {
@@ -368,6 +421,29 @@ pub fn moveLineStart(self: *Buffer) void {
 
 pub fn moveLineEnd(self: *Buffer) void {
     self.cursor_col = self.lines.items[self.cursor_row].items.len;
+}
+
+/// M-<: jump to the very start of the buffer.
+pub fn moveBufStart(self: *Buffer) void {
+    self.cursor_row = 0;
+    self.cursor_col = 0;
+}
+
+/// M->: jump to the very end of the buffer.
+pub fn moveBufEnd(self: *Buffer) void {
+    if (self.lines.items.len == 0) return;
+    self.cursor_row = self.lines.items.len - 1;
+    self.cursor_col = self.lines.items[self.cursor_row].items.len;
+}
+
+/// M-j / M-k: move the cursor `delta` lines (positive down, negative up),
+/// clamped to the buffer.
+pub fn moveLines(self: *Buffer, delta: isize) void {
+    if (self.lines.items.len == 0) return;
+    const target: isize = @as(isize, @intCast(self.cursor_row)) + delta;
+    const last: isize = @intCast(self.lines.items.len - 1);
+    self.cursor_row = @intCast(std.math.clamp(target, 0, last));
+    self.clampCol();
 }
 
 /// Keep the cursor row within [top_line, top_line + height) by adjusting top_line.

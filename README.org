@@ -45,11 +45,39 @@ Binaries land in =zig-out/bin/=. Use =-p some/dir= to send each target to a sepa
 | =M-w= | copy region, without deleting |
 | =C-y= | yank (insert most recent kill) |
 | =C-s= / =C-r= | incremental search forward / backward |
-| =C-x u= | undo |
+| =C-/= (or =C-x u=) | undo |
+| =C-;= | comment / uncomment the current line (marker guessed from the file extension) |
 | =C-x b= / =C-x C-f= | switch to buffer, or open it if it isn't already open |
-| =C-x d= | open directory browser (dired) |
+| =C-x d= / =C-x m= | open directory browser (dired) |
+| =C-x g= | re-read the file from disk, discarding in-memory changes |
+| =C-x h= | select the whole buffer (mark at start, point at end) |
+| =C-c b= | copy the whole buffer to the kill ring |
+| =C-c w= | copy the region and deselect it |
+| =C-c C-k= | close the dired browser |
 | =C-x C-s= | save |
 | =C-x C-c= | quit (asks first if there are unsaved changes) |
+
+Window keys (mostly aliases of the =C-x= window commands, plus a few extras):
+
+| Keys | Action |
+|---+---|
+| =C-x 2= / =M-m= | split horizontally (stacked) — =M-m= also moves to the new window |
+| =C-x 3= / =M-;= | split vertically (side-by-side) — =M-;= also moves to the new window |
+| =C-x o= / =M-n= | move to the next window |
+| =M-p= | move to the previous window |
+| =C-x 0= / =M-q= | delete the current window |
+| =C-x 1= / =M-a= | collapse back to a single window |
+| =M-C-h= / =M-C-l= | shrink / enlarge the current window's width |
+| =M-C-k= / =M-C-j= | shrink / enlarge the current window's depth |
+| =M-e= | in a file: open dired at the file's directory; in dired: go up a directory |
+
+Buffer keys:
+
+| Keys | Action |
+|---+---|
+| =M-<= / =M->= | beginning / end of buffer |
+| =M-j= / =M-k= | 5 lines down / up |
+| =C-x C-k= | kill region (alias of =C-w=) |
 
 While searching: type to extend the query, =C-s=/=C-r= again jumps to the next/previous match, Backspace shrinks the query, =C-g= cancels back to where you started, and Enter (or any other key) confirms and leaves the cursor at the match. A search with no match shows "Failing I-search" and stops moving the cursor until you backspace back to something that matches.
 
@@ -61,7 +89,9 @@ Undo (=C-x u=) restores whole-buffer snapshots taken before each edit, and coale
 
 =C-x b= and =C-x C-f= both prompt for a filename on the status line and do the same thing: Enter switches to it if it's already open (matched by exact path, whitespace-trimmed), or loads and opens it fresh otherwise — real Emacs splits these (=C-x C-f= opens by path, =C-x b= switches by buffer name, with its own separate completion), but a single "open or switch by path" command covers both cases for a minimal editor. =C-g=/Escape cancels. When more than one buffer is open, the status line shows =(current/total)= so it's visible at a glance. There's no way to close a buffer yet (=C-x k= in real Emacs) — a natural next step.
 
-=C-x d= opens a directory browser (dired) in the editing pane, rooted at the directory of the current buffer's file (or =.= if the buffer has no file). While in dired: =n= / =C-n= / ↓ and =p= / =C-p= / ↑ move the selection, =^= goes straight to the parent directory, Enter descends into a directory or opens the selected file as a buffer (reusing the same open-or-switch path as =C-x b= / =C-x C-f=, so a file already open is switched to rather than loaded twice), and =C-g= / =q= leaves dired and returns to the buffer. Entries are sorted with =..= first, then case-insensitive by name; directories and files are interleaved rather than grouped, directories are shown with a trailing =/=, and hidden (dot) files are listed too. The modeline shows =Dired: <path>= while browsing.
+=C-x d= opens a directory browser (dired) in the editing pane, rooted at the directory of the current buffer's file (or =.= if the buffer has no file). While in dired: =n= / =C-n= / ↓ and =p= / =C-p= / ↑ move the selection, =^= / =M-e= goes straight to the parent directory, Enter descends into a directory or opens the selected file as a buffer (reusing the same open-or-switch path as =C-x b= / =C-x C-f=, so a file already open is switched to rather than loaded twice), and =C-g= / =q= / =C-c C-k= leaves dired and returns to the buffer. Entries are sorted with =..= first, then case-insensitive by name; directories and files are interleaved rather than grouped, directories are shown with a trailing =/=, and hidden (dot) files are listed too. The modeline shows =Dired: <path>= while browsing.
+
+The modeline is a bar that spans the full width of its window, like Emacs's mode line: reverse video in the current window and dimmed in the others, whether split or single-window.
 
 * Architecture
 
