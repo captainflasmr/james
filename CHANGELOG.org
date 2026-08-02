@@ -10,6 +10,17 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.11.0 — <2026-08-02>
+
+Dired as a buffer.
+
+- Dired is no longer a modal directory/file picker: a dired is an ordinary buffer, the default Emacs way. Each directory browsed is its own buffer (its =filename= is the directory path), so several can be open at once, they appear in the =(current/total)= count, =C-x b= switches to them by path (and a directory path typed into the prompt opens a fresh dired), and =C-x o= moves between windows freely — dired never blocks anything.
+- Descending into a directory (=Enter= / =f=) opens a new dired buffer for it and the previous one stays open; =^= / =M-e= switches to the parent's dired buffer if one exists, else opens it. Opening a file shows it in the window and leaves the dired buffer open.
+- =q= / =C-g= / =C-c C-k= close the current dired buffer (the window then shows the buffer that took its place), like Emacs's =dired-kill-buffer=.
+- Dired buffers are read-only: typing and editing keys are ignored, while every =C-x= / =C-s= / =C-g= command still works on them. =Dired.choose= now just reports a path instead of mutating itself, so the buffer model lives entirely in =main.zig=.
+- Fixed a crash opening a file from dired with Enter or =f=: the read-only guard was evaluated after the open had already switched =current= mid-keypress, so the same key fell through into the editing dispatch against the stale zero-line dired buffer (=insertNewline= indexed out of bounds). The guard is now captured before the dired keys run.
+- Incremental search works in dired: the listing is mirrored into the dired buffer's lines (names, with =/= for directories), so =C-s= / =C-r= search the file names with the usual highlight and =I-search= prompt, the selection follows the match, and Enter after confirming opens the found file. Prompt modes (isearch, buffer switch, quit confirm) now render a dired through the normal buffer renderer, which also makes the =C-x b= prompt visible on a dired instead of being hidden behind the dired modeline.
+
 ** 0.10.0 — <2026-08-02>
 
 Jasspa MicroEmacs keybindings.
@@ -18,6 +29,7 @@ Jasspa MicroEmacs keybindings.
 - Window movement aliases: =M-m= and =M-;= split (horizontally / vertically, matching the =C-x 2= / =C-x 3= directions) and switch to the new window, =M-n= / =M-p= move to the next / previous window, =M-q= deletes the current window, =M-a= collapses back to a single window (=C-x 1=).
 - =M-<= / =M->= jump to the beginning / end of the buffer, =M-j= / =M-k= move 5 lines down / up, and =M-e= inside dired goes up a directory (alias of =^=); =C-c C-k= closes dired.
 - =M-e= is now a full =dired-jump-or-up=: in dired it goes up a directory, and in a file buffer it opens dired rooted at that file's directory (matching the =my/dired-jump-or-up= binding in the Emacs config).
+- In dired, =f= now opens the selected entry (the =dirlst-find-file= key from the Jasspa setup), the same as Enter.
 - Window resizing: =M-C-h= / =M-C-l= shrink / enlarge the focused window's width, =M-C-k= / =M-C-j= its depth. Splits now carry a divider ratio (256ths) instead of always halving, and resize the nearest matching divider. Alt+Ctrl chords need a terminal that speaks the kitty keyboard protocol; elsewhere they simply don't fire.
 - New =Buffer= methods behind it all: =moveBufStart= / =moveBufEnd= / =moveLines= / =toggleComment= / =copyWholeBuffer= / =reread=.
 - =C-g= now also deselects a marked region: in the prompt modes it already cancels (quit confirmation, dired, buffer switch, search), and in normal editing it drops the mark so the reverse-video region highlight clears.

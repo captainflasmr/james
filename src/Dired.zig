@@ -16,7 +16,9 @@ pub const Entry = struct {
 };
 
 pub const Choice = union(enum) {
-    navigated,
+    /// The selected entry is a directory; the caller should open (or switch
+    /// to) a dired buffer for this path. Caller must free.
+    open_dir: []u8,
     open_file: []u8, // caller must free
     none,
 };
@@ -115,17 +117,18 @@ pub fn scrollToSelected(self: *Dired, height: usize) void {
     }
 }
 
-/// Go straight to the parent directory, regardless of which entry is
-/// selected — the "^" shortcut in real dired.
-pub fn goUp(self: *Dired, gpa: std.mem.Allocator, io: std.Io) !void {
-    const parent = try parentOf(gpa, self.path.items) orelse return;
-    defer gpa.free(parent);
-    try self.open(gpa, io, parent);
+/// The directory "above" `current` (owned by the caller), for the "^" /
+/// M-e shortcut — the Emacs equivalent of dired-up-directory. Returns null
+/// only when `current` is an absolute path already at the filesystem root.
+pub fn upPath(self: *Dired, gpa: std.mem.Allocator) !?[]u8 {
+    return parentOf(gpa, self.path.items);
 }
 
-/// Act on the selected entry: descend into a directory (reloading the
-/// listing in place) or report a file to be opened by the caller.
-pub fn choose(self: *Dired, gpa: std.mem.Allocator, io: std.Io) !Choice {
+/// Act on the selected entry: report a directory for the caller to open as
+/// its own dired buffer, or a file to be opened. Never mutates the listing
+/// itself — the caller decides what to do with the path, so dired behaves
+/// like a buffer rather than a one-shot picker.
+pub fn choose(self: *Dired, gpa: std.mem.Allocator) !Choice {
     if (self.entries.items.len == 0) return .none;
     const entry = self.entries.items[self.selected];
 
@@ -142,9 +145,6 @@ pub fn choose(self: *Dired, gpa: std.mem.Allocator, io: std.Io) !Choice {
         try target.appendSlice(gpa, full);
     }
 
-    if (entry.is_dir) {
-        try self.open(gpa, io, target.items);
-        return .navigated;
-    }
+    if (entry.is_dir) return .{ .open_dir = try target.toOwnedSlice(gpa) };
     return .{ .open_file = try target.toOwnedSlice(gpa) };
 }

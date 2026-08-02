@@ -332,14 +332,13 @@ fn renderTree(
     modeline_bufs: *[MAX_PANES][1024]u8,
     slot: usize,
     buffers: []*Buffer,
+    direds: []?Dired,
     focused: *Pane,
-    dired: *Dired,
-    dired_active: bool,
 ) void {
     if (pane.isLeaf()) {
         const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
-        if (pane == focused and dired_active) {
-            renderDiredPane(child, dired, true, 0, height, &modeline_bufs[slot % MAX_PANES]);
+        if (direds[pane.buf_idx]) |*d| {
+            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES]);
         } else {
             renderPane(child, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES]);
         }
@@ -351,13 +350,13 @@ fn renderTree(
             const left_w: u16 = @intCast((@as(u32, width) * pane.left_frac) / 256);
             const right_w = width -| (left_w + 1);
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
-            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot * 2, buffers, focused, dired, dired_active);
-            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot * 2 + 1, buffers, focused, dired, dired_active);
+            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot * 2, buffers, direds, focused);
+            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot * 2 + 1, buffers, direds, focused);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
-            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot * 2, buffers, focused, dired, dired_active);
-            renderTree(win, pane.right.?, x_off, y_off + top_h, width, height -| top_h, modeline_bufs, slot * 2 + 1, buffers, focused, dired, dired_active);
+            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot * 2, buffers, direds, focused);
+            renderTree(win, pane.right.?, x_off, y_off + top_h, width, height -| top_h, modeline_bufs, slot * 2 + 1, buffers, direds, focused);
         },
     }
 }
@@ -401,17 +400,112 @@ fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer)) !void {
     try buffers.append(gpa, new_buf);
 }
 
-fn openBuffer(gpa: std.mem.Allocator, io: std.Io, buffers: *std.ArrayList(*Buffer), path: []const u8) !usize {
+/// True if `path` names a directory (so it should be browsed, not read).
+fn isDirectory(io: std.Io, path: []const u8) bool {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+    dir.close(io);
+    return true;
+}
+
+/// Open a buffer for `path`: an existing buffer if one already visits it
+/// (matched by exact path), else a dired buffer if the path is a directory,
+/// else a file buffer. Dired buffers are ordinary members of the buffer
+/// list — one per directory, so several can be open at once, exactly like
+/// Emacs.
+fn openBufferOrDired(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    buffers: *std.ArrayList(*Buffer),
+    direds: *std.ArrayList(?Dired),
+    path: []const u8,
+) !usize {
     for (buffers.items, 0..) |b, idx| {
         if (b.filename) |f| {
             if (std.mem.eql(u8, f, path)) return idx;
         }
     }
+    if (isDirectory(io, path)) {
+        const new_buf = try gpa.create(Buffer);
+        errdefer gpa.destroy(new_buf);
+        new_buf.* = Buffer.initEmpty();
+        errdefer new_buf.deinit(gpa);
+        new_buf.filename = try gpa.dupe(u8, path);
+
+        var d: Dired = .{};
+        errdefer d.deinit(gpa);
+        try d.open(gpa, io, path);
+
+        // Mirror the listing into the buffer's lines (name, with a "/"
+        // for directories) so incremental search and the prompt-mode
+        // rendering see the file names like any other buffer. The listing
+        // never changes while the dired is open, so this stays in sync.
+        for (d.entries.items) |e| {
+            var line: std.ArrayList(u8) = .empty;
+            errdefer line.deinit(gpa);
+            try line.appendSlice(gpa, e.name);
+            if (e.is_dir) try line.append(gpa, '/');
+            try new_buf.lines.append(gpa, line);
+        }
+
+        try direds.append(gpa, d);
+        errdefer {
+            var popped = direds.pop().?.?;
+            popped.deinit(gpa);
+        }
+        try buffers.append(gpa, new_buf);
+        return buffers.items.len - 1;
+    }
     const new_buf = try gpa.create(Buffer);
     errdefer gpa.destroy(new_buf);
     new_buf.* = try Buffer.loadFile(gpa, io, path);
     try buffers.append(gpa, new_buf);
+    try direds.append(gpa, null);
     return buffers.items.len - 1;
+}
+
+/// q / C-g / C-c C-k on a dired buffer: close it (like Emacs's
+/// dired-kill-buffer) and leave the focused window showing whatever buffer
+/// took its place. Every window's buffer index is fixed up, since the
+/// indices of all later buffers shift down by one.
+fn closeDiredBuffer(
+    gpa: std.mem.Allocator,
+    buffers: *std.ArrayList(*Buffer),
+    direds: *std.ArrayList(?Dired),
+    root: *Pane,
+    focused: *Pane,
+    current: usize,
+) usize {
+    if (buffers.items.len <= 1) return current; // never leave zero buffers
+    if (current >= direds.items.len or direds.items[current] == null) return current;
+
+    var d = direds.orderedRemove(current).?;
+    d.deinit(gpa);
+    var b = buffers.orderedRemove(current);
+    b.deinit(gpa);
+    gpa.destroy(b);
+
+    // Rebase every window's buffer index onto the shrunken list; a pane
+    // that showed the closed dired now shows the buffer that took its slot.
+    fixupBufIndices(root, current, buffers.items.len);
+    const next = @min(current, buffers.items.len - 1);
+    focused.buf_idx = next;
+    return next;
+}
+
+/// Keep a dired's selection following an isearch match: search moves
+/// point, and in a dired buffer point *is* the selected entry.
+fn syncDiredSelection(direds: []?Dired, current: usize, buf: *Buffer) void {
+    if (direds[current]) |*d| d.selected = buf.cursor_row;
+}
+
+fn fixupBufIndices(pane: *Pane, removed: usize, len: usize) void {
+    if (pane.isLeaf()) {
+        if (pane.buf_idx > removed) pane.buf_idx -= 1;
+        if (pane.buf_idx >= len) pane.buf_idx = len - 1;
+        return;
+    }
+    fixupBufIndices(pane.left.?, removed, len);
+    fixupBufIndices(pane.right.?, removed, len);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -431,13 +525,21 @@ pub fn main(init: std.process.Init) !void {
         }
         buffers.deinit(gpa);
     }
+    var direds: std.ArrayList(?Dired) = .empty;
+    defer {
+        for (direds.items) |*d| {
+            if (d.*) |*dd| dd.deinit(gpa);
+        }
+        direds.deinit(gpa);
+    }
     while (args_it.next()) |arg| {
-        _ = try openBuffer(gpa, io, &buffers, arg);
+        _ = try openBufferOrDired(gpa, io, &buffers, &direds, arg);
     }
     if (buffers.items.len == 0) {
         // No files given: land on the home screen, where C-x d makes it
         // easy to navigate to something real.
         try openWelcome(gpa, &buffers);
+        try direds.append(gpa, null);
     }
     var current: usize = 0;
 
@@ -464,10 +566,10 @@ pub fn main(init: std.process.Init) !void {
     var pending_ctrl_c = false;
     var confirming_quit = false;
 
-    // Directory-browser (dired) state.
-    var dired_active = false;
-    var dired: Dired = .{};
-    defer dired.deinit(gpa);
+    // Directory-browser state: one slot per buffer. A buffer with a non-null
+    // slot is a dired buffer (its `filename` is the directory being
+    // browsed); direds are ordinary buffers, so several can be open at once
+    // and they live in windows like any other, matching Emacs.
 
     // Switch/open-buffer prompt state (C-x b).
     // Split-window state. `root` is a tree of panes; a leaf shows one
@@ -529,27 +631,11 @@ pub fn main(init: std.process.Init) !void {
                         buf.mark = null;
                         kill_active = true;
                     } else if (key.matches('k', .{ .ctrl = true })) {
-                        if (dired_active) dired_active = false;
-                    }
-                } else if (dired_active) {
-                    if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
-                        dired_active = false;
-                    } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
-                        dired.moveDown();
-                    } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
-                        dired.moveUp();
-                    } else if (key.matches('e', .{ .alt = true }) or key.matches('^', .{})) {
-                        dired.goUp(gpa, io) catch {};
-                    } else if (key.matches(vaxis.Key.enter, .{})) {
-                        const choice = dired.choose(gpa, io) catch Dired.Choice.none;
-                        switch (choice) {
-                            .navigated, .none => {},
-                            .open_file => |file_path| {
-                                defer gpa.free(file_path);
-                                current = openBuffer(gpa, io, &buffers, file_path) catch current;
-                                focused.buf_idx = current;
-                                dired_active = false;
-                            },
+                        // C-c C-k: close the dired buffer, if that's what's
+                        // showing (the file-browser-close key from the
+                        // Jasspa setup).
+                        if (direds.items[current] != null) {
+                            current = closeDiredBuffer(gpa, &buffers, &direds, root, focused, current);
                         }
                     }
                 } else if (switching_buffer) {
@@ -561,7 +647,7 @@ pub fn main(init: std.process.Init) !void {
                         switching_buffer = false;
                         const name = std.mem.trim(u8, switch_query.items, " ");
                         if (name.len > 0) {
-                            current = openBuffer(gpa, io, &buffers, name) catch current;
+                            current = openBufferOrDired(gpa, io, &buffers, &direds, name) catch current;
                             focused.buf_idx = current;
                             kill_active = false;
                         }
@@ -574,6 +660,7 @@ pub fn main(init: std.process.Init) !void {
                     if (key.matches('g', .{ .ctrl = true })) {
                         buf.cursor_row = isearch_origin.row;
                         buf.cursor_col = isearch_origin.col;
+                        syncDiredSelection(direds.items, current, buf);
                         isearch_active = false;
                         isearch_match = null;
                         isearch_query.clearRetainingCapacity();
@@ -587,6 +674,7 @@ pub fn main(init: std.process.Init) !void {
                             if (buf.findNext(isearch_query.items, from, .forward)) |m| {
                                 buf.cursor_row = m.row;
                                 buf.cursor_col = m.col;
+                                syncDiredSelection(direds.items, current, buf);
                                 isearch_match = m;
                                 isearch_failed = false;
                             } else {
@@ -600,6 +688,7 @@ pub fn main(init: std.process.Init) !void {
                             if (buf.findNext(isearch_query.items, from, .backward)) |m| {
                                 buf.cursor_row = m.row;
                                 buf.cursor_col = m.col;
+                                syncDiredSelection(direds.items, current, buf);
                                 isearch_match = m;
                                 isearch_failed = false;
                             } else {
@@ -611,23 +700,28 @@ pub fn main(init: std.process.Init) !void {
                         if (isearch_query.items.len == 0) {
                             buf.cursor_row = isearch_origin.row;
                             buf.cursor_col = isearch_origin.col;
+                            syncDiredSelection(direds.items, current, buf);
                             isearch_match = null;
                             isearch_failed = false;
                         } else if (buf.findNext(isearch_query.items, isearch_origin, isearch_dir)) |m| {
                             buf.cursor_row = m.row;
                             buf.cursor_col = m.col;
+                            syncDiredSelection(direds.items, current, buf);
                             isearch_match = m;
                             isearch_failed = false;
                         } else {
                             isearch_failed = true;
                         }
                     } else if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.escape, .{})) {
+                        // Confirm the search: the match stays selected.
+                        syncDiredSelection(direds.items, current, buf);
                         isearch_active = false;
                     } else if (key.text) |t| {
                         try isearch_query.appendSlice(gpa, t);
                         if (buf.findNext(isearch_query.items, isearch_origin, isearch_dir)) |m| {
                             buf.cursor_row = m.row;
                             buf.cursor_col = m.col;
+                            syncDiredSelection(direds.items, current, buf);
                             isearch_match = m;
                             isearch_failed = false;
                         } else {
@@ -654,10 +748,12 @@ pub fn main(init: std.process.Init) !void {
                         switching_buffer = true;
                         switch_query.clearRetainingCapacity();
                     } else if (key.matches('d', .{}) or key.matches('m', .{})) {
+                        // C-x d / C-x m: open (or switch to) a dired buffer
+                        // for the current file's directory.
                         const start = try Dired.startingDir(gpa, buf.filename orelse ".");
                         defer gpa.free(start);
-                        dired.open(gpa, io, start) catch {};
-                        dired_active = true;
+                        current = try openBufferOrDired(gpa, io, &buffers, &direds, start);
+                        focused.buf_idx = current;
                     } else if (key.matches('g', .{})) {
                         buf.reread(gpa, io) catch {};
                     } else if (key.matches('h', .{})) {
@@ -692,6 +788,48 @@ pub fn main(init: std.process.Init) !void {
                     const was_kill = kill_active;
                     kill_active = false;
 
+                    // A dired buffer is showing. It takes over the plain
+                    // navigation keys (n/p/Enter/...), but behaves like any
+                    // other buffer for everything else — C-x commands (C-x o,
+                    // C-x b, splits), C-s search, C-g. This block is
+                    // deliberately NOT an else-if chain: keys it doesn't
+                    // consume fall through to the editing dispatch below.
+                    //
+                    // `editing` is captured BEFORE the dired block runs: it
+                    // must describe the buffer this keypress actually acts
+                    // on. Opening a file from dired changes `current` mid-
+                    // keypress, and a stale true value would let the same
+                    // key fall through into the editing dispatch against the
+                    // zero-line dired buffer.
+                    const editing = direds.items[current] == null;
+                    if (direds.items[current]) |*d| {
+                        if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
+                            current = closeDiredBuffer(gpa, &buffers, &direds, root, focused, current);
+                        } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
+                            d.moveDown();
+                        } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
+                            d.moveUp();
+                        } else if (key.matches('e', .{ .alt = true }) or key.matches('^', .{})) {
+                            if (try d.upPath(gpa)) |parent| {
+                                defer gpa.free(parent);
+                                current = try openBufferOrDired(gpa, io, &buffers, &direds, parent);
+                                focused.buf_idx = current;
+                            }
+                        } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('f', .{})) {
+                            // Enter, or "f" (the dirlst-find-file key from
+                            // the Jasspa setup): open the selected entry.
+                            const choice = d.choose(gpa) catch Dired.Choice.none;
+                            switch (choice) {
+                                .none => {},
+                                .open_file, .open_dir => |path| {
+                                    defer gpa.free(path);
+                                    current = try openBufferOrDired(gpa, io, &buffers, &direds, path);
+                                    focused.buf_idx = current;
+                                },
+                            }
+                        }
+                    }
+
                     if (key.matches('x', .{ .ctrl = true })) {
                         pending_ctrl_x = true;
                     } else if (key.matches('c', .{ .ctrl = true })) {
@@ -699,18 +837,24 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('/', .{ .ctrl = true }) or key.matches(0x1F, .{})) {
                         buf.undo(gpa);
                     } else if (key.matches(';', .{ .ctrl = true })) {
-                        try buf.toggleComment(gpa);
+                        if (editing) try buf.toggleComment(gpa);
                     } else if (key.matches('s', .{ .ctrl = true })) {
                         isearch_active = true;
                         isearch_dir = .forward;
-                        isearch_origin = .{ .row = buf.cursor_row, .col = buf.cursor_col };
+                        isearch_origin = if (direds.items[current]) |d|
+                            .{ .row = d.selected, .col = 0 }
+                        else
+                            .{ .row = buf.cursor_row, .col = buf.cursor_col };
                         isearch_match = null;
                         isearch_failed = false;
                         isearch_query.clearRetainingCapacity();
                     } else if (key.matches('r', .{ .ctrl = true })) {
                         isearch_active = true;
                         isearch_dir = .backward;
-                        isearch_origin = .{ .row = buf.cursor_row, .col = buf.cursor_col };
+                        isearch_origin = if (direds.items[current]) |d|
+                            .{ .row = d.selected, .col = 0 }
+                        else
+                            .{ .row = buf.cursor_row, .col = buf.cursor_col };
                         isearch_match = null;
                         isearch_failed = false;
                         isearch_query.clearRetainingCapacity();
@@ -730,7 +874,7 @@ pub fn main(init: std.process.Init) !void {
                         try buf.copyRegion(gpa, &kill_ring, was_kill);
                         kill_active = true;
                     } else if (key.matches('y', .{ .ctrl = true })) {
-                        try buf.yank(gpa, &kill_ring);
+                        if (editing) try buf.yank(gpa, &kill_ring);
                     } else if (key.matches('f', .{ .ctrl = true }) or key.matches(vaxis.Key.right, .{})) {
                         buf.moveRight();
                     } else if (key.matches('b', .{ .ctrl = true }) or key.matches(vaxis.Key.left, .{})) {
@@ -764,12 +908,12 @@ pub fn main(init: std.process.Init) !void {
                         focused = root;
                     } else if (key.matches('e', .{ .alt = true })) {
                         // M-e: dired-jump — open dired at the current
-                        // file's directory (in dired mode M-e already goes
-                        // up a directory, matching my/dired-jump-or-up).
+                        // file's directory (in a dired buffer M-e goes up,
+                        // matching my/dired-jump-or-up).
                         const start = try Dired.startingDir(gpa, buf.filename orelse ".");
                         defer gpa.free(start);
-                        dired.open(gpa, io, start) catch {};
-                        dired_active = true;
+                        current = try openBufferOrDired(gpa, io, &buffers, &direds, start);
+                        focused.buf_idx = current;
                     } else if (key.matches('n', .{ .alt = true })) {
                         if (moveFocus(root, focused, 1)) |nf| {
                             focused = nf;
@@ -797,9 +941,10 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('j', .{ .alt = true, .ctrl = true })) {
                         root.resizeDivider(focused, .horizontal, 8);
                     } else if (key.matches(vaxis.Key.enter, .{})) {
-                        try buf.insertNewline(gpa);
+                        if (editing) try buf.insertNewline(gpa);
                     } else if (key.text) |t| {
-                        try buf.insertSlice(gpa, t);
+                        // Dired buffers are read-only: typing is ignored.
+                        if (editing) try buf.insertSlice(gpa, t);
                     }
                 }
             },
@@ -810,24 +955,30 @@ pub fn main(init: std.process.Init) !void {
         win.clear();
 
         const text_height: usize = if (win.height > 1) win.height - 1 else win.height;
-        // Dired is not modal: it renders inside the focused pane, leaving
-        // any other split panes untouched. Only the prompt-style modes take
-        // over the whole screen.
+        // Dired is not modal: it renders inside whichever pane shows the
+        // dired buffer, leaving any other split panes untouched. Only the
+        // prompt-style modes take over the whole screen.
         const is_modal = confirming_quit or switching_buffer or isearch_active;
 
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
-            renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, 0, buffers.items, focused, &dired, dired_active);
+            renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, 0, buffers.items, direds.items, focused);
             try vx.render(tty.writer());
             continue;
         }
 
-        if (dired_active) {
-            var modeline_buf: [2048]u8 = undefined;
-            renderDiredPane(win, &dired, true, 0, win.height, &modeline_buf);
-            try vx.render(tty.writer());
-            continue;
+        if (!is_modal) {
+            if (direds.items[current]) |*d| {
+                var modeline_buf: [2048]u8 = undefined;
+                renderDiredPane(win, d, true, 0, win.height, &modeline_buf);
+                try vx.render(tty.writer());
+                continue;
+            }
         }
+        // Modal states (isearch, buffer switch, quit confirm) render a
+        // dired through the normal buffer renderer instead: its lines mirror
+        // the listing, so the isearch match highlight and the prompt
+        // modeline work exactly as they do in a file buffer.
 
         buf.scrollToCursor(text_height);
         var row: u16 = 0;
