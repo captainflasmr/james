@@ -82,7 +82,16 @@ fn highlightFor(
 ) struct { hl: ?Highlight, empty_marker: bool } {
     if (searching) {
         if (search_match) |m| {
-            if (row == m.row) return .{ .hl = .{ .start = m.col, .end = m.col + search_len }, .empty_marker = false };
+            if (row == m.row) {
+                // Clamp the highlight to the line: the match always lies
+                // within the searched buffer, but this is called from panes
+                // that may show other buffers.
+                const line_len = buf.lines.items[row].items.len;
+                return .{ .hl = .{
+                    .start = @min(m.col, line_len),
+                    .end = @min(m.col + search_len, line_len),
+                }, .empty_marker = false };
+            }
         }
         return .{ .hl = null, .empty_marker = false };
     }
@@ -98,25 +107,46 @@ fn highlightFor(
 
 /// Switch to the buffer visiting `path` if one is already open, otherwise
 /// load it fresh and open it as a new buffer. Returns its index.
+/// The isearch state, for rendering a search in whatever pane is being
+/// searched: the match highlight plus the "I-search:" prompt in the
+/// pane's own modeline, so the window layout never changes while
+/// searching. Null when no search is active.
+const IsearchView = struct {
+    failed: bool,
+    match: ?Buffer.Pos,
+    query: []const u8,
+    backward: bool,
+};
+
 /// Render one buffer's text plus its own compact modeline into `win`, which
-/// may be the whole screen or one pane of a split. Used for split panes,
-/// where there's no room for isearch/mark-set decoration — just enough to
-/// tell panes apart and see where you are.
-fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8) void {
+/// may be the whole screen or one pane of a split. An active isearch shows
+/// its match highlight and prompt in this pane, exactly as if the pane were
+/// the whole screen.
+fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, search: ?IsearchView) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     buf.scrollToCursor(text_height);
+
+    const searching = search != null;
+    const match: ?Buffer.Pos = if (search) |s| (if (s.failed) null else s.match) else null;
+    const query_len: usize = if (search) |s| s.query.len else 0;
 
     var row: u16 = 0;
     var i = buf.top_line;
     while (i < buf.lines.items.len and row < text_height) : (i += 1) {
-        const h = highlightFor(buf, i, false, null, 0);
+        const h = highlightFor(buf, i, searching, match, query_len);
         var seg_storage: [3]vaxis.Segment = undefined;
         const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage);
         _ = win.print(segs, .{ .row_offset = row_base + row });
         row += 1;
     }
 
-    const modeline = std.fmt.bufPrint(modeline_buf, "{s}{s}  L{d}:C{d}", .{
+    const modeline = if (search) |s| blk: {
+        const label = if (s.failed)
+            (if (s.backward) "Failing I-search backward" else "Failing I-search")
+        else
+            (if (s.backward) "I-search backward" else "I-search");
+        break :blk std.fmt.bufPrint(modeline_buf, "{s}: {s}", .{ label, s.query }) catch label;
+    } else std.fmt.bufPrint(modeline_buf, "{s}{s}  L{d}:C{d}", .{
         buf.display_name orelse buf.filename orelse "?",
         if (buf.dirty) " [modified]" else "",
         buf.cursor_row + 1,
@@ -289,22 +319,34 @@ fn deleteOtherWindows(gpa: std.mem.Allocator, root: *Pane, focused: *Pane) usize
 /// may be the whole screen or one pane of a split. Same shape as
 /// `renderPane`, so dired lives inside the current window instead of
 /// taking over the whole screen; when a file is chosen it's simply
-/// replaced by the newly opened buffer.
-fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8) void {
+/// replaced by the newly opened buffer. An active isearch shows its prompt
+/// in the modeline; the match is the selected entry.
+fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, search: ?IsearchView) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     dired.scrollToSelected(text_height);
-    var name_bufs: [256][300]u8 = undefined;
+    // Entry labels print the entry's own heap-allocated name (plus a "/"
+    // segment for directories), never a stack-local copy — vaxis stores
+    // grapheme slices, so a scratch buffer would be clobbered by the next
+    // pane rendered in the same frame.
     var row: u16 = 0;
     var i = dired.top;
-    while (i < dired.entries.items.len and row < text_height and row < name_bufs.len) : (i += 1) {
+    while (i < dired.entries.items.len and row < text_height) : (i += 1) {
         const e = dired.entries.items[i];
-        const label = std.fmt.bufPrint(&name_bufs[row], "{s}{s}", .{ e.name, if (e.is_dir) "/" else "" }) catch e.name;
         const style: vaxis.Style = if (i == dired.selected) highlight_style else .{};
-        _ = win.printSegment(.{ .text = label, .style = style }, .{ .row_offset = row_base + row });
+        _ = win.printSegment(.{ .text = e.name, .style = style }, .{ .row_offset = row_base + row });
+        if (e.is_dir) {
+            _ = win.printSegment(.{ .text = "/", .style = style }, .{ .row_offset = row_base + row, .col_offset = win.gwidth(e.name) });
+        }
         row += 1;
     }
 
-    const modeline = std.fmt.bufPrint(modeline_buf, "Dired: {s}   (Enter opens, ^ up, q quits)", .{dired.path.items}) catch "Dired";
+    const modeline = if (search) |s| blk: {
+        const label = if (s.failed)
+            (if (s.backward) "Failing I-search backward" else "Failing I-search")
+        else
+            (if (s.backward) "I-search backward" else "I-search");
+        break :blk std.fmt.bufPrint(modeline_buf, "{s}: {s}", .{ label, s.query }) catch label;
+    } else std.fmt.bufPrint(modeline_buf, "Dired: {s}   (Enter opens, ^ up, q quits)", .{dired.path.items}) catch "Dired";
     const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true, .reverse = true };
     const text_w = win.gwidth(modeline);
     const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
@@ -330,17 +372,27 @@ fn renderTree(
     width: u16,
     height: u16,
     modeline_bufs: *[MAX_PANES][1024]u8,
-    slot: usize,
+    slot_counter: *usize,
     buffers: []*Buffer,
     direds: []?Dired,
     focused: *Pane,
+    search: ?IsearchView,
 ) void {
     if (pane.isLeaf()) {
+        // Each leaf gets its own scratch slot, in render order — the
+        // buffer must not be shared between panes, since vaxis stores
+        // grapheme slices into it until the end of the frame.
+        const slot = slot_counter.*;
+        slot_counter.* += 1;
+        // isearch operates on the focused buffer only: passing the match
+        // to every pane would highlight the wrong window and could slice
+        // past a shorter line in a neighbouring buffer.
+        const pane_search: ?IsearchView = if (pane == focused) search else null;
         const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
         if (direds[pane.buf_idx]) |*d| {
-            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES]);
+            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_search);
         } else {
-            renderPane(child, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES]);
+            renderPane(child, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_search);
         }
         return;
     }
@@ -350,13 +402,13 @@ fn renderTree(
             const left_w: u16 = @intCast((@as(u32, width) * pane.left_frac) / 256);
             const right_w = width -| (left_w + 1);
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
-            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot * 2, buffers, direds, focused);
-            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot * 2 + 1, buffers, direds, focused);
+            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search);
+            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
-            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot * 2, buffers, direds, focused);
-            renderTree(win, pane.right.?, x_off, y_off + top_h, width, height -| top_h, modeline_bufs, slot * 2 + 1, buffers, direds, focused);
+            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, search);
+            renderTree(win, pane.right.?, x_off, y_off + top_h, width, height -| top_h, modeline_bufs, slot_counter, buffers, direds, focused, search);
         },
     }
 }
@@ -1151,14 +1203,20 @@ pub fn main(init: std.process.Init) !void {
         win.clear();
 
         const text_height: usize = if (win.height > 1) win.height - 1 else win.height;
-        // Dired is not modal: it renders inside whichever pane shows the
-        // dired buffer, leaving any other split panes untouched. Only the
+        // Dired and isearch are not modal: they render inside whichever
+        // pane they apply to, leaving the window layout untouched. Only the
         // prompt-style modes take over the whole screen.
-        const is_modal = confirming_quit or switching_buffer or bookmark_prompt != null or bookmark_list_active or isearch_active;
+        const is_modal = confirming_quit or switching_buffer or bookmark_prompt != null or bookmark_list_active;
+
+        const search_view: ?IsearchView = if (isearch_active)
+            .{ .failed = isearch_failed, .match = isearch_match, .query = isearch_query.items, .backward = isearch_dir == .backward }
+        else
+            null;
 
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
-            renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, 0, buffers.items, direds.items, focused);
+            var slot_counter: usize = 0;
+            renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, search_view);
             try vx.render(tty.writer());
             continue;
         }
@@ -1190,21 +1248,21 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal) {
             if (direds.items[current]) |*d| {
                 var modeline_buf: [2048]u8 = undefined;
-                renderDiredPane(win, d, true, 0, win.height, &modeline_buf);
+                renderDiredPane(win, d, true, 0, win.height, &modeline_buf, search_view);
                 try vx.render(tty.writer());
                 continue;
             }
         }
-        // Modal states (isearch, buffer switch, quit confirm) render a
-        // dired through the normal buffer renderer instead: its lines mirror
-        // the listing, so the isearch match highlight and the prompt
-        // modeline work exactly as they do in a file buffer.
+        // The prompt-style modal states (buffer switch, quit confirm)
+        // render a dired through the normal buffer renderer instead: its
+        // lines mirror the listing, so the prompt modeline works exactly as
+        // it does in a file buffer. isearch is handled natively above.
 
         buf.scrollToCursor(text_height);
         var row: u16 = 0;
         var i = buf.top_line;
         while (i < buf.lines.items.len and row < text_height) : (i += 1) {
-            const h = highlightFor(buf, i, isearch_active, if (isearch_failed) null else isearch_match, isearch_query.items.len);
+            const h = highlightFor(buf, i, search_view != null, if (search_view) |s| (if (s.failed) null else s.match) else null, if (search_view) |s| s.query.len else 0);
             var seg_storage: [3]vaxis.Segment = undefined;
             const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage);
             _ = win.print(segs, .{ .row_offset = row });

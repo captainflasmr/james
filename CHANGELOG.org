@@ -17,6 +17,9 @@ Bookmarks.
 - =C-x r m= bookmarks the current file and cursor position under a name; the prompt is prefilled with the file name (like Emacs), and setting an existing name replaces it. =C-x r b= prompts for a name and jumps: the file (or dired) opens and point moves to the recorded position. =C-x r l= (or =C-c o=, the "favorites" key from the Jasspa setup) shows all bookmarks in a picker (n/p move, Enter jumps, q / C-g closes).
 - Bookmarks persist across sessions in =~/.james-bookmarks= (tab-separated =name/path/row/col= lines), saved on every set and on exit, loaded at startup.
 - Dired bookmarks work too: jumping restores the selection to the recorded entry.
+- Fixed garbled dired panes in multi-window splits: each pane now gets its own modeline scratch slot (the tree's slot arithmetic collided for small trees, so panes shared buffers), and dired entry labels print the entries' own heap names instead of a stack scratch copy — vaxis stores grapheme slices, so the previous stack buffer was clobbered by whichever pane rendered last, leaving every dired pane except the final ones garbled.
+- isearch no longer takes over the whole screen: it operates inside the pane being searched, so splits keep their layout while searching. The searched pane shows the match highlight and the =I-search:= prompt in its own modeline, exactly like the full-screen view; dired panes show the prompt too (the match is the selected entry).
+- Fixed two isearch-in-split bugs: the match highlight is now applied only to the focused pane (previously every pane rendered the match, so a dired search lit up a neighbouring file pane and could slice past a shorter line in it — an out-of-bounds crash); the highlight range is also clamped to the line defensively.
 
 ** 0.11.0 — <2026-08-02>
 
