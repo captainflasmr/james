@@ -736,7 +736,8 @@ const welcome_text =
     \\
     \\    C-s / C-r     incremental search
     \\    C-x 2 / C-x 3 split the window, C-x o moves to the next one
-    \\    C-space       set the mark; C-w kills the region, C-y yanks
+    \\    C-space       set the mark; C-x C-k kills the region, C-y yanks
+    \\    C-w           save (as does C-x C-s)
     \\    C-x u         undo
     \\    C-x C-s       save
     \\    C-x j / C-x c  drop to a real shell (C-z / exit returns)
@@ -1187,13 +1188,32 @@ pub fn main(init: std.process.Init) !void {
     while (args_it.next()) |arg| {
         _ = try openBufferOrDired(gpa, io, &buffers, &direds, arg);
     }
+    var current: usize = 0;
+    // Index of the cwd dired in the default no-files layout; null when
+    // the layout wasn't built (files were given, or scratch.txt couldn't
+    // be created in a read-only directory).
+    var default_dired_idx: ?usize = null;
     if (buffers.items.len == 0) {
         // No files given: land on the home screen, where C-x d makes it
-        // easy to navigate to something real.
+        // easy to navigate to something real. The scratch buffer and a
+        // dired of the current directory join it in a three-pane layout:
+        // welcome | (scratch / dired).
         try openWelcome(gpa, &buffers);
         try direds.append(gpa, null);
+
+        // The scratch buffer is tied to a real scratch.txt file (created
+        // here if missing, never truncated if it exists), so it saves and
+        // prompts like any other file.
+        if (std.Io.Dir.cwd().createFile(io, "scratch.txt", .{ .truncate = false })) |f| {
+            f.close(io);
+            const scratch_idx = try openBufferOrDired(gpa, io, &buffers, &direds, "scratch.txt");
+            default_dired_idx = try openBufferOrDired(gpa, io, &buffers, &direds, ".");
+            current = scratch_idx;
+        } else |_| {
+            // A read-only cwd falls back to the plain single-window home
+            // screen.
+        }
     }
-    var current: usize = 0;
 
     // Kill ring is shared across all buffers, same as real Emacs.
     var kill_ring: std.ArrayList(u8) = .empty;
@@ -1260,6 +1280,19 @@ pub fn main(init: std.process.Init) !void {
     root.* = .{ .buf_idx = current };
     defer root.destroy(gpa);
     var focused = root;
+
+    // The default no-files layout: one vertical split, then the right
+    // pane split horizontally — welcome left (full height), scratch
+    // top right, the cwd dired bottom right. The scratch pane starts
+    // focused.
+    if (default_dired_idx) |dired_idx| {
+        try root.split(gpa, .vertical);
+        root.left.?.buf_idx = 0; // the welcome buffer
+        try root.right.?.split(gpa, .horizontal);
+        root.right.?.right.?.buf_idx = dired_idx;
+        focused = root.right.?.left.?;
+        current = focused.buf_idx;
+    }
 
     var switching_buffer = false;
     var switch_query: std.ArrayList(u8) = .empty;
@@ -1829,9 +1862,8 @@ pub fn main(init: std.process.Init) !void {
                         syncClipboard(&vx, &tty, gpa, kill_ring.items);
                         kill_active = true;
                     } else if (key.matches('w', .{ .ctrl = true })) {
-                        try buf.killRegion(gpa, &kill_ring, was_kill);
-                        syncClipboard(&vx, &tty, gpa, kill_ring.items);
-                        kill_active = true;
+                        // C-w is save-buffer; kill-region lives at C-x C-k.
+                        buf.save(gpa, io) catch {};
                     } else if (key.matches('w', .{ .alt = true })) {
                         try buf.copyRegion(gpa, &kill_ring, was_kill);
                         syncClipboard(&vx, &tty, gpa, kill_ring.items);

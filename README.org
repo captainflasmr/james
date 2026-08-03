@@ -15,7 +15,7 @@ A very minimal, Emacs/MicroEmacs-inspired text editor, written in Zig on top of 
 zig build run -- path/to/file.txt [more-files...]
 #+end_src
 
-Every filename given on the command line opens as its own buffer; the first one is shown initially. With no filenames, james starts on a home screen with a keybinding cheat sheet — =C-x d= from there browses files, or use =C-x C-f= / =C-x b=. First run will fetch libvaxis automatically. To fetch dependencies ahead of time (e.g. for an offline build later): =zig build --fetch=.
+Every filename given on the command line opens as its own buffer; the first one is shown initially. With no filenames, james starts on the home screen in a three-pane layout: the welcome screen left (full height), the =scratch.txt= buffer top right, and a dired of the current directory bottom right. =scratch.txt= is a real file in the current directory — created on first startup if missing, never truncated — so it saves and prompts exactly like any other buffer. =C-x d= from there browses files, or use =C-x C-f= / =C-x b=. First run will fetch libvaxis automatically. To fetch dependencies ahead of time (e.g. for an offline build later): =zig build --fetch=.
 
 A plain =zig build= already produces a ReleaseSmall, stripped binary (james is meant to be run, not debugged). If you do need to debug: =zig build -Doptimize=Debug -Dstrip=false=.
 
@@ -44,7 +44,7 @@ Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes 
 | Enter / =C-j= | new line |
 | =C-space= | set mark |
 | =C-k= | kill to end of line (or kill the newline, at end of line) |
-| =C-w= | kill region (point to mark) |
+| =C-w= | save buffer (=C-x C-s= alias) |
 | =M-w= | copy region, without deleting |
 | =C-y= | yank (insert most recent kill) |
 | =C-s= / =C-r= | incremental search forward / backward |
@@ -86,13 +86,13 @@ Buffer keys:
 |---+---|
 | =M-<= / =M->= | beginning / end of buffer |
 | =M-j= / =M-k= | 5 lines down / up |
-| =C-x C-k= | kill region (alias of =C-w=) |
+| =C-x C-k= | kill region (point to mark) |
 
 While searching: type to extend the query, =C-s=/=C-r= again jumps to the next/previous match, Backspace shrinks the query, =C-g= cancels back to where you started, and Enter (or any other key) confirms and leaves the cursor at the match. A search with no match shows "Failing I-search" and stops moving the cursor until you backspace back to something that matches.
 
 If the buffer has unsaved changes, =C-x C-c= asks "Save file ... before exiting?" on the status line: =y= saves and quits, =n= quits without saving, and =C-g= (or Escape) cancels the quit and returns to editing. Any other key is ignored while the prompt is up, rather than risk a stray keystroke accidentally choosing for you.
 
-Consecutive =C-k=/=C-w=/=M-w= presses append to the same kill instead of overwriting it, same as real Emacs — typing or moving the cursor in between starts a fresh kill. The kill ring is shared across all open buffers, so you can kill text in one file and yank it into another. Every kill or copy is also mirrored onto the system clipboard (OSC 52), so text you kill in james can be pasted into any other application — and over ssh too, since the terminal forwards the sequence; terminals without OSC 52 support just ignore it. The other direction works the same way: =C-y= with an empty kill ring pastes the system clipboard into the buffer. Once a mark is set, the region between mark and point is shown in reverse video as you move the cursor, and the highlight clears automatically once you kill, copy, or otherwise drop the mark.
+Consecutive =C-k=/=C-x C-k=/=M-w= presses append to the same kill instead of overwriting it, same as real Emacs — typing or moving the cursor in between starts a fresh kill. The kill ring is shared across all open buffers, so you can kill text in one file and yank it into another. Every kill or copy is also mirrored onto the system clipboard (OSC 52), so text you kill in james can be pasted into any other application — and over ssh too, since the terminal forwards the sequence; terminals without OSC 52 support just ignore it. The other direction works the same way: =C-y= with an empty kill ring pastes the system clipboard into the buffer. Once a mark is set, the region between mark and point is shown in reverse video as you move the cursor, and the highlight clears automatically once you kill, copy, or otherwise drop the mark.
 
 Undo (=C-x u=) restores whole-buffer snapshots taken before each edit, and coalesces a run of the same kind of edit (a burst of typing, a run of backspaces) into a single step, so undoing a word you just typed is one keypress, not one per character. Switching to a different kind of edit — or moving the cursor — starts a new undo step. There's no redo yet; undo is a one-way trip back through history, and it doesn't (yet) clear the =[modified]= flag even if it lands you back on the exact text you loaded. Undo history, the mark, cursor position, and the dirty flag are all separate per buffer; only the kill ring is shared.
 
@@ -120,7 +120,7 @@ Quitting (=C-x C-c=) relies on libvaxis's normal shutdown path, which sends a te
 
 * Roadmap
 
-1. +*Kill ring + yank*+ — done (=C-space=, =C-k=, =C-w=, =M-w=, =C-y=). =Buffer.mark= is a plain snapshot, not a self-adjusting marker, so it can go stale if you edit the buffer between setting mark and using the region — acceptable for now, worth revisiting if it bites you.
+1. +*Kill ring + yank*+ — done (=C-space=, =C-k=, =C-x C-k=, =M-w=, =C-y=). =Buffer.mark= is a plain snapshot, not a self-adjusting marker, so it can go stale if you edit the buffer between setting mark and using the region — acceptable for now, worth revisiting if it bites you.
 2. +*Undo*+ — done (=C-x u=), whole-buffer snapshots with same-kind coalescing. Adding redo would mean pushing undone states onto a second stack that gets cleared on any new edit — a natural follow-up, not done yet.
 3. +*Incremental search*+ — done (=C-s= / =C-r=). Search never crosses a line boundary and wraps around the buffer when it runs off either end. The =isearch_active= branch at the top of the key-dispatch loop in =main.zig= is the "mode" plumbing mentioned above — when =M-x= arrives, it's a second branch of the same shape, not a redesign.
 4. +Unsaved-changes confirmation on =C-x C-c=+ — done. A save that fails (disk full, permissions, etc.) is still silently swallowed either way, same as =C-x C-s= today — worth real error reporting eventually.
