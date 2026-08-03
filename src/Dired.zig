@@ -10,6 +10,9 @@ path: std.ArrayList(u8) = .empty,
 entries: std.ArrayList(Entry) = .empty,
 selected: usize = 0,
 top: usize = 0,
+/// Next position for C-l (recenter-top-bottom): 0 = middle, 1 = top,
+/// 2 = bottom.
+recenter_pos: u8 = 0,
 
 pub const Entry = struct {
     name: []u8,
@@ -218,6 +221,24 @@ pub fn scrollToSelected(self: *Dired, height: usize) void {
     } else if (self.selected >= self.top + height) {
         self.top = self.selected - height + 1;
     }
+}
+
+/// C-l: recenter the listing on the selected entry, cycling through the
+/// middle, top, and bottom of the window like Emacs's
+/// recenter-top-bottom (the dired twin of Buffer.recenterTopBottom).
+/// `cycling` is true when the previous key was also C-l; otherwise the
+/// listing recenters to the middle.
+pub fn recenterTopBottom(self: *Dired, height: usize, cycling: bool) void {
+    if (height == 0) return;
+    const pos: u8 = if (cycling) (self.recenter_pos + 1) % 3 else 0;
+    self.recenter_pos = pos;
+    switch (pos) {
+        0 => self.top = self.selected -| (height / 2),   // middle
+        1 => self.top = self.selected,                   // top
+        else => self.top = self.selected -| (height - 1), // bottom
+    }
+    const max_top = self.entries.items.len -| height;
+    self.top = @min(self.top, max_top);
 }
 
 /// The directory "above" `current` (owned by the caller), for the "^" /

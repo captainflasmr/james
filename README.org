@@ -38,6 +38,7 @@ Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes 
 |---+---|
 | =C-f= =C-b= =C-n= =C-p= / arrows | move right / left / down / up |
 | =C-a= / =C-e= | start / end of line |
+| =C-l= | recenter the window on the cursor line (middle, then top, then bottom, cycling) |
 | =C-d= / Delete | delete forward |
 | Backspace | delete backward |
 | Enter / =C-j= | new line |

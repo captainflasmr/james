@@ -16,6 +16,9 @@ undo_stack: std.ArrayList(Snapshot) = .empty,
 /// Kind of the most recent edit, so a run of the same kind (typing, or
 /// backspacing) coalesces into a single undo step instead of one per key.
 undo_group: UndoKind = .none,
+/// Next position for C-l (recenter-top-bottom): 0 = middle, 1 = top,
+/// 2 = bottom.
+recenter_pos: u8 = 0,
 
 pub const Pos = struct { row: usize, col: usize };
 pub const Region = struct { start: Pos, end: Pos };
@@ -459,6 +462,26 @@ pub fn scrollToCursor(self: *Buffer, height: usize) void {
     } else if (self.cursor_row >= self.top_line + height) {
         self.top_line = self.cursor_row - height + 1;
     }
+}
+
+/// C-l: recenter the window on the cursor line, cycling through the
+/// middle, top, and bottom of the window like Emacs's
+/// recenter-top-bottom. `cycling` is true when the previous key was also
+/// C-l — the position then advances (middle → top → bottom → middle);
+/// otherwise the line recenters to the middle. The last position is
+/// remembered per buffer.
+pub fn recenterTopBottom(self: *Buffer, height: usize, cycling: bool) void {
+    if (height == 0) return;
+    const pos: u8 = if (cycling) (self.recenter_pos + 1) % 3 else 0;
+    self.recenter_pos = pos;
+    switch (pos) {
+        0 => self.top_line = self.cursor_row -| (height / 2),   // middle
+        1 => self.top_line = self.cursor_row,                   // top
+        else => self.top_line = self.cursor_row -| (height - 1), // bottom
+    }
+    // Keep the last lines of a long buffer on screen.
+    const max_top = self.lines.items.len -| height;
+    self.top_line = @min(self.top_line, max_top);
 }
 
 pub const SearchDirection = enum { forward, backward };

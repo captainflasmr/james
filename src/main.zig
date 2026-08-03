@@ -656,8 +656,12 @@ fn renderTree(
     focused: *Pane,
     search: ?IsearchView,
     dired_prompt: ?DiredPromptView,
+    focused_h: *usize,
 ) void {
     if (pane.isLeaf()) {
+        // The focused pane's text area height, for C-l (recenter-top-
+        // bottom) and anything else that needs to know its window.
+        if (pane == focused) focused_h.* = if (height > 1) height - 1 else height;
         // Each leaf gets its own scratch slot, in render order — the
         // buffer must not be shared between panes, since vaxis stores
         // grapheme slices into it until the end of the frame.
@@ -684,8 +688,8 @@ fn renderTree(
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             // The one blank column between the panes gets the separator.
             drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
-            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt);
-            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt);
+            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, focused_h);
+            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, focused_h);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
@@ -693,8 +697,8 @@ fn renderTree(
             // a blank row between the panes for the separator (mirroring
             // the one blank column of a vertical split).
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
-            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt);
-            renderTree(win, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt);
+            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, focused_h);
+            renderTree(win, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, focused_h);
         },
     }
 }
@@ -1210,6 +1214,12 @@ pub fn main(init: std.process.Init) !void {
     // very first frame is already at the true console size no matter what
     // the terminal reported.
     var last_winsize: ?vaxis.Winsize = null;
+    // Height of the focused pane's text area, tracked during rendering so
+    // C-l (recenter-top-bottom) can center within the right window.
+    var focused_text_height: usize = 0;
+    // True while consecutive C-l presses are cycling recenter positions
+    // (center → top → bottom); any other key resets the next C-l to center.
+    var last_was_recenter = false;
     if (tty.getWinsize() catch null) |ws| {
         if (ws.cols > 0 and ws.rows > 0) {
             try vx.resize(gpa, tty.writer(), ws);
@@ -1325,6 +1335,10 @@ pub fn main(init: std.process.Init) !void {
                 }
             },
             .key_press => |key| {
+                // C-l cycles recenter positions only when pressed back to
+                // back (Emacs recenter-top-bottom); any other key makes the
+                // next C-l recenter to the middle again.
+                if (!key.matches('l', .{ .ctrl = true })) last_was_recenter = false;
                 const buf: *Buffer = buffers.items[current];
 
                 if (confirming_quit) {
@@ -1700,6 +1714,10 @@ pub fn main(init: std.process.Init) !void {
                             d.moveDown();
                         } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
                             d.moveUp();
+                        } else if (key.matches('l', .{ .ctrl = true })) {
+                            // C-l: recenter the listing on the selection.
+                            d.recenterTopBottom(focused_text_height, last_was_recenter);
+                            last_was_recenter = true;
                         } else if (key.matches('e', .{ .alt = true }) or key.matches('^', .{})) {
                             if (try d.upPath(gpa)) |parent| {
                                 defer gpa.free(parent);
@@ -1806,6 +1824,11 @@ pub fn main(init: std.process.Init) !void {
                         buf.moveLineStart();
                     } else if (key.matches('e', .{ .ctrl = true })) {
                         buf.moveLineEnd();
+                    } else if (key.matches('l', .{ .ctrl = true })) {
+                        // C-l: recenter the window on the cursor line
+                        // (recenter-top-bottom), within the focused pane.
+                        buf.recenterTopBottom(focused_text_height, last_was_recenter);
+                        last_was_recenter = true;
                     } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.delete, .{})) {
                         try buf.deleteForward(gpa);
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
@@ -1906,6 +1929,9 @@ pub fn main(init: std.process.Init) !void {
         win.setCursorShape(.block_blink);
 
         const text_height: usize = if (win.height > 1) win.height - 1 else win.height;
+        // The focused pane's text area (the whole window when unsplit),
+        // remembered for C-l so it can recenter within the right window.
+        focused_text_height = text_height;
         // Dired and isearch are not modal: they render inside whichever
         // pane they apply to, leaving the window layout untouched. Only the
         // prompt-style modes take over the whole screen.
@@ -1926,7 +1952,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, search_view, dired_prompt_view);
+            renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, search_view, dired_prompt_view, &focused_text_height);
             try vx.render(tty.writer());
             continue;
         }
