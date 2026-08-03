@@ -830,7 +830,7 @@ pub fn main(init: std.process.Init) !void {
                         switching_buffer = false;
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
                         if (switch_query.items.len > 0) _ = switch_query.pop();
-                    } else if (key.matches(vaxis.Key.enter, .{})) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
                         switching_buffer = false;
                         const name = std.mem.trim(u8, switch_query.items, " ");
                         if (name.len > 0) {
@@ -848,7 +848,7 @@ pub fn main(init: std.process.Init) !void {
                         bookmark_prompt = null;
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
                         if (bookmark_query.items.len > 0) _ = bookmark_query.pop();
-                    } else if (key.matches(vaxis.Key.enter, .{})) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
                         const name = std.mem.trim(u8, bookmark_query.items, " ");
                         bookmark_prompt = null;
                         if (name.len > 0) switch (mode) {
@@ -873,7 +873,7 @@ pub fn main(init: std.process.Init) !void {
                         if (bookmark_list_selected + 1 < bookmarks.items.len) bookmark_list_selected += 1;
                     } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
                         if (bookmark_list_selected > 0) bookmark_list_selected -= 1;
-                    } else if (key.matches(vaxis.Key.enter, .{})) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
                         if (bookmark_list_selected < bookmarks.items.len) {
                             const name = bookmarks.items[bookmark_list_selected].name;
                             bookmark_list_active = false;
@@ -939,7 +939,7 @@ pub fn main(init: std.process.Init) !void {
                         } else {
                             isearch_failed = true;
                         }
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.escape, .{})) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                         // Confirm the search: the match stays selected.
                         syncDiredSelection(direds.items, current, buf);
                         isearch_active = false;
@@ -1063,8 +1063,8 @@ pub fn main(init: std.process.Init) !void {
                                 current = try openBufferOrDired(gpa, io, &buffers, &direds, parent);
                                 focused.buf_idx = current;
                             }
-                        } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('f', .{})) {
-                            // Enter, or "f" (the dirlst-find-file key from
+                        } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('f', .{})) {
+                            // Enter / C-j, or "f" (the dirlst-find-file key from
                             // the Jasspa setup): open the selected entry.
                             const choice = d.choose(gpa) catch Dired.Choice.none;
                             switch (choice) {
@@ -1154,10 +1154,14 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('a', .{ .alt = true })) {
                         current = deleteOtherWindows(gpa, root, focused);
                         focused = root;
-                    } else if (key.matches('e', .{ .alt = true })) {
+                    } else if (editing and key.matches('e', .{ .alt = true })) {
                         // M-e: dired-jump — open dired at the current
                         // file's directory (in a dired buffer M-e goes up,
-                        // matching my/dired-jump-or-up).
+                        // matching my/dired-jump-or-up, and is handled above
+                        // — this branch must not fire for direds, or the
+                        // two M-e handlers would fight: e.g. at the root
+                        // "/" going up does nothing, while dirname("/") is
+                        // null and dired-jump would fall back to ".").
                         const start = try Dired.startingDir(gpa, buf.filename orelse ".");
                         defer gpa.free(start);
                         current = try openBufferOrDired(gpa, io, &buffers, &direds, start);
@@ -1188,7 +1192,7 @@ pub fn main(init: std.process.Init) !void {
                         root.resizeDivider(focused, .horizontal, -8);
                     } else if (key.matches('j', .{ .alt = true, .ctrl = true })) {
                         root.resizeDivider(focused, .horizontal, 8);
-                    } else if (key.matches(vaxis.Key.enter, .{})) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
                         if (editing) try buf.insertNewline(gpa);
                     } else if (key.text) |t| {
                         // Dired buffers are read-only: typing is ignored.

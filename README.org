@@ -38,7 +38,7 @@ Binaries land in =zig-out/bin/=. Use =-p some/dir= to send each target to a sepa
 | =C-a= / =C-e= | start / end of line |
 | =C-d= / Delete | delete forward |
 | Backspace | delete backward |
-| Enter | new line |
+| Enter / =C-j= | new line |
 | =C-space= | set mark |
 | =C-k= | kill to end of line (or kill the newline, at end of line) |
 | =C-w= | kill region (point to mark) |
