@@ -57,6 +57,7 @@ Binaries land in =zig-out/bin/=. Use =-p some/dir= to send each target to a sepa
 | =C-c b= | copy the whole buffer to the kill ring |
 | =C-c w= | copy the region and deselect it |
 | =C-c C-k= | close the dired browser |
+| =C-c j= / =C-c k= | step back / forward through window layouts (winner-mode) |
 | =C-x C-s= | save |
 | =C-x C-c= | quit (asks first if there are unsaved changes) |
 

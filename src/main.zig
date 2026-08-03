@@ -647,6 +647,142 @@ fn syncDiredSelection(direds: []?Dired, current: usize, buf: *Buffer) void {
     if (direds[current]) |*d| d.selected = buf.cursor_row;
 }
 
+/// Winner-mode style window history (C-c j / C-c k): the window layout is
+/// snapshotted before each layout change, so you can step back and forward
+/// through them. A snapshot is the pane tree serialized in pre-order.
+const WinNode = struct {
+    is_leaf: bool,
+    dir: SplitDir = .vertical,
+    left_frac: u8 = 128,
+    buf_idx: usize = 0,
+};
+
+const WindowSnapshot = struct {
+    nodes: std.ArrayList(WinNode) = .empty,
+    /// Pre-order index of the focused leaf.
+    focused: usize = 0,
+    /// The buffer index of the focused pane.
+    current: usize = 0,
+
+    fn deinit(self: *WindowSnapshot, gpa: std.mem.Allocator) void {
+        self.nodes.deinit(gpa);
+    }
+};
+
+fn serializePane(gpa: std.mem.Allocator, pane: *Pane, focused: *Pane, out: *std.ArrayList(WinNode), idx: *usize, focused_idx: *usize) !void {
+    if (pane == focused) focused_idx.* = idx.*;
+    if (pane.isLeaf()) {
+        try out.append(gpa, .{ .is_leaf = true, .buf_idx = pane.buf_idx });
+    } else {
+        try out.append(gpa, .{ .is_leaf = false, .dir = pane.dir, .left_frac = pane.left_frac });
+        try serializePane(gpa, pane.left.?, focused, out, idx, focused_idx);
+        try serializePane(gpa, pane.right.?, focused, out, idx, focused_idx);
+    }
+    idx.* += 1;
+}
+
+fn deserializePane(gpa: std.mem.Allocator, nodes: []const WinNode, idx: *usize) !*Pane {
+    const n = nodes[idx.*];
+    idx.* += 1;
+    if (n.is_leaf) {
+        const p = try gpa.create(Pane);
+        p.* = .{ .buf_idx = n.buf_idx };
+        return p;
+    }
+    const p = try gpa.create(Pane);
+    p.* = .{ .dir = n.dir, .left_frac = n.left_frac };
+    p.left = try deserializePane(gpa, nodes, idx);
+    p.right = try deserializePane(gpa, nodes, idx);
+    return p;
+}
+
+/// The pane at pre-order index `target` (counting splits and leaves alike,
+/// matching the serializer).
+fn paneAt(pane: *Pane, idx: *usize, target: usize) ?*Pane {
+    if (idx.* == target) return pane;
+    idx.* += 1;
+    if (pane.isLeaf()) return null;
+    if (paneAt(pane.left.?, idx, target)) |p| return p;
+    return paneAt(pane.right.?, idx, target);
+}
+
+fn snapshotWindow(gpa: std.mem.Allocator, root: *Pane, focused: *Pane, current: usize) !WindowSnapshot {
+    var snap: WindowSnapshot = .{ .current = current };
+    errdefer snap.deinit(gpa);
+    var idx: usize = 0;
+    var focused_idx: usize = 0;
+    try serializePane(gpa, root, focused, &snap.nodes, &idx, &focused_idx);
+    snap.focused = focused_idx;
+    return snap;
+}
+
+fn snapshotsEqual(a: *const WindowSnapshot, b: *const WindowSnapshot) bool {
+    if (a.focused != b.focused or a.current != b.current) return false;
+    if (a.nodes.items.len != b.nodes.items.len) return false;
+    for (a.nodes.items, b.nodes.items) |x, y| {
+        if (x.is_leaf != y.is_leaf or x.dir != y.dir or x.left_frac != y.left_frac or x.buf_idx != y.buf_idx) return false;
+    }
+    return true;
+}
+
+/// Record the current layout on the undo stack before a change; identical
+/// consecutive states are skipped, and any redo branch is abandoned.
+fn recordWindow(gpa: std.mem.Allocator, root: *Pane, focused: *Pane, current: usize, undo: *std.ArrayList(WindowSnapshot), redo: *std.ArrayList(WindowSnapshot)) void {
+    var snap = snapshotWindow(gpa, root, focused, current) catch return;
+    if (undo.items.len > 0 and snapshotsEqual(&snap, &undo.items[undo.items.len - 1])) {
+        snap.deinit(gpa);
+        return;
+    }
+    undo.append(gpa, snap) catch {
+        snap.deinit(gpa);
+        return;
+    };
+    for (redo.items) |*s| s.deinit(gpa);
+    redo.clearRetainingCapacity();
+}
+
+/// Rebuild the tree from `snap`, freeing the old one. Returns the buffer
+/// index the focused pane should show.
+fn restoreSnapshot(gpa: std.mem.Allocator, root: **Pane, focused: **Pane, snap_in: WindowSnapshot) ?usize {
+    var snap = snap_in;
+    const result = snap.current;
+    root.*.destroy(gpa);
+    var idx: usize = 0;
+    root.* = deserializePane(gpa, snap.nodes.items, &idx) catch blk: {
+        // Shouldn't happen; fall back to a single pane.
+        const p = gpa.create(Pane) catch return null;
+        p.* = .{ .buf_idx = result };
+        break :blk p;
+    };
+    idx = 0;
+    const target = @min(snap.focused, snap.nodes.items.len -| 1);
+    focused.* = paneAt(root.*, &idx, target) orelse root.*;
+    snap.deinit(gpa);
+    return result;
+}
+
+/// C-c j: step back to the previous window layout.
+fn windowUndo(gpa: std.mem.Allocator, root: **Pane, focused: **Pane, current: usize, undo: *std.ArrayList(WindowSnapshot), redo: *std.ArrayList(WindowSnapshot)) ?usize {
+    if (undo.items.len == 0) return null;
+    var cur = snapshotWindow(gpa, root.*, focused.*, current) catch return null;
+    redo.append(gpa, cur) catch {
+        cur.deinit(gpa);
+        return null;
+    };
+    return restoreSnapshot(gpa, root, focused, undo.pop().?);
+}
+
+/// C-c k: step forward to the next window layout.
+fn windowRedo(gpa: std.mem.Allocator, root: **Pane, focused: **Pane, current: usize, undo: *std.ArrayList(WindowSnapshot), redo: *std.ArrayList(WindowSnapshot)) ?usize {
+    if (redo.items.len == 0) return null;
+    var cur = snapshotWindow(gpa, root.*, focused.*, current) catch return null;
+    undo.append(gpa, cur) catch {
+        cur.deinit(gpa);
+        return null;
+    };
+    return restoreSnapshot(gpa, root, focused, redo.pop().?);
+}
+
 /// Reload a dired's listing and re-mirror it into its buffer's lines
 /// (used after copy / delete change the directory contents).
 fn refreshDired(gpa: std.mem.Allocator, io: std.Io, buffers: *std.ArrayList(*Buffer), direds: *std.ArrayList(?Dired), idx: usize) void {
@@ -889,6 +1025,19 @@ pub fn main(init: std.process.Init) !void {
     defer dired_copy_query.deinit(gpa);
     var confirming_delete = false;
 
+    // Winner-mode style window history: layouts are recorded before each
+    // change; C-c j / C-c k step back / forward.
+    var window_undo: std.ArrayList(WindowSnapshot) = .empty;
+    defer {
+        for (window_undo.items) |*s| s.deinit(gpa);
+        window_undo.deinit(gpa);
+    }
+    var window_redo: std.ArrayList(WindowSnapshot) = .empty;
+    defer {
+        for (window_redo.items) |*s| s.deinit(gpa);
+        window_redo.deinit(gpa);
+    }
+
     // Incremental search state.
     var isearch_active = false;
     var isearch_dir: Buffer.SearchDirection = .forward;
@@ -938,6 +1087,7 @@ pub fn main(init: std.process.Init) !void {
                         // showing (the file-browser-close key from the
                         // Jasspa setup).
                         if (direds.items[current] != null) {
+                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                             current = closeDiredBuffer(gpa, &buffers, &direds, root, focused, current);
                         }
                     } else if (key.matches('o', .{})) {
@@ -947,6 +1097,18 @@ pub fn main(init: std.process.Init) !void {
                         bookmark_list_active = true;
                         bookmark_list_selected = 0;
                         bookmark_list_top = 0;
+                    } else if (key.matches('j', .{})) {
+                        // C-c j: step back through window layouts
+                        // (winner-mode undo).
+                        if (windowUndo(gpa, &root, &focused, current, &window_undo, &window_redo)) |nc| {
+                            current = nc;
+                        }
+                    } else if (key.matches('k', .{})) {
+                        // C-c k: step forward through window layouts
+                        // (winner-mode redo).
+                        if (windowRedo(gpa, &root, &focused, current, &window_undo, &window_redo)) |nc| {
+                            current = nc;
+                        }
                     }
                 } else if (switching_buffer) {
                     if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
@@ -957,6 +1119,7 @@ pub fn main(init: std.process.Init) !void {
                         switching_buffer = false;
                         const name = std.mem.trim(u8, switch_query.items, " ");
                         if (name.len > 0) {
+                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                             current = openBufferOrDired(gpa, io, &buffers, &direds, name) catch current;
                             focused.buf_idx = current;
                             kill_active = false;
@@ -980,6 +1143,7 @@ pub fn main(init: std.process.Init) !void {
                                 saveBookmarks(gpa, io, init.environ_map, &bookmarks);
                             },
                             .jump => if (bookmarkJump(gpa, io, &buffers, &direds, bookmarks.items, name)) |idx| {
+                                recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                                 current = idx;
                                 focused.buf_idx = idx;
                             },
@@ -1055,6 +1219,7 @@ pub fn main(init: std.process.Init) !void {
                             const name = bookmarks.items[bookmark_list_selected].name;
                             bookmark_list_active = false;
                             if (bookmarkJump(gpa, io, &buffers, &direds, bookmarks.items, name)) |idx| {
+                                recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                                 current = idx;
                                 focused.buf_idx = idx;
                             }
@@ -1170,6 +1335,7 @@ pub fn main(init: std.process.Init) !void {
                         try buf.killRegion(gpa, &kill_ring, kill_active);
                         kill_active = true;
                     } else if (key.matches('2', .{}) or key.matches('3', .{})) {
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         if (root.leafCount() < MAX_PANES) {
                             const dir: SplitDir = if (key.matches('2', .{})) .horizontal else .vertical;
                             try focused.split(gpa, dir);
@@ -1177,9 +1343,11 @@ pub fn main(init: std.process.Init) !void {
                             current = focused.buf_idx;
                         }
                     } else if (key.matches('1', .{})) {
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         current = deleteOtherWindows(gpa, root, focused);
                         focused = root;
                     } else if (key.matches('0', .{})) {
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         if (deleteFocusedPane(gpa, &root, focused)) |nf| {
                             focused = nf;
                             current = focused.buf_idx;
@@ -1229,6 +1397,7 @@ pub fn main(init: std.process.Init) !void {
                     const editing = direds.items[current] == null;
                     if (direds.items[current]) |*d| {
                         if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
+                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                             current = closeDiredBuffer(gpa, &buffers, &direds, root, focused, current);
                         } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
                             d.moveDown();
@@ -1237,6 +1406,7 @@ pub fn main(init: std.process.Init) !void {
                         } else if (key.matches('e', .{ .alt = true }) or key.matches('^', .{})) {
                             if (try d.upPath(gpa)) |parent| {
                                 defer gpa.free(parent);
+                                recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                                 current = try openBufferOrDired(gpa, io, &buffers, &direds, parent);
                                 focused.buf_idx = current;
                             }
@@ -1274,6 +1444,7 @@ pub fn main(init: std.process.Init) !void {
                                 .none => {},
                                 .open_file, .open_dir => |path| {
                                     defer gpa.free(path);
+                                    recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                                     current = try openBufferOrDired(gpa, io, &buffers, &direds, path);
                                     focused.buf_idx = current;
                                 },
@@ -1343,6 +1514,7 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
                         try buf.deleteBackward(gpa);
                     } else if (key.matches(';', .{ .alt = true }) or key.matches('m', .{ .alt = true })) {
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         if (root.leafCount() < MAX_PANES) {
                             const dir: SplitDir = if (key.matches(';', .{ .alt = true })) .vertical else .horizontal;
                             try focused.split(gpa, dir);
@@ -1350,11 +1522,13 @@ pub fn main(init: std.process.Init) !void {
                             current = focused.buf_idx;
                         }
                     } else if (key.matches('q', .{ .alt = true })) {
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         if (deleteFocusedPane(gpa, &root, focused)) |nf| {
                             focused = nf;
                             current = focused.buf_idx;
                         }
                     } else if (key.matches('a', .{ .alt = true })) {
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         current = deleteOtherWindows(gpa, root, focused);
                         focused = root;
                     } else if (editing and key.matches('e', .{ .alt = true })) {
@@ -1367,6 +1541,7 @@ pub fn main(init: std.process.Init) !void {
                         // null and dired-jump would fall back to ".").
                         const start = try Dired.startingDir(gpa, buf.filename orelse ".");
                         defer gpa.free(start);
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         current = try openBufferOrDired(gpa, io, &buffers, &direds, start);
                         focused.buf_idx = current;
                     } else if (key.matches('n', .{ .alt = true })) {
@@ -1388,12 +1563,16 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('>', .{ .alt = true })) {
                         buf.moveBufEnd();
                     } else if (key.matches('h', .{ .alt = true, .ctrl = true })) {
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         root.resizeDivider(focused, .vertical, -8);
                     } else if (key.matches('l', .{ .alt = true, .ctrl = true })) {
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         root.resizeDivider(focused, .vertical, 8);
                     } else if (key.matches('k', .{ .alt = true, .ctrl = true })) {
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         root.resizeDivider(focused, .horizontal, -8);
                     } else if (key.matches('j', .{ .alt = true, .ctrl = true })) {
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         root.resizeDivider(focused, .horizontal, 8);
                     } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
                         if (editing) try buf.insertNewline(gpa);
