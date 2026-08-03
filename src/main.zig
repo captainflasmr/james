@@ -1019,6 +1019,13 @@ pub fn main(init: std.process.Init) !void {
     var bookmark_list_selected: usize = 0;
     var bookmark_list_top: usize = 0;
 
+    // Buffer-list picker (C-x b): a modal list of every open buffer, the
+    // same shape as the bookmark picker — n/p move, Enter switches, q
+    // closes. C-x C-f keeps the type-a-name prompt instead.
+    var buffer_list_active = false;
+    var buffer_list_selected: usize = 0;
+    var buffer_list_top: usize = 0;
+
     // Dired copy / delete prompts (C / D in a dired buffer).
     var dired_copy_prompt = false;
     var dired_copy_query: std.ArrayList(u8) = .empty;
@@ -1225,6 +1232,22 @@ pub fn main(init: std.process.Init) !void {
                             }
                         }
                     }
+                } else if (buffer_list_active) {
+                    if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
+                        buffer_list_active = false;
+                    } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
+                        if (buffer_list_selected + 1 < buffers.items.len) buffer_list_selected += 1;
+                    } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
+                        if (buffer_list_selected > 0) buffer_list_selected -= 1;
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
+                        if (buffer_list_selected < buffers.items.len) {
+                            buffer_list_active = false;
+                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                            current = buffer_list_selected;
+                            focused.buf_idx = current;
+                            kill_active = false;
+                        }
+                    }
                 } else if (isearch_active) {
                     if (key.matches('g', .{ .ctrl = true })) {
                         buf.cursor_row = isearch_origin.row;
@@ -1313,7 +1336,16 @@ pub fn main(init: std.process.Init) !void {
                         }
                     } else if (key.matches('u', .{}) or key.matches('u', .{ .ctrl = true })) {
                         buf.undo(gpa);
-                    } else if (key.matches('b', .{}) or key.matches('f', .{ .ctrl = true })) {
+                    } else if (key.matches('b', .{})) {
+                        // C-x b: pick from a list of every open buffer, like
+                        // the bookmark picker (real Emacs splits C-x b from
+                        // C-x C-f too).
+                        buffer_list_active = true;
+                        buffer_list_selected = current;
+                        buffer_list_top = 0;
+                    } else if (key.matches('f', .{ .ctrl = true })) {
+                        // C-x C-f: open-or-switch by typing a path, the old
+                        // C-x b prompt.
                         switching_buffer = true;
                         switch_query.clearRetainingCapacity();
                     } else if (key.matches('r', .{})) {
@@ -1596,7 +1628,7 @@ pub fn main(init: std.process.Init) !void {
         // Dired and isearch are not modal: they render inside whichever
         // pane they apply to, leaving the window layout untouched. Only the
         // prompt-style modes take over the whole screen.
-        const is_modal = confirming_quit or switching_buffer or bookmark_prompt != null or bookmark_list_active;
+        const is_modal = confirming_quit or switching_buffer or bookmark_prompt != null or bookmark_list_active or buffer_list_active;
 
         const search_view: ?IsearchView = if (isearch_active)
             .{ .failed = isearch_failed, .match = isearch_match, .query = isearch_query.items, .backward = isearch_dir == .backward }
@@ -1620,10 +1652,12 @@ pub fn main(init: std.process.Init) !void {
 
         if (bookmark_list_active) {
             // The bookmark picker: one name per row, Enter jumps.
-            if (bookmark_list_selected < bookmark_list_top) {
-                bookmark_list_top = bookmark_list_selected;
-            } else if (bookmark_list_selected >= bookmark_list_top + text_height) {
-                bookmark_list_top = bookmark_list_selected - text_height + 1;
+            if (text_height > 0) {
+                if (bookmark_list_selected < bookmark_list_top) {
+                    bookmark_list_top = bookmark_list_selected;
+                } else if (bookmark_list_selected >= bookmark_list_top + text_height) {
+                    bookmark_list_top = bookmark_list_selected - text_height + 1;
+                }
             }
             var list_row: u16 = 0;
             var i = bookmark_list_top;
@@ -1640,6 +1674,34 @@ pub fn main(init: std.process.Init) !void {
             _ = win.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = win.height -| 1 });
             // No highlights: the block cursor marks the selected bookmark.
             win.showCursor(0, @intCast(bookmark_list_selected - bookmark_list_top));
+            try vx.render(tty.writer());
+            continue;
+        }
+
+        if (buffer_list_active) {
+            // The buffer picker: one buffer name per row, Enter switches.
+            if (text_height > 0) {
+                if (buffer_list_selected < buffer_list_top) {
+                    buffer_list_top = buffer_list_selected;
+                } else if (buffer_list_selected >= buffer_list_top + text_height) {
+                    buffer_list_top = buffer_list_selected - text_height + 1;
+                }
+            }
+            var list_row: u16 = 0;
+            var i = buffer_list_top;
+            while (i < buffers.items.len and list_row < text_height) : (i += 1) {
+                const b: *Buffer = buffers.items[i];
+                _ = win.printSegment(.{ .text = b.display_name orelse b.filename orelse "?", .style = .{} }, .{ .row_offset = list_row });
+                list_row += 1;
+            }
+            var list_ml_buf: [2048]u8 = undefined;
+            const list_ml = std.fmt.bufPrint(&list_ml_buf, "Buffers ({d}/{d})   (Enter switches, n/p move, q closes)", .{
+                buffer_list_selected + 1,
+                buffers.items.len,
+            }) catch "Buffers";
+            _ = win.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = win.height -| 1 });
+            // No highlights: the block cursor marks the selected buffer.
+            win.showCursor(0, if (text_height > 0) @intCast(buffer_list_selected - buffer_list_top) else 0);
             try vx.render(tty.writer());
             continue;
         }

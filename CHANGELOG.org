@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.13.0 — <2026-08-03>
+
+Buffer-list picker for =C-x b=.
+
+- =C-x b= now shows a picker list of every open buffer — file buffers, direds, and the home screen — one per row, the same shape as the bookmark list: n/p (or arrows) move, Enter switches to the selected buffer, q / =C-g= closes. The cursor starts on the current buffer. =C-x C-f= keeps the old status-line prompt (open-or-switch by path), so typing a name to open a new file still works — the same C-x b / C-x C-f split real Emacs makes.
+
 ** 0.12.0 — <2026-08-02>
 
 Bookmarks.
