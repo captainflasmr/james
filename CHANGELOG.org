@@ -10,6 +10,15 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.14.0 — <2026-08-03>
+
+The my-jump keymap: =M-l= is now a prefix key, like the author's Emacs setup.
+
+- =M-l= is a prefix keymap (the my-jump-keymap from the author's Emacs init.el): =M-l b= jumps to =~/bin=, =M-l d= to the Downloads directory, =M-l g= to the config directory, =M-l h= to the home directory, =M-l i= to =~/.emacs.d/Emacs-vanilla=, =M-l y= to =~/.emacs.d/Emacs-DIYer=, =M-l s= to =~/source=, =M-l o= opens the bookmark picker (bookmark-jump), and =M-l r= switches to the scratch buffer (=scratch.txt=, created if missing). =C-g= / Esc cancels the prefix; any other key is ignored, like an undefined binding in a real keymap.
+- The directory targets resolve like the original elisp's =system-type= checks: on Windows =M-l d= uses =%USERPROFILE%\Downloads= (falling back to =~/Downloads=), =M-l g= uses =%APPDATA%= (falling back to =~/AppData/Roaming=), and =M-l h= uses =%USERPROFILE%=; elsewhere they are =~/Downloads=, =~/.config= and =~= respectively (home is =$HOME= on Unix, =%USERPROFILE%= on Windows).
+- A jump that can't be opened (a missing =~/bin=, say) leaves the window alone instead of dropping the editor, and every jump is recorded in the winner-mode window history, so =C-c j= steps back out of it. The keys with no james equivalent were left out: =M-l == and =M-l -= (tabs), =M-l e= (the Emacs init.el), and =M-l l= (recentf — no recent-files tracking yet).
+- =W= in a dired buffer opens the selected entry with the system's default handler — =xdg-open= on Linux/BSD, =open= on macOS, and cmd's =start= on Windows — so a file opens in its default application and a directory in the file manager, all without leaving the editor. The opener's stdio is thrown away so the terminal stays clean, and a failure (no =xdg-open=, no desktop session) reports on the modeline. =..= is skipped like =C= and =D=.
+
 ** 0.13.0 — <2026-08-03>
 
 Buffer-list picker for =C-x b=.

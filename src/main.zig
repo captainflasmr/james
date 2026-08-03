@@ -579,6 +579,36 @@ fn restoreEditor(gpa: std.mem.Allocator, vx: *vaxis.Vaxis, tty: *vaxis.Tty) !voi
     }
 }
 
+/// W in dired: open `path` with the system's default handler — xdg-open
+/// on Linux/BSD, `open` on macOS, cmd's =start= on Windows. The opener
+/// runs with its stdio thrown away so the editor's terminal stays clean;
+/// xdg-open / open hand the file to the desktop and exit, and start
+/// returns after ShellExecute launches the app, so waiting for it never
+/// blocks the editor on the viewer itself. Returns false when nothing
+/// could be spawned (no xdg-open, no desktop session, ...).
+fn openExternal(io: std.Io, gpa: std.mem.Allocator, environ_map: *std.process.Environ.Map, path: []const u8) bool {
+    if (comptime builtin.os.tag == .windows) {
+        // cmd's start builtin ShellExecutes the file with its default
+        // handler (a directory gets a file-manager window) and returns
+        // immediately. The path is quoted so spaces and & stay safe, and
+        // the child inherits the editor's cwd, so relative dired paths
+        // resolve exactly where they should.
+        const comspec = environ_map.get("COMSPEC") orelse "cmd.exe";
+        const quoted = std.fmt.allocPrint(gpa, "\"{s}\"", .{path}) catch return false;
+        defer gpa.free(quoted);
+        var child = std.process.spawn(io, .{ .argv = &.{ comspec, "/c", "start", "", quoted }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
+        _ = child.wait(io) catch return false;
+        return true;
+    }
+    const opener: []const u8 = if (comptime builtin.os.tag == .macos) "open" else "xdg-open";
+    var child = std.process.spawn(io, .{ .argv = &.{ opener, path }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
+    const term = child.wait(io) catch return false;
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
 /// Mirror the kill ring onto the system clipboard (OSC 52), so a kill or
 /// copy in james is available to other applications — even over ssh, since
 /// the terminal forwards the sequence. Terminals without OSC 52 support
@@ -1228,6 +1258,55 @@ fn loadBookmarks(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Envir
     }
 }
 
+/// The user's home directory the way the my-jump-keymap elisp sees it:
+/// $USERPROFILE on Windows (the elisp's `~` expands there; its explicit
+/// `(getenv "USERPROFILE")` check is the same lookup), $HOME elsewhere.
+fn jumpHome(env_map: *std.process.Environ.Map) ?[]const u8 {
+    if (comptime builtin.os.tag == .windows) {
+        return env_map.get("USERPROFILE") orelse env_map.get("HOME");
+    }
+    return env_map.get("HOME");
+}
+
+/// Join path components onto the user's home directory — the `~`
+/// expansion the my-jump-keymap elisp gets for free from Emacs. Returns
+/// an allocated path, or null when the home directory can't be found.
+fn jumpHomePath(gpa: std.mem.Allocator, env_map: *std.process.Environ.Map, sub: []const []const u8) ?[]u8 {
+    const home = jumpHome(env_map) orelse return null;
+    const parts: [][]const u8 = gpa.alloc([]const u8, 1 + sub.len) catch return null;
+    defer gpa.free(parts);
+    parts[0] = home;
+    @memcpy(parts[1..], sub);
+    return std.fs.path.join(gpa, parts) catch null;
+}
+
+/// M-l jump: open `path` (file or directory) in the focused window,
+/// recording the layout first so winner-mode can undo the jump. A path
+/// that can't be opened (e.g. ~/bin on a fresh machine) leaves the
+/// current window alone and reports it in the modeline instead of
+/// dropping the whole editor, which is what the try-version would do.
+fn jumpOpen(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    buffers: *std.ArrayList(*Buffer),
+    direds: *std.ArrayList(?Dired),
+    root: *Pane,
+    focused: *Pane,
+    current: usize,
+    undo: *std.ArrayList(WindowSnapshot),
+    redo: *std.ArrayList(WindowSnapshot),
+    status_msg: *?[]const u8,
+) usize {
+    recordWindow(gpa, root, focused, current, undo, redo);
+    const idx = openBufferOrDired(gpa, io, buffers, direds, path) catch {
+        status_msg.* = "No such file or directory";
+        return current;
+    };
+    focused.buf_idx = idx;
+    return idx;
+}
+
 fn fixupBufIndices(pane: *Pane, removed: usize, len: usize) void {
     if (pane.isLeaf()) {
         if (pane.buf_idx > removed) pane.buf_idx -= 1;
@@ -1346,6 +1425,9 @@ pub fn main(init: std.process.Init) !void {
     var pending_ctrl_x = false;
     var pending_ctrl_x_r = false;
     var pending_ctrl_c = false;
+    // M-l: the my-jump prefix keymap from the author's Emacs init.el — a
+    // jump to a well-known directory is two keys, like every Emacs prefix.
+    var pending_alt_l = false;
     var confirming_quit = false;
 
     // Directory-browser state: one slot per buffer. A buffer with a non-null
@@ -1836,6 +1918,107 @@ pub fn main(init: std.process.Init) !void {
                         bookmark_list_selected = 0;
                         bookmark_list_top = 0;
                     }
+                } else if (pending_alt_l) {
+                    // M-l: the my-jump keymap from the author's Emacs
+                    // init.el, a prefix of jumps to well-known places. The
+                    // Windows path resolution mirrors the elisp's
+                    // system-type checks: %USERPROFILE% / %APPDATA% first,
+                    // ~-relative fallbacks second. C-g / Esc aborts the
+                    // prefix; any other key is ignored, like an undefined
+                    // binding in a real keymap.
+                    pending_alt_l = false;
+                    if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        // abort the prefix
+                    } else if (key.matches('o', .{})) {
+                        // M-l o: bookmark-jump — the bookmark picker
+                        // (the C-x r l / C-c o favorites list).
+                        bookmark_list_active = true;
+                        bookmark_list_selected = 0;
+                        bookmark_list_top = 0;
+                    } else if (key.matches('r', .{})) {
+                        // M-l r: switch to the *scratch* buffer — the
+                        // scratch.txt file the home-screen layout also
+                        // opens (created here if missing, never truncated).
+                        var found: ?usize = null;
+                        for (buffers.items, 0..) |b, idx| {
+                            if (b.filename) |f| {
+                                if (std.mem.eql(u8, std.fs.path.basename(f), "scratch.txt")) {
+                                    found = idx;
+                                    break;
+                                }
+                            }
+                        }
+                        if (found) |idx| {
+                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                            current = idx;
+                            focused.buf_idx = idx;
+                        } else if (std.Io.Dir.cwd().createFile(io, "scratch.txt", .{ .truncate = false })) |f| {
+                            f.close(io);
+                            if (openBufferOrDired(gpa, io, &buffers, &direds, "scratch.txt")) |idx| {
+                                recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                                current = idx;
+                                focused.buf_idx = idx;
+                            } else |_| {}
+                        } else |_| {
+                            // A read-only cwd can't attach the scratch
+                            // buffer to anything — say so rather than
+                            // silently doing nothing.
+                            status_msg = "Can't open scratch buffer";
+                        }
+                    } else if (key.matches('h', .{})) {
+                        // M-l h: the home directory (the elisp's `~`,
+                        // USERPROFILE on Windows).
+                        if (jumpHome(init.environ_map)) |home| {
+                            current = jumpOpen(gpa, io, home, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                        }
+                    } else if (key.matches('b', .{})) {
+                        // M-l b: ~/bin.
+                        if (jumpHomePath(gpa, init.environ_map, &.{"bin"})) |p| {
+                            defer gpa.free(p);
+                            current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                        }
+                    } else if (key.matches('d', .{})) {
+                        // M-l d: Downloads — %USERPROFILE%\Downloads on
+                        // Windows (or ~/Downloads), ~/Downloads elsewhere,
+                        // exactly the elisp's system-type branch.
+                        if (jumpHomePath(gpa, init.environ_map, &.{"Downloads"})) |p| {
+                            defer gpa.free(p);
+                            current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                        }
+                    } else if (key.matches('g', .{})) {
+                        // M-l g: the config directory — %APPDATA% on
+                        // Windows (with the elisp's ~/AppData/Roaming
+                        // fallback), ~/.config elsewhere.
+                        if (comptime builtin.os.tag == .windows) {
+                            if (init.environ_map.get("APPDATA")) |appdata| {
+                                current = jumpOpen(gpa, io, appdata, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                            } else if (jumpHomePath(gpa, init.environ_map, &.{ "AppData", "Roaming" })) |p| {
+                                defer gpa.free(p);
+                                current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                            }
+                        } else if (jumpHomePath(gpa, init.environ_map, &.{".config"})) |p| {
+                            defer gpa.free(p);
+                            current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                        }
+                    } else if (key.matches('i', .{})) {
+                        // M-l i: the Emacs-vanilla config directory.
+                        if (jumpHomePath(gpa, init.environ_map, &.{ ".emacs.d", "Emacs-vanilla" })) |p| {
+                            defer gpa.free(p);
+                            current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                        }
+                    } else if (key.matches('y', .{})) {
+                        // M-l y: the Emacs-DIYer config directory.
+                        if (jumpHomePath(gpa, init.environ_map, &.{ ".emacs.d", "Emacs-DIYer" })) |p| {
+                            defer gpa.free(p);
+                            current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                        }
+                    } else if (key.matches('s', .{})) {
+                        // M-l s: the ~/source tree.
+                        if (jumpHomePath(gpa, init.environ_map, &.{"source"})) |p| {
+                            defer gpa.free(p);
+                            current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                        }
+                    }
                 } else {
                     const was_kill = kill_active;
                     kill_active = false;
@@ -1918,6 +2101,20 @@ pub fn main(init: std.process.Init) !void {
                             if (!std.mem.eql(u8, e.name, "..")) {
                                 confirming_delete = true;
                             }
+                        } else if (key.matches('W', .{})) {
+                            // W: open the selected entry with the system's
+                            // default handler — xdg-open on Linux/BSD, `open`
+                            // on macOS, cmd's start on Windows — so a file
+                            // opens in its default application and a
+                            // directory in the file manager. ".." is skipped
+                            // like C and D.
+                            const e = d.entries.items[d.selected];
+                            if (!std.mem.eql(u8, e.name, "..")) {
+                                if (std.fs.path.join(gpa, &.{ d.path.items, e.name }) catch null) |full| {
+                                    defer gpa.free(full);
+                                    if (!openExternal(io, gpa, init.environ_map, full)) status_msg = "Failed to open externally";
+                                }
+                            }
                         } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('f', .{})) {
                             // Enter / C-j, or "f" (the dirlst-find-file key from
                             // the Jasspa setup): open the selected entry.
@@ -1938,6 +2135,10 @@ pub fn main(init: std.process.Init) !void {
                         pending_ctrl_x = true;
                     } else if (key.matches('c', .{ .ctrl = true })) {
                         pending_ctrl_c = true;
+                    } else if (key.matches('l', .{ .alt = true })) {
+                        // M-l: the my-jump prefix (see the pending_alt_l
+                        // branch above).
+                        pending_alt_l = true;
                     } else if (key.matches('/', .{ .ctrl = true }) or key.matches(0x1F, .{})) {
                         buf.undo(gpa);
                     } else if (key.matches(';', .{ .ctrl = true })) {
