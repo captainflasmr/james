@@ -1493,7 +1493,7 @@ pub fn main(init: std.process.Init) !void {
                         if (bookmark_list_selected + 1 < bookmarks.items.len) bookmark_list_selected += 1;
                     } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
                         if (bookmark_list_selected > 0) bookmark_list_selected -= 1;
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
                         if (bookmark_list_selected < bookmarks.items.len) {
                             const name = bookmarks.items[bookmark_list_selected].name;
                             bookmark_list_active = false;
@@ -1969,8 +1969,18 @@ pub fn main(init: std.process.Init) !void {
             var list_row: u16 = 0;
             var i = bookmark_list_top;
             while (i < bookmarks.items.len and list_row < text_height) : (i += 1) {
-                const style: vaxis.Style = .{};
-                _ = win.printSegment(.{ .text = bookmarks.items[i].name, .style = style }, .{ .row_offset = list_row });
+                // The bookmark name, then its base directory dimmed after
+                // it. For a dired bookmark the path is a directory, so it
+                // shows itself; for a file bookmark, its parent directory.
+                const b = bookmarks.items[i];
+                _ = win.printSegment(.{ .text = b.name, .style = .{} }, .{ .row_offset = list_row });
+                const dir: ?[]const u8 = if (isDirectory(io, b.path))
+                    b.path
+                else
+                    std.fs.path.dirname(b.path);
+                if (dir) |d| {
+                    _ = win.printSegment(.{ .text = d, .style = .{ .dim = true } }, .{ .row_offset = list_row, .col_offset = win.gwidth(b.name) + 2 });
+                }
                 list_row += 1;
             }
             var list_ml_buf: [2048]u8 = undefined;

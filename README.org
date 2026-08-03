@@ -57,7 +57,7 @@ Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes 
 | =C-x h= | select the whole buffer (mark at start, point at end) |
 | =C-x r m= | bookmark the current position (name prompt, defaults to the file name) |
 | =C-x r b= | jump to a bookmark |
-| =C-x r l= / =C-c o= | list bookmarks (Enter jumps, n/p move, q closes) |
+| =C-x r l= / =C-c o= | list bookmarks (Enter/C-m jumps, n/p move, q closes) |
 | =C-c b= | copy the whole buffer to the kill ring |
 | =C-c w= | copy the region and deselect it |
 | =C-c C-k= | close the dired browser |
