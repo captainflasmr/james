@@ -26,6 +26,7 @@ Buffer-list picker for =C-x b=.
 - System clipboard integration via OSC 52: every kill or copy (=C-k=, =C-w=, =M-w=, =C-c b=, =C-c w=, =C-x C-k=) is mirrored onto the system clipboard, so text can be pasted into any other application (over ssh too — the terminal forwards the sequence). =C-y= with an empty kill ring requests the clipboard and pastes it into the buffer, like Emacs consulting the interprogram clipboard when the kill ring is empty. Terminals without OSC 52 support silently ignore the sequences.
 - Starting with no files now opens a three-pane default layout: the welcome screen left (full height), a =scratch.txt= buffer top right, and a dired of the current directory bottom right. =scratch.txt= is a real file in the current directory — created on first startup if missing, opened without truncation if it exists — so it saves and prompts like any other buffer. A read-only directory falls back to the plain single-window home screen.
 - =C-w= now saves the buffer (an alias of =C-x C-s=); kill-region lives at =C-x C-k= instead.
+- Dired sorts on the digit keys, matching the ls flags (and the author's Emacs dired bindings): =3= by size (largest first), =4= by modification time (newest first), =5= by name, =6= by extension, and =s= toggles between name and date (dired-sort-toggle-or-edit). The selection moves to the first real entry, ".." stays pinned first, and the chosen order persists across refreshes. Entries carry their raw size and mtime for this (no parsing the formatted metadata back out).
 
 ** 0.12.0 — <2026-08-02>
 

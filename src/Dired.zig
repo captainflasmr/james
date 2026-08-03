@@ -13,11 +13,20 @@ top: usize = 0,
 /// Next position for C-l (recenter-top-bottom): 0 = middle, 1 = top,
 /// 2 = bottom.
 recenter_pos: u8 = 0,
+/// How the listing is ordered — the digit keys 3-6 in dired, mirroring
+/// the ls flags S / t / (default) / X.
+sort_mode: SortMode = .name,
+
+pub const SortMode = enum { name, size, date, extension };
 
 pub const Entry = struct {
     name: []u8,
     is_dir: bool,
     is_link: bool = false,
+    /// The raw sort keys, captured from the stat so sorting by size or
+    /// date doesn't have to parse the formatted meta string back out.
+    size: u64 = 0,
+    mtime: i64 = 0,
     /// The ls -al style prefix: permissions, size, modification time and a
     /// trailing space, e.g. "drwxr-xr-x  1234 2026-08-02 14:30 ". Computed
     /// and heap-allocated once at load time, so rendering can print it
@@ -110,7 +119,7 @@ fn reload(self: *Dired, gpa: std.mem.Allocator, io: std.Io) !void {
         try self.entries.append(gpa, try makeEntry(gpa, io, dir, entry.name, entry.kind));
     }
 
-    std.mem.sort(Entry, self.entries.items, {}, lessThan);
+    std.mem.sort(Entry, self.entries.items, self.sort_mode, lessThan);
 }
 
 /// Build one entry: the name plus an ls -al style metadata prefix. A file
@@ -136,6 +145,8 @@ fn makeEntry(
         e.meta = try std.fmt.allocPrint(gpa, "----------  {d:>8}  1970-01-01 00:00:00 ", .{@as(u64, 0)});
         return e;
     };
+    e.size = stat.size;
+    e.mtime = @intCast(stat.mtime.nanoseconds);
     e.meta = try formatMeta(gpa, e, stat);
     return e;
 }
@@ -200,10 +211,51 @@ fn dateString(buf: *[19]u8, mtime: std.Io.Timestamp) void {
     }) catch {};
 }
 
-fn lessThan(_: void, a: Entry, b: Entry) bool {
+/// The part of a file name after the last dot, for sorting by extension
+/// like `ls -X`. Hidden files such as ".gitignore" are all extension, not
+/// extension-less.
+fn extensionOf(name: []const u8) []const u8 {
+    const base = std.fs.path.basename(name);
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return "";
+    if (dot == 0) return "";
+    return base[dot + 1 ..];
+}
+
+/// Order the listing by `mode`, keeping ".." pinned first. Size sorts
+/// largest first (`ls -S`), date newest first (`ls -t`); ties fall back
+/// to the name.
+fn lessThan(mode: SortMode, a: Entry, b: Entry) bool {
     if (std.mem.eql(u8, a.name, "..")) return true;
     if (std.mem.eql(u8, b.name, "..")) return false;
-    return std.ascii.lessThanIgnoreCase(a.name, b.name);
+    switch (mode) {
+        .name => return std.ascii.lessThanIgnoreCase(a.name, b.name),
+        .size => {
+            if (a.size != b.size) return a.size > b.size;
+            return std.ascii.lessThanIgnoreCase(a.name, b.name);
+        },
+        .date => {
+            if (a.mtime != b.mtime) return a.mtime > b.mtime;
+            return std.ascii.lessThanIgnoreCase(a.name, b.name);
+        },
+        .extension => {
+            const ae = extensionOf(a.name);
+            const be = extensionOf(b.name);
+            if (!std.mem.eql(u8, ae, be)) return std.ascii.lessThanIgnoreCase(ae, be);
+            return std.ascii.lessThanIgnoreCase(a.name, b.name);
+        },
+    }
+}
+
+/// Re-order the listing by `mode` (the digit keys 3-6, mirroring the ls
+/// flags S / t / default / X), keeping ".." pinned first. The selection
+/// moves to the first real entry, like the dired sort advice in the
+/// author's Emacs config.
+pub fn sortBy(self: *Dired, mode: SortMode) void {
+    self.sort_mode = mode;
+    std.mem.sort(Entry, self.entries.items, mode, lessThan);
+    self.selected = 0;
+    if (self.entries.items.len > 0 and std.mem.eql(u8, self.entries.items[0].name, "..")) self.selected = 1;
+    self.top = 0;
 }
 
 pub fn moveUp(self: *Dired) void {

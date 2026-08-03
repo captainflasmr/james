@@ -1027,12 +1027,11 @@ fn windowRedo(gpa: std.mem.Allocator, root: **Pane, focused: **Pane, current: us
 
 /// Reload a dired's listing and re-mirror it into its buffer's lines
 /// (used after copy / delete change the directory contents).
-fn refreshDired(gpa: std.mem.Allocator, io: std.Io, buffers: *std.ArrayList(*Buffer), direds: *std.ArrayList(?Dired), idx: usize) void {
-    if (idx >= direds.items.len or direds.items[idx] == null) return;
-    const d = &direds.items[idx].?;
-    d.refresh(gpa, io) catch return;
-
-    const buf = buffers.items[idx];
+/// Re-mirror a dired's listing into its buffer's lines (name, with a "/"
+/// for directories) so incremental search and the prompt-mode rendering
+/// see the file names like any other buffer. The mirror must be rebuilt
+/// whenever the listing changes or is re-sorted.
+fn mirrorDiredLines(gpa: std.mem.Allocator, buf: *Buffer, d: *const Dired) void {
     for (buf.lines.items) |*l| l.deinit(gpa);
     buf.lines.clearRetainingCapacity();
     for (d.entries.items) |e| {
@@ -1043,6 +1042,13 @@ fn refreshDired(gpa: std.mem.Allocator, io: std.Io, buffers: *std.ArrayList(*Buf
         buf.lines.append(gpa, line) catch return;
     }
     if (buf.cursor_row >= buf.lines.items.len) buf.cursor_row = buf.lines.items.len -| 1;
+}
+
+fn refreshDired(gpa: std.mem.Allocator, io: std.Io, buffers: *std.ArrayList(*Buffer), direds: *std.ArrayList(?Dired), idx: usize) void {
+    if (idx >= direds.items.len or direds.items[idx] == null) return;
+    const d = &direds.items[idx].?;
+    d.refresh(gpa, io) catch return;
+    mirrorDiredLines(gpa, buffers.items[idx], d);
 }
 
 /// A named (file, position) pair, like an Emacs bookmark. Persisted to
@@ -1774,6 +1780,25 @@ pub fn main(init: std.process.Init) !void {
                             // C-l: recenter the listing on the selection.
                             d.recenterTopBottom(focused_text_height, last_was_recenter);
                             last_was_recenter = true;
+                        } else if (key.matches('s', .{})) {
+                            // s: dired-sort-toggle-or-edit — toggle between
+                            // name and date sorting (the classic dired
+                            // pair); from any other sort, back to name.
+                            d.sortBy(if (d.sort_mode == .name) Dired.SortMode.date else Dired.SortMode.name);
+                            mirrorDiredLines(gpa, buffers.items[current], d);
+                            buffers.items[current].cursor_row = d.selected;
+                        } else if (key.matches('3', .{}) or key.matches('4', .{}) or key.matches('5', .{}) or key.matches('6', .{})) {
+                            // 3-6: sort the listing by size / date / name
+                            // / extension (the digit bindings from the
+                            // author's Emacs dired setup).
+                            d.sortBy(switch (key.text.?[0]) {
+                                '3' => Dired.SortMode.size,
+                                '4' => Dired.SortMode.date,
+                                '5' => Dired.SortMode.name,
+                                else => Dired.SortMode.extension,
+                            });
+                            mirrorDiredLines(gpa, buffers.items[current], d);
+                            buffers.items[current].cursor_row = d.selected;
                         } else if (key.matches('e', .{ .alt = true }) or key.matches('^', .{})) {
                             if (try d.upPath(gpa)) |parent| {
                                 defer gpa.free(parent);
