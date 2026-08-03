@@ -149,7 +149,10 @@ fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, 
         else
             (if (s.backward) "I-search backward" else "I-search");
         break :blk std.fmt.bufPrint(modeline_buf, "{s}: {s}", .{ label, s.query }) catch label;
-    } else std.fmt.bufPrint(modeline_buf, "{s}{s}  L{d}:C{d}", .{
+    } else std.fmt.bufPrint(modeline_buf, "{s}{s}{s}  L{d}:C{d}", .{
+        // Emacs-style modified marker in the bottom-left corner of the
+        // modeline.
+        if (buf.dirty) "*" else "",
         buf.display_name orelse buf.filename orelse "?",
         if (buf.dirty) " [modified]" else "",
         buf.cursor_row + 1,
@@ -161,7 +164,7 @@ fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, 
     // caller keeps alive until after render — vaxis stores grapheme slices,
     // not copies, so a stack-local fill buffer would dangle and show
     // garbage once this frame returns.
-    const style: vaxis.Style = if (is_focused) .{} else .{ .dim = true };
+    const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true };
     const text_w = win.gwidth(modeline);
     const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
     if (fill_n > 0) @memset(modeline_buf[modeline.len .. modeline.len + fill_n], ' ');
@@ -330,7 +333,12 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
     // Entries print their own heap-allocated metadata prefix and name
     // (plus a "/" segment for directories), never a stack-local copy —
     // vaxis stores grapheme slices, so a scratch buffer would be clobbered
-    // by the next pane rendered in the same frame.
+    // by the next pane rendered in the same frame. An active isearch
+    // highlights the matched part of the entry's name.
+    const searching = search != null;
+    const match: ?Buffer.Pos = if (search) |s| (if (s.failed) null else s.match) else null;
+    const query_len: usize = if (search) |s| s.query.len else 0;
+
     var row: u16 = 0;
     var i = dired.top;
     while (i < dired.entries.items.len and row < text_height) : (i += 1) {
@@ -338,7 +346,30 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
         const style: vaxis.Style = .{};
         _ = win.printSegment(.{ .text = e.meta, .style = style }, .{ .row_offset = row_base + row });
         const name_col = win.gwidth(e.meta);
-        _ = win.printSegment(.{ .text = e.name, .style = style }, .{ .row_offset = row_base + row, .col_offset = name_col });
+        const hl: ?Highlight = if (searching) blk: {
+            if (match) |m| {
+                if (i == m.row) {
+                    const start = @min(m.col, e.name.len);
+                    const end = @min(m.col + query_len, e.name.len);
+                    if (end > start) break :blk .{ .start = start, .end = end };
+                }
+            }
+            break :blk null;
+        } else null;
+        if (hl) |h| {
+            var col = name_col;
+            if (h.start > 0) {
+                _ = win.printSegment(.{ .text = e.name[0..h.start], .style = style }, .{ .row_offset = row_base + row, .col_offset = col });
+                col += win.gwidth(e.name[0..h.start]);
+            }
+            _ = win.printSegment(.{ .text = e.name[h.start..h.end], .style = highlight_style }, .{ .row_offset = row_base + row, .col_offset = col });
+            col += win.gwidth(e.name[h.start..h.end]);
+            if (h.end < e.name.len) {
+                _ = win.printSegment(.{ .text = e.name[h.end..], .style = style }, .{ .row_offset = row_base + row, .col_offset = col });
+            }
+        } else {
+            _ = win.printSegment(.{ .text = e.name, .style = style }, .{ .row_offset = row_base + row, .col_offset = name_col });
+        }
         if (e.is_dir) {
             _ = win.printSegment(.{ .text = "/", .style = style }, .{ .row_offset = row_base + row, .col_offset = name_col + win.gwidth(e.name) });
         }
@@ -352,14 +383,21 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
             (if (s.backward) "I-search backward" else "I-search");
         break :blk std.fmt.bufPrint(modeline_buf, "{s}: {s}", .{ label, s.query }) catch label;
     } else std.fmt.bufPrint(modeline_buf, "Dired: {s}   (Enter opens, ^ up, q quits)", .{dired.path.items}) catch "Dired";
-    const style: vaxis.Style = if (is_focused) .{} else .{ .dim = true };
+    const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true };
     const text_w = win.gwidth(modeline);
     const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
     if (fill_n > 0) @memset(modeline_buf[modeline.len .. modeline.len + fill_n], ' ');
     _ = win.printSegment(.{ .text = modeline_buf[0 .. modeline.len + fill_n], .style = style }, .{ .row_offset = row_base + (height -| 1) });
 
     if (is_focused) {
-        win.showCursor(0, @intCast(dired.selected - dired.top));
+        // The cursor sits at the start of the entry's name, after the
+        // metadata prefix, rather than at the start of the line.
+        const sel = dired.selected;
+        const name_col: u16 = if (sel < dired.entries.items.len)
+            win.gwidth(dired.entries.items[sel].meta)
+        else
+            0;
+        win.showCursor(name_col, @intCast(sel - dired.top));
     }
 }
 
@@ -1310,7 +1348,10 @@ pub fn main(init: std.process.Init) !void {
                 (std.fmt.bufPrint(&count_buf, "  ({d}/{d})", .{ current + 1, buffers.items.len }) catch "")
             else
                 "";
-            break :blk std.fmt.bufPrint(&modeline_buf, "-- {s}{s}{s}{s}  L{d}:C{d} --", .{
+            break :blk std.fmt.bufPrint(&modeline_buf, "{s}-- {s}{s}{s}{s}  L{d}:C{d} --", .{
+                // Emacs-style modified marker in the bottom-left corner of
+                // the modeline.
+                if (buf.dirty) "*" else "",
                 buf.display_name orelse buf.filename orelse "?",
                 if (buf.dirty) " [modified]" else "",
                 if (buf.mark != null) " [mark set]" else "",
@@ -1321,7 +1362,7 @@ pub fn main(init: std.process.Init) !void {
         };
         // Same full-width bar as the pane modelines: the whole row is one
         // segment in `modeline_buf`, kept alive until after the render.
-        const style: vaxis.Style = .{};
+        const style: vaxis.Style = highlight_style;
         const text_w = win.gwidth(modeline);
         const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
         if (fill_n > 0) @memset(modeline_buf[modeline.len .. modeline.len + fill_n], ' ');

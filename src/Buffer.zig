@@ -26,6 +26,10 @@ const Snapshot = struct {
     cursor_row: usize,
     cursor_col: usize,
     mark: ?Pos,
+    /// The dirty flag at the moment the snapshot was taken, so undoing
+    /// back to the saved state clears [modified] (and undoing past an
+    /// edit restores it).
+    dirty: bool,
 
     fn deinit(self: *Snapshot, gpa: std.mem.Allocator) void {
         for (self.lines.items) |*line| line.deinit(gpa);
@@ -139,6 +143,7 @@ fn recordUndo(self: *Buffer, gpa: std.mem.Allocator, kind: UndoKind) !void {
         .cursor_row = self.cursor_row,
         .cursor_col = self.cursor_col,
         .mark = self.mark,
+        .dirty = self.dirty,
     });
     self.undo_group = kind;
 }
@@ -154,7 +159,7 @@ pub fn undo(self: *Buffer, gpa: std.mem.Allocator) void {
     self.cursor_col = snap.cursor_col;
     self.mark = snap.mark;
     self.undo_group = .none;
-    self.dirty = true;
+    self.dirty = snap.dirty;
 }
 
 fn insertSliceRaw(self: *Buffer, gpa: std.mem.Allocator, text: []const u8) !void {
@@ -458,9 +463,25 @@ pub fn scrollToCursor(self: *Buffer, height: usize) void {
 
 pub const SearchDirection = enum { forward, backward };
 
+/// Case-insensitive backward search, mirroring std.ascii.findIgnoreCasePos
+/// (std only ships the forward variant).
+fn lastIndexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len > haystack.len or needle.len == 0) return null;
+    var i = haystack.len - needle.len;
+    while (true) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+        if (i == 0) break;
+        i -= 1;
+    }
+    return null;
+}
+
 /// Find the next occurrence of `query` from `from`, wrapping around the
 /// buffer if needed. Search never crosses a line boundary within a single
 /// match. Returns the position of the start of the match.
+///
+/// Matching is always case-insensitive (ASCII), like the Jasspa "exact"
+/// mode being off.
 pub fn findNext(self: Buffer, query: []const u8, from: Pos, dir: SearchDirection) ?Pos {
     const n = self.lines.items.len;
     if (query.len == 0 or n == 0) return null;
@@ -473,7 +494,7 @@ pub fn findNext(self: Buffer, query: []const u8, from: Pos, dir: SearchDirection
             while (i <= n) : (i += 1) {
                 const line = self.lines.items[row].items;
                 if (col_start <= line.len) {
-                    if (std.mem.indexOfPos(u8, line, col_start, query)) |c| {
+                    if (std.ascii.findIgnoreCasePos(line, col_start, query)) |c| {
                         return .{ .row = row, .col = c };
                     }
                 }
@@ -489,7 +510,7 @@ pub fn findNext(self: Buffer, query: []const u8, from: Pos, dir: SearchDirection
             while (i <= n) : (i += 1) {
                 const line = self.lines.items[row].items;
                 const limit = @min(end_col orelse line.len, line.len);
-                if (std.mem.lastIndexOf(u8, line[0..limit], query)) |c| {
+                if (lastIndexOfIgnoreCase(line[0..limit], query)) |c| {
                     return .{ .row = row, .col = c };
                 }
                 row = if (row == 0) n - 1 else row - 1;
