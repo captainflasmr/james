@@ -74,7 +74,7 @@ Window keys (mostly aliases of the =C-x= window commands, plus a few extras):
 | =C-x 3= / =M-;= | split vertically (side-by-side) — =M-;= also moves to the new window |
 | =C-x o= / =M-n= | move to the next window |
 | =M-p= | move to the previous window |
-| =C-x 0= / =M-q= | delete the current window |
+| =C-x 0= / =M-q= / =M-'= | delete the current window |
 | =C-x 1= / =M-a= | collapse back to a single window |
 | =M-C-h= / =M-C-l= | shrink / enlarge the current window's width |
 | =M-C-k= / =M-C-j= | shrink / enlarge the current window's depth |
@@ -92,7 +92,7 @@ While searching: type to extend the query, =C-s=/=C-r= again jumps to the next/p
 
 If the buffer has unsaved changes, =C-x C-c= asks "Save file ... before exiting?" on the status line: =y= saves and quits, =n= quits without saving, and =C-g= (or Escape) cancels the quit and returns to editing. Any other key is ignored while the prompt is up, rather than risk a stray keystroke accidentally choosing for you.
 
-Consecutive =C-k=/=C-w=/=M-w= presses append to the same kill instead of overwriting it, same as real Emacs — typing or moving the cursor in between starts a fresh kill. The kill ring is shared across all open buffers, so you can kill text in one file and yank it into another. Once a mark is set, the region between mark and point is shown in reverse video as you move the cursor, and the highlight clears automatically once you kill, copy, or otherwise drop the mark.
+Consecutive =C-k=/=C-w=/=M-w= presses append to the same kill instead of overwriting it, same as real Emacs — typing or moving the cursor in between starts a fresh kill. The kill ring is shared across all open buffers, so you can kill text in one file and yank it into another. Every kill or copy is also mirrored onto the system clipboard (OSC 52), so text you kill in james can be pasted into any other application — and over ssh too, since the terminal forwards the sequence; terminals without OSC 52 support just ignore it. The other direction works the same way: =C-y= with an empty kill ring pastes the system clipboard into the buffer. Once a mark is set, the region between mark and point is shown in reverse video as you move the cursor, and the highlight clears automatically once you kill, copy, or otherwise drop the mark.
 
 Undo (=C-x u=) restores whole-buffer snapshots taken before each edit, and coalesces a run of the same kind of edit (a burst of typing, a run of backspaces) into a single step, so undoing a word you just typed is one keypress, not one per character. Switching to a different kind of edit — or moving the cursor — starts a new undo step. There's no redo yet; undo is a one-way trip back through history, and it doesn't (yet) clear the =[modified]= flag even if it lands you back on the exact text you loaded. Undo history, the mark, cursor position, and the dirty flag are all separate per buffer; only the kill ring is shared.
 

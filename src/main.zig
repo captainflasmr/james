@@ -26,6 +26,9 @@ fn silence(
 const Event = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
+    /// The terminal's answer to an OSC 52 clipboard request; the text is
+    /// allocated with gpa and must be freed by the handler.
+    paste: []const u8,
 };
 
 // The mark region and the isearch match keep this reverse-video
@@ -511,6 +514,14 @@ fn restoreEditor(gpa: std.mem.Allocator, vx: *vaxis.Vaxis, tty: *vaxis.Tty) !voi
     }
 }
 
+/// Mirror the kill ring onto the system clipboard (OSC 52), so a kill or
+/// copy in james is available to other applications — even over ssh, since
+/// the terminal forwards the sequence. Terminals without OSC 52 support
+/// simply ignore it.
+fn syncClipboard(vx: *vaxis.Vaxis, tty: *vaxis.Tty, gpa: std.mem.Allocator, kill_ring: []const u8) void {
+    vx.copyToSystemClipboard(tty.writer(), kill_ring, gpa) catch {};
+}
+
 // --- terminal-size watchdog ---------------------------------------------
 //
 // Changing the font size in a terminal like foot or alacritty rescales
@@ -707,12 +718,11 @@ fn renderTree(
 /// It's a plain buffer (so movement, search and every C-x command work on
 /// it) with no backing file; C-x d / C-x C-f lead somewhere real.
 const welcome_text =
-    \\          ██╗ █████╗ ███╗   ███╗███████╗███████╗
-    \\          ██║██╔══██╗████╗ ████║██╔════╝██╔════╝
-    \\          ██║███████║██╔████╔██║█████╗  ███████╗
-    \\          ██║██╔══██║██║╚██╔╝██║██╔══╝  ╚════██║
-    \\          ██║██║  ██║██║ ╚═╝ ██║███████╗███████║
-    \\          ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚══════╝
+    \\          _   _    __  __ _____ ____
+    \\         | | / \  |  \/  | ____/ ___|
+    \\      _  | |/ _ \ | |\/| |  _| \___ \
+    \\     | |_| / ___ \| |  | | |___ ___) |
+    \\      \___/_/   \_\_|  |_|_____|____/
     \\
     \\  Welcome to james, a minimal Emacs-inspired editor for the terminal.
     \\
@@ -1198,7 +1208,7 @@ pub fn main(init: std.process.Init) !void {
     // swap ever happens so C-x j can hand the terminal back to it.
     const editor_pgrp: ?std.posix.pid_t = shellForegroundPgrp(&tty);
 
-    var vx = try vaxis.init(io, gpa, init.environ_map, .{});
+    var vx = try vaxis.init(io, gpa, init.environ_map, .{ .system_clipboard_allocator = gpa });
     defer vx.deinit(null, tty.writer());
 
     var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);
@@ -1334,6 +1344,16 @@ pub fn main(init: std.process.Init) !void {
                     last_winsize = real;
                 }
             },
+            .paste => |text| {
+                defer gpa.free(text);
+                // The terminal answered an OSC 52 clipboard request (C-y
+                // with an empty kill ring): insert the text at the cursor
+                // as a normal edit. Dired buffers are read-only.
+                const b: *Buffer = buffers.items[current];
+                if (direds.items[current] == null) {
+                    b.insertSlice(gpa, text) catch {};
+                }
+            },
             .key_press => |key| {
                 // C-l cycles recenter positions only when pressed back to
                 // back (Emacs recenter-top-bottom); any other key makes the
@@ -1356,9 +1376,11 @@ pub fn main(init: std.process.Init) !void {
                     pending_ctrl_c = false;
                     if (key.matches('b', .{})) {
                         try buf.copyWholeBuffer(gpa, &kill_ring);
+                        syncClipboard(&vx, &tty, gpa, kill_ring.items);
                         kill_active = true;
                     } else if (key.matches('w', .{})) {
                         try buf.copyRegion(gpa, &kill_ring, false);
+                        syncClipboard(&vx, &tty, gpa, kill_ring.items);
                         buf.mark = null;
                         kill_active = true;
                     } else if (key.matches('k', .{ .ctrl = true })) {
@@ -1637,6 +1659,7 @@ pub fn main(init: std.process.Init) !void {
                         buf.moveBufEnd();
                     } else if (key.matches('k', .{ .ctrl = true })) {
                         try buf.killRegion(gpa, &kill_ring, kill_active);
+                        syncClipboard(&vx, &tty, gpa, kill_ring.items);
                         kill_active = true;
                     } else if (key.matches('2', .{}) or key.matches('3', .{})) {
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
@@ -1803,15 +1826,29 @@ pub fn main(init: std.process.Init) !void {
                         buf.mark = null;
                     } else if (key.matches('k', .{ .ctrl = true })) {
                         try buf.killLine(gpa, &kill_ring, was_kill);
+                        syncClipboard(&vx, &tty, gpa, kill_ring.items);
                         kill_active = true;
                     } else if (key.matches('w', .{ .ctrl = true })) {
                         try buf.killRegion(gpa, &kill_ring, was_kill);
+                        syncClipboard(&vx, &tty, gpa, kill_ring.items);
                         kill_active = true;
                     } else if (key.matches('w', .{ .alt = true })) {
                         try buf.copyRegion(gpa, &kill_ring, was_kill);
+                        syncClipboard(&vx, &tty, gpa, kill_ring.items);
                         kill_active = true;
                     } else if (key.matches('y', .{ .ctrl = true })) {
-                        if (editing) try buf.yank(gpa, &kill_ring);
+                        if (editing) {
+                            if (kill_ring.items.len > 0) {
+                                try buf.yank(gpa, &kill_ring);
+                            } else {
+                                // Nothing has been killed yet: yank the
+                                // system clipboard instead (Emacs consults
+                                // the interprogram clipboard when the kill
+                                // ring is empty). The terminal answers
+                                // asynchronously with a .paste event.
+                                vx.requestSystemClipboard(tty.writer()) catch {};
+                            }
+                        }
                     } else if (key.matches('f', .{ .ctrl = true }) or key.matches(vaxis.Key.right, .{})) {
                         buf.moveRight();
                     } else if (key.matches('b', .{ .ctrl = true }) or key.matches(vaxis.Key.left, .{})) {
@@ -1841,7 +1878,9 @@ pub fn main(init: std.process.Init) !void {
                             focused = focused.right.?;
                             current = focused.buf_idx;
                         }
-                    } else if (key.matches('q', .{ .alt = true })) {
+                    } else if (key.matches('q', .{ .alt = true }) or key.matches('\'', .{ .alt = true })) {
+                        // M-q / M-': delete the current window, giving its
+                        // space to the sibling.
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         if (deleteFocusedPane(gpa, &root, focused)) |nf| {
                             focused = nf;

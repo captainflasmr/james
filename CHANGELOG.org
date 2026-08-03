@@ -22,6 +22,8 @@ Buffer-list picker for =C-x b=.
 - =C-x j= (or =C-x c=) drops out of the editor into a real shell: the alternate screen is left and the terminal restored to its normal mode, then =$SHELL= (or =/bin/sh=) takes over the whole screen — full-screen programs included. =exit= / =C-d= returns to the editor, as does =C-z=, which only suspends the shell and is resumed by the next =C-x j= / =C-x c= with its state intact. POSIX-only (Linux/macOS) for now; Windows has no way to hand the terminal to a child process group (ConPTY would be the proper approach there).
 - =C-l= recenters the window on the cursor line like Emacs recenter-top-bottom, within the focused pane of a split; it works in dired listings too. The position cycles middle → top → bottom only while =C-l= is pressed back to back; any other key — navigation included — resets the next =C-l= to the middle.
 - The bookmark picker now shows each bookmark's base directory (dimmed, after the name; a dired bookmark shows its own directory), and =C-m= selects the bookmark like Enter — including terminals that report C-m through the kitty keyboard protocol as a modified key.
+- =M-'= is now an alias for =M-q=: delete the current window (the window-delete key from the Jasspa setup).
+- System clipboard integration via OSC 52: every kill or copy (=C-k=, =C-w=, =M-w=, =C-c b=, =C-c w=, =C-x C-k=) is mirrored onto the system clipboard, so text can be pasted into any other application (over ssh too — the terminal forwards the sequence). =C-y= with an empty kill ring requests the clipboard and pastes it into the buffer, like Emacs consulting the interprogram clipboard when the kill ring is empty. Terminals without OSC 52 support silently ignore the sequences.
 
 ** 0.12.0 — <2026-08-02>
 
