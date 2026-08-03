@@ -27,6 +27,9 @@ const Event = union(enum) {
     winsize: vaxis.Winsize,
 };
 
+// The mark region and the isearch match keep this reverse-video
+// highlight. The dired selection and the modelines are plain — the
+// blinking block cursor marks position there.
 const highlight_style: vaxis.Style = .{ .reverse = true };
 
 const Highlight = struct { start: usize, end: usize };
@@ -158,7 +161,7 @@ fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, 
     // caller keeps alive until after render — vaxis stores grapheme slices,
     // not copies, so a stack-local fill buffer would dangle and show
     // garbage once this frame returns.
-    const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true, .reverse = true };
+    const style: vaxis.Style = if (is_focused) .{} else .{ .dim = true };
     const text_w = win.gwidth(modeline);
     const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
     if (fill_n > 0) @memset(modeline_buf[modeline.len .. modeline.len + fill_n], ' ');
@@ -332,7 +335,7 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
     var i = dired.top;
     while (i < dired.entries.items.len and row < text_height) : (i += 1) {
         const e = dired.entries.items[i];
-        const style: vaxis.Style = if (i == dired.selected) highlight_style else .{};
+        const style: vaxis.Style = .{};
         _ = win.printSegment(.{ .text = e.meta, .style = style }, .{ .row_offset = row_base + row });
         const name_col = win.gwidth(e.meta);
         _ = win.printSegment(.{ .text = e.name, .style = style }, .{ .row_offset = row_base + row, .col_offset = name_col });
@@ -349,7 +352,7 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
             (if (s.backward) "I-search backward" else "I-search");
         break :blk std.fmt.bufPrint(modeline_buf, "{s}: {s}", .{ label, s.query }) catch label;
     } else std.fmt.bufPrint(modeline_buf, "Dired: {s}   (Enter opens, ^ up, q quits)", .{dired.path.items}) catch "Dired";
-    const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true, .reverse = true };
+    const style: vaxis.Style = if (is_focused) .{} else .{ .dim = true };
     const text_w = win.gwidth(modeline);
     const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
     if (fill_n > 0) @memset(modeline_buf[modeline.len .. modeline.len + fill_n], ' ');
@@ -1207,6 +1210,10 @@ pub fn main(init: std.process.Init) !void {
         const buf: *Buffer = buffers.items[current];
         const win = vx.window();
         win.clear();
+        // The blinking block cursor is the position indicator: there are no
+        // reverse-video line highlights, so this is what marks the dired
+        // selection, the isearch match, and point.
+        win.setCursorShape(.block_blink);
 
         const text_height: usize = if (win.height > 1) win.height - 1 else win.height;
         // Dired and isearch are not modal: they render inside whichever
@@ -1237,7 +1244,7 @@ pub fn main(init: std.process.Init) !void {
             var list_row: u16 = 0;
             var i = bookmark_list_top;
             while (i < bookmarks.items.len and list_row < text_height) : (i += 1) {
-                const style: vaxis.Style = if (i == bookmark_list_selected) highlight_style else .{};
+                const style: vaxis.Style = .{};
                 _ = win.printSegment(.{ .text = bookmarks.items[i].name, .style = style }, .{ .row_offset = list_row });
                 list_row += 1;
             }
@@ -1246,7 +1253,9 @@ pub fn main(init: std.process.Init) !void {
                 bookmark_list_selected + 1,
                 bookmarks.items.len,
             }) catch "Bookmarks";
-            _ = win.printSegment(.{ .text = list_ml, .style = highlight_style }, .{ .row_offset = win.height -| 1 });
+            _ = win.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = win.height -| 1 });
+            // No highlights: the block cursor marks the selected bookmark.
+            win.showCursor(0, @intCast(bookmark_list_selected - bookmark_list_top));
             try vx.render(tty.writer());
             continue;
         }
@@ -1312,7 +1321,7 @@ pub fn main(init: std.process.Init) !void {
         };
         // Same full-width bar as the pane modelines: the whole row is one
         // segment in `modeline_buf`, kept alive until after the render.
-        const style: vaxis.Style = highlight_style;
+        const style: vaxis.Style = .{};
         const text_w = win.gwidth(modeline);
         const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
         if (fill_n > 0) @memset(modeline_buf[modeline.len .. modeline.len + fill_n], ' ');
