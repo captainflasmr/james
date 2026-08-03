@@ -511,6 +511,44 @@ fn restoreEditor(gpa: std.mem.Allocator, vx: *vaxis.Vaxis, tty: *vaxis.Tty) !voi
     }
 }
 
+// --- terminal-size watchdog ---------------------------------------------
+//
+// Changing the font size in a terminal like foot or alacritty rescales
+// the cell grid, and while these terminals usually do send SIGWINCH for
+// it, not every grid change is delivered reliably. Since the editor only
+// re-checks its size on events, a terminal that stays quiet would leave
+// it stuck at the old dimensions — the content shrinks with gaps to the
+// right and bottom — until the next keystroke. A dedicated thread
+// re-reads the kernel's ioctl size every 100ms and posts a winsize event
+// only when it actually changed, so the editor tracks the terminal on
+// its own, fast enough to land well before the next keystroke.
+//
+// A thread rather than a signal handler: postEvent takes the event
+// queue's mutex, and a handler that interrupted the main thread inside a
+// queue critical section would deadlock on it. The thread holds no
+// locks across the editor's fork for the C-x j shell (spawn does no
+// allocation between fork and exec), so the swap stays safe too.
+fn sizeWatchdogMain(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event)) void {
+    var last: vaxis.Winsize = tty.getWinsize() catch std.mem.zeroes(vaxis.Winsize);
+    while (true) {
+        io.sleep(std.Io.Duration.fromMilliseconds(100), .real) catch continue;
+        const ws = tty.getWinsize() catch continue;
+        if (ws.cols == 0 or ws.rows == 0) continue;
+        if (last.cols == ws.cols and last.rows == ws.rows) continue;
+        // Only remember the size if the event actually got posted, so a
+        // full queue doesn't swallow the change forever.
+        if (loop.postEvent(.{ .winsize = ws })) |_| {
+            last = ws;
+        } else |_| {}
+    }
+}
+
+fn armSizeWatchdog(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event)) void {
+    // The future is deliberately dropped: its thread runs for the life of
+    // the editor, and the dropped wrapper keeps the context alive.
+    _ = io.concurrent(sizeWatchdogMain, .{ io, tty, loop }) catch {};
+}
+
 /// Render one dired listing plus its own compact modeline into `win`, which
 /// may be the whole screen or one pane of a split. Same shape as
 /// `renderPane`, so dired lives inside the current window instead of
@@ -1178,6 +1216,9 @@ pub fn main(init: std.process.Init) !void {
             last_winsize = ws;
         }
     }
+    // The size watchdog is portable (a thread + ioctl/console query), so
+    // every platform gets the same safety net.
+    armSizeWatchdog(io, &tty, &loop);
 
     var pending_ctrl_x = false;
     var pending_ctrl_x_r = false;
