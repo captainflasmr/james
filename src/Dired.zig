@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Dired = @This();
 
@@ -13,6 +14,13 @@ top: usize = 0,
 pub const Entry = struct {
     name: []u8,
     is_dir: bool,
+    is_link: bool = false,
+    /// The ls -al style prefix: permissions, size, modification time and a
+    /// trailing space, e.g. "drwxr-xr-x  1234 2026-08-02 14:30 ". Computed
+    /// and heap-allocated once at load time, so rendering can print it
+    /// directly (vaxis stores grapheme slices, not copies — no scratch
+    /// buffers at render time).
+    meta: []u8 = &.{},
 };
 
 pub const Choice = union(enum) {
@@ -30,7 +38,10 @@ pub fn deinit(self: *Dired, gpa: std.mem.Allocator) void {
 }
 
 fn freeEntries(self: *Dired, gpa: std.mem.Allocator) void {
-    for (self.entries.items) |e| gpa.free(e.name);
+    for (self.entries.items) |e| {
+        gpa.free(e.name);
+        gpa.free(e.meta);
+    }
     self.entries.clearRetainingCapacity();
 }
 
@@ -76,7 +87,7 @@ fn reload(self: *Dired, gpa: std.mem.Allocator, io: std.Io) !void {
 
     if (try parentOf(gpa, self.path.items)) |parent| {
         gpa.free(parent);
-        try self.entries.append(gpa, .{ .name = try gpa.dupe(u8, ".."), .is_dir = true });
+        try self.entries.append(gpa, try makeEntry(gpa, io, dir, "..", .directory));
     }
 
     var it = dir.iterate();
@@ -85,13 +96,97 @@ fn reload(self: *Dired, gpa: std.mem.Allocator, io: std.Io) !void {
             .directory, .file, .sym_link => {},
             else => continue,
         }
-        try self.entries.append(gpa, .{
-            .name = try gpa.dupe(u8, entry.name),
-            .is_dir = entry.kind == .directory,
-        });
+        try self.entries.append(gpa, try makeEntry(gpa, io, dir, entry.name, entry.kind));
     }
 
     std.mem.sort(Entry, self.entries.items, {}, lessThan);
+}
+
+/// Build one entry: the name plus an ls -al style metadata prefix. A file
+/// that can't be stat'd (e.g. a broken symlink) keeps the entry with a
+/// zeroed metadata line rather than vanishing, like real dired.
+fn makeEntry(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    name: []const u8,
+    kind: std.Io.File.Kind,
+) !Entry {
+    var e: Entry = .{
+        .name = try gpa.dupe(u8, name),
+        .is_dir = kind == .directory,
+        .is_link = kind == .sym_link,
+    };
+    errdefer gpa.free(e.name);
+    errdefer gpa.free(e.meta);
+
+    const stat = dir.statFile(io, name, .{ .follow_symlinks = false }) catch {
+        // Stat failed: zeroed metadata, keeping column alignment.
+        e.meta = try std.fmt.allocPrint(gpa, "----------  {d:>8}  1970-01-01 00:00:00 ", .{@as(u64, 0)});
+        return e;
+    };
+    e.meta = try formatMeta(gpa, e, stat);
+    return e;
+}
+
+/// "drwxr-xr-x  1234 2026-08-02 14:30 " for a POSIX stat; on Windows the
+/// permission bits don't exist, so the nine permission characters become
+/// "r/w" for writability and "-" elsewhere.
+fn formatMeta(gpa: std.mem.Allocator, e: Entry, stat: std.Io.File.Stat) ![]u8 {
+    var perms_buf: [10]u8 = undefined;
+    permString(&perms_buf, e, stat.permissions);
+    var date_buf: [19]u8 = undefined;
+    dateString(&date_buf, stat.mtime);
+    return std.fmt.allocPrint(gpa, "{s} {d:>8} {s} ", .{ perms_buf, stat.size, date_buf });
+}
+
+fn permString(buf: *[10]u8, e: Entry, perms: std.Io.File.Permissions) void {
+    buf[0] = if (e.is_dir) 'd' else if (e.is_link) 'l' else '-';
+    if (comptime builtin.os.tag == .windows) {
+        // Windows has no rwx bits; FILE_ATTRIBUTE_READONLY is 0x1. (The
+        // std helper is unusable here — it doesn't compile for Windows in
+        // this Zig version.)
+        const attrs: u32 = @intFromEnum(perms);
+        buf[1] = 'r';
+        buf[2] = if (attrs & 1 != 0) '-' else 'w';
+        for (buf[3..10]) |*c| c.* = '-';
+    } else {
+        const mode = perms.toMode();
+        var i: usize = 1;
+        // setuid / setgid / sticky sit three octal places above the
+        // class's read bit, so the shift differs per class (3, 5, 7 bits).
+        for ([_]u16{ 0o400, 0o040, 0o004 }, [3]u4{ 3, 5, 7 }) |rbit, sshift| {
+            buf[i] = if (mode & rbit != 0) 'r' else '-';
+            i += 1;
+            buf[i] = if (mode & (rbit >> 1) != 0) 'w' else '-';
+            i += 1;
+            const xbit = rbit >> 2;
+            const sbit = rbit << sshift;
+            buf[i] = if (mode & xbit != 0)
+                (if (mode & sbit != 0) 's' else 'x')
+            else
+                (if (mode & sbit != 0) 'S' else '-');
+            i += 1;
+        }
+    }
+}
+
+fn dateString(buf: *[19]u8, mtime: std.Io.Timestamp) void {
+    const secs_i: i64 = @intCast(@divTrunc(mtime.nanoseconds, 1_000_000_000));
+    const secs: u64 = @intCast(@max(secs_i, 0));
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const day = es.getEpochDay();
+    const ds = es.getDaySeconds();
+    const yd = day.calculateYearDay();
+    const md = yd.calculateMonthDay();
+    _ = std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+        yd.year,
+        md.month.numeric(),
+        md.day_index + 1,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    }) catch {};
 }
 
 fn lessThan(_: void, a: Entry, b: Entry) bool {

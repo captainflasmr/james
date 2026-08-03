@@ -324,18 +324,20 @@ fn deleteOtherWindows(gpa: std.mem.Allocator, root: *Pane, focused: *Pane) usize
 fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, search: ?IsearchView) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     dired.scrollToSelected(text_height);
-    // Entry labels print the entry's own heap-allocated name (plus a "/"
-    // segment for directories), never a stack-local copy — vaxis stores
-    // grapheme slices, so a scratch buffer would be clobbered by the next
-    // pane rendered in the same frame.
+    // Entries print their own heap-allocated metadata prefix and name
+    // (plus a "/" segment for directories), never a stack-local copy —
+    // vaxis stores grapheme slices, so a scratch buffer would be clobbered
+    // by the next pane rendered in the same frame.
     var row: u16 = 0;
     var i = dired.top;
     while (i < dired.entries.items.len and row < text_height) : (i += 1) {
         const e = dired.entries.items[i];
         const style: vaxis.Style = if (i == dired.selected) highlight_style else .{};
-        _ = win.printSegment(.{ .text = e.name, .style = style }, .{ .row_offset = row_base + row });
+        _ = win.printSegment(.{ .text = e.meta, .style = style }, .{ .row_offset = row_base + row });
+        const name_col = win.gwidth(e.meta);
+        _ = win.printSegment(.{ .text = e.name, .style = style }, .{ .row_offset = row_base + row, .col_offset = name_col });
         if (e.is_dir) {
-            _ = win.printSegment(.{ .text = "/", .style = style }, .{ .row_offset = row_base + row, .col_offset = win.gwidth(e.name) });
+            _ = win.printSegment(.{ .text = "/", .style = style }, .{ .row_offset = row_base + row, .col_offset = name_col + win.gwidth(e.name) });
         }
         row += 1;
     }
