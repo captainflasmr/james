@@ -121,6 +121,14 @@ const IsearchView = struct {
     backward: bool,
 };
 
+/// An in-pane dired prompt (copy target / delete confirmation): the
+/// listing stays in its window and the prompt text appears in that pane's
+/// modeline, so the layout never changes.
+const DiredPromptView = struct {
+    kind: enum { copy, delete },
+    query: []const u8 = &.{},
+};
+
 /// Render one buffer's text plus its own compact modeline into `win`, which
 /// may be the whole screen or one pane of a split. An active isearch shows
 /// its match highlight and prompt in this pane, exactly as if the pane were
@@ -327,7 +335,7 @@ fn deleteOtherWindows(gpa: std.mem.Allocator, root: *Pane, focused: *Pane) usize
 /// taking over the whole screen; when a file is chosen it's simply
 /// replaced by the newly opened buffer. An active isearch shows its prompt
 /// in the modeline; the match is the selected entry.
-fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, search: ?IsearchView) void {
+fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, search: ?IsearchView, dired_prompt: ?DiredPromptView) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     dired.scrollToSelected(text_height);
     // Entries print their own heap-allocated metadata prefix and name
@@ -382,6 +390,13 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
         else
             (if (s.backward) "I-search backward" else "I-search");
         break :blk std.fmt.bufPrint(modeline_buf, "{s}: {s}", .{ label, s.query }) catch label;
+    } else if (dired_prompt) |p| blk: {
+        const is_dir = dired.selected < dired.entries.items.len and dired.entries.items[dired.selected].is_dir;
+        const name = if (dired.selected < dired.entries.items.len) dired.entries.items[dired.selected].name else "";
+        break :blk switch (p.kind) {
+            .copy => std.fmt.bufPrint(modeline_buf, "Copy {s}{s} to (C-g cancels): {s}", .{ if (is_dir) "directory " else "", name, p.query }) catch "Copy to: ...",
+            .delete => std.fmt.bufPrint(modeline_buf, "{s}{s}? (y / n / C-g cancels)", .{ if (is_dir) "Recursively delete " else "Delete ", name }) catch "Delete?",
+        };
     } else std.fmt.bufPrint(modeline_buf, "Dired: {s}   (Enter opens, ^ up, q quits)", .{dired.path.items}) catch "Dired";
     const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true };
     const text_w = win.gwidth(modeline);
@@ -420,6 +435,7 @@ fn renderTree(
     direds: []?Dired,
     focused: *Pane,
     search: ?IsearchView,
+    dired_prompt: ?DiredPromptView,
 ) void {
     if (pane.isLeaf()) {
         // Each leaf gets its own scratch slot, in render order — the
@@ -431,9 +447,10 @@ fn renderTree(
         // to every pane would highlight the wrong window and could slice
         // past a shorter line in a neighbouring buffer.
         const pane_search: ?IsearchView = if (pane == focused) search else null;
+        const pane_prompt: ?DiredPromptView = if (pane == focused) dired_prompt else null;
         const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
         if (direds[pane.buf_idx]) |*d| {
-            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_search);
+            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_search, pane_prompt);
         } else {
             renderPane(child, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_search);
         }
@@ -445,13 +462,13 @@ fn renderTree(
             const left_w: u16 = @intCast((@as(u32, width) * pane.left_frac) / 256);
             const right_w = width -| (left_w + 1);
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
-            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search);
-            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search);
+            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt);
+            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
-            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, search);
-            renderTree(win, pane.right.?, x_off, y_off + top_h, width, height -| top_h, modeline_bufs, slot_counter, buffers, direds, focused, search);
+            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt);
+            renderTree(win, pane.right.?, x_off, y_off + top_h, width, height -| top_h, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt);
         },
     }
 }
@@ -587,10 +604,67 @@ fn closeDiredBuffer(
     return next;
 }
 
+/// True if `path` is `prefix` itself or lives underneath it — used to
+/// refuse copying a directory into itself.
+fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
+    return std.mem.startsWith(u8, path, prefix) and
+        (path.len == prefix.len or path[prefix.len] == std.fs.path.sep);
+}
+
+/// Recursively copy the directory `src` to a new directory `dst`. Files
+/// (and symlinks, followed) are copied with std's copyFile; directories
+/// recurse. std's copyFile itself cannot copy a directory — it panics with
+/// EISDIR — so directories must come through here.
+fn copyTree(gpa: std.mem.Allocator, io: std.Io, src: []const u8, dst: []const u8) void {
+    std.Io.Dir.cwd().createDirPath(io, dst) catch return;
+    var dir = std.Io.Dir.cwd().openDir(io, src, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                const sub_src = std.fs.path.join(gpa, &.{ src, entry.name }) catch continue;
+                defer gpa.free(sub_src);
+                const sub_dst = std.fs.path.join(gpa, &.{ dst, entry.name }) catch continue;
+                defer gpa.free(sub_dst);
+                copyTree(gpa, io, sub_src, sub_dst);
+            },
+            .file, .sym_link => {
+                const sub_src = std.fs.path.join(gpa, &.{ src, entry.name }) catch continue;
+                defer gpa.free(sub_src);
+                const sub_dst = std.fs.path.join(gpa, &.{ dst, entry.name }) catch continue;
+                defer gpa.free(sub_dst);
+                std.Io.Dir.cwd().copyFile(sub_src, std.Io.Dir.cwd(), sub_dst, io, .{}) catch {};
+            },
+            else => {},
+        }
+    }
+}
+
 /// Keep a dired's selection following an isearch match: search moves
 /// point, and in a dired buffer point *is* the selected entry.
 fn syncDiredSelection(direds: []?Dired, current: usize, buf: *Buffer) void {
     if (direds[current]) |*d| d.selected = buf.cursor_row;
+}
+
+/// Reload a dired's listing and re-mirror it into its buffer's lines
+/// (used after copy / delete change the directory contents).
+fn refreshDired(gpa: std.mem.Allocator, io: std.Io, buffers: *std.ArrayList(*Buffer), direds: *std.ArrayList(?Dired), idx: usize) void {
+    if (idx >= direds.items.len or direds.items[idx] == null) return;
+    const d = &direds.items[idx].?;
+    d.refresh(gpa, io) catch return;
+
+    const buf = buffers.items[idx];
+    for (buf.lines.items) |*l| l.deinit(gpa);
+    buf.lines.clearRetainingCapacity();
+    for (d.entries.items) |e| {
+        var line: std.ArrayList(u8) = .empty;
+        errdefer line.deinit(gpa);
+        line.appendSlice(gpa, e.name) catch return;
+        if (e.is_dir) line.append(gpa, '/') catch return;
+        buf.lines.append(gpa, line) catch return;
+    }
+    if (buf.cursor_row >= buf.lines.items.len) buf.cursor_row = buf.lines.items.len -| 1;
 }
 
 /// A named (file, position) pair, like an Emacs bookmark. Persisted to
@@ -809,6 +883,12 @@ pub fn main(init: std.process.Init) !void {
     var bookmark_list_selected: usize = 0;
     var bookmark_list_top: usize = 0;
 
+    // Dired copy / delete prompts (C / D in a dired buffer).
+    var dired_copy_prompt = false;
+    var dired_copy_query: std.ArrayList(u8) = .empty;
+    defer dired_copy_query.deinit(gpa);
+    var confirming_delete = false;
+
     // Incremental search state.
     var isearch_active = false;
     var isearch_dir: Buffer.SearchDirection = .forward;
@@ -909,6 +989,60 @@ pub fn main(init: std.process.Init) !void {
                     } else {
                         bookmark_prompt = null;
                     }
+                } else if (dired_copy_prompt) {
+                    if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        dired_copy_prompt = false;
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        if (dired_copy_query.items.len > 0) _ = dired_copy_query.pop();
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
+                        const target_raw = std.mem.trim(u8, dired_copy_query.items, " ");
+                        dired_copy_prompt = false;
+                        if (target_raw.len > 0 and direds.items[current] != null) {
+                            const d = &direds.items[current].?;
+                            const e = d.entries.items[d.selected];
+                            if (!std.mem.eql(u8, e.name, "..")) {
+                                const src = try std.fs.path.join(gpa, &.{ d.path.items, e.name });
+                                defer gpa.free(src);
+                                const target = if (std.fs.path.isAbsolute(target_raw))
+                                    try gpa.dupe(u8, target_raw)
+                                else
+                                    try std.fs.path.join(gpa, &.{ d.path.items, target_raw });
+                                defer gpa.free(target);
+                                if (!std.mem.eql(u8, src, target) and !pathStartsWith(target, src)) {
+                                    if (e.is_dir) {
+                                        copyTree(gpa, io, src, target);
+                                    } else {
+                                        std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), target, io, .{}) catch {};
+                                    }
+                                    refreshDired(gpa, io, &buffers, &direds, current);
+                                }
+                            }
+                        }
+                    } else if (key.text) |t| {
+                        try dired_copy_query.appendSlice(gpa, t);
+                    } else {
+                        dired_copy_prompt = false;
+                    }
+                } else if (confirming_delete) {
+                    if (key.matches('y', .{}) or key.matches('Y', .{})) {
+                        confirming_delete = false;
+                        if (direds.items[current]) |*d| {
+                            const e = d.entries.items[d.selected];
+                            if (!std.mem.eql(u8, e.name, "..")) {
+                                const path = try std.fs.path.join(gpa, &.{ d.path.items, e.name });
+                                defer gpa.free(path);
+                                if (e.is_dir) {
+                                    std.Io.Dir.cwd().deleteTree(io, path) catch {};
+                                } else {
+                                    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+                                }
+                                refreshDired(gpa, io, &buffers, &direds, current);
+                            }
+                        }
+                    } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        confirming_delete = false;
+                    }
+                    // Any other key is ignored while confirming.
                 } else if (bookmark_list_active) {
                     if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
                         bookmark_list_active = false;
@@ -1118,6 +1252,20 @@ pub fn main(init: std.process.Init) !void {
                         } else if (key.matches('k', .{ .alt = true })) {
                             // M-k: 5 entries up.
                             d.selected -|= 5;
+                        } else if (key.matches('C', .{})) {
+                            // C: copy the selected entry (Emacs dired).
+                            const e = d.entries.items[d.selected];
+                            if (!std.mem.eql(u8, e.name, "..")) {
+                                dired_copy_prompt = true;
+                                dired_copy_query.clearRetainingCapacity();
+                                dired_copy_query.appendSlice(gpa, e.name) catch {};
+                            }
+                        } else if (key.matches('D', .{})) {
+                            // D: delete the selected entry (Emacs dired).
+                            const e = d.entries.items[d.selected];
+                            if (!std.mem.eql(u8, e.name, "..")) {
+                                confirming_delete = true;
+                            }
                         } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('f', .{})) {
                             // Enter / C-j, or "f" (the dirlst-find-file key from
                             // the Jasspa setup): open the selected entry.
@@ -1276,10 +1424,17 @@ pub fn main(init: std.process.Init) !void {
         else
             null;
 
+        const dired_prompt_view: ?DiredPromptView = if (dired_copy_prompt)
+            .{ .kind = .copy, .query = dired_copy_query.items }
+        else if (confirming_delete)
+            .{ .kind = .delete }
+        else
+            null;
+
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, search_view);
+            renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, search_view, dired_prompt_view);
             try vx.render(tty.writer());
             continue;
         }
@@ -1313,7 +1468,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal) {
             if (direds.items[current]) |*d| {
                 var modeline_buf: [2048]u8 = undefined;
-                renderDiredPane(win, d, true, 0, win.height, &modeline_buf, search_view);
+                renderDiredPane(win, d, true, 0, win.height, &modeline_buf, search_view, dired_prompt_view);
                 try vx.render(tty.writer());
                 continue;
             }

@@ -77,6 +77,14 @@ pub fn open(self: *Dired, gpa: std.mem.Allocator, io: std.Io, new_path: []const 
     try self.reload(gpa, io);
 }
 
+/// Re-read the directory listing, keeping the selection where it was.
+/// Used after copy / delete change the directory contents.
+pub fn refresh(self: *Dired, gpa: std.mem.Allocator, io: std.Io) !void {
+    const prev_selected = self.selected;
+    try self.reload(gpa, io);
+    self.selected = @min(prev_selected, self.entries.items.len -| 1);
+}
+
 fn reload(self: *Dired, gpa: std.mem.Allocator, io: std.Io) !void {
     self.freeEntries(gpa);
     self.selected = 0;
