@@ -329,6 +329,32 @@ fn deleteOtherWindows(gpa: std.mem.Allocator, root: *Pane, focused: *Pane) usize
     return keep;
 }
 
+// The thin box-drawing lines drawn between the panes of a split. A
+// vertical split's children are already separated by one blank column,
+// and a horizontal split's by one blank row (see renderTree); these fill
+// that gap. A separator only spans its own node's rect, so junctions
+// with a nested split's separator are T-junctions of adjacent cells.
+const split_hline = "─";
+const split_vline = "│";
+
+/// Draw a `split_vline` down `height` rows starting at (`col`, `row`),
+/// all coordinates relative to `win`.
+fn drawVLine(win: vaxis.Window, col: u16, row: u16, height: u16) void {
+    var r: u16 = 0;
+    while (r < height) : (r += 1) {
+        _ = win.printSegment(.{ .text = split_vline, .style = .{} }, .{ .row_offset = row + r, .col_offset = col });
+    }
+}
+
+/// Draw a `split_hline` across `width` columns starting at (`col`, `row`),
+/// all coordinates relative to `win`.
+fn drawHLine(win: vaxis.Window, col: u16, row: u16, width: u16) void {
+    var c: u16 = 0;
+    while (c < width) : (c += 1) {
+        _ = win.printSegment(.{ .text = split_hline, .style = .{} }, .{ .row_offset = row, .col_offset = col + c });
+    }
+}
+
 /// Render one dired listing plus its own compact modeline into `win`, which
 /// may be the whole screen or one pane of a split. Same shape as
 /// `renderPane`, so dired lives inside the current window instead of
@@ -462,13 +488,19 @@ fn renderTree(
             const left_w: u16 = @intCast((@as(u32, width) * pane.left_frac) / 256);
             const right_w = width -| (left_w + 1);
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
+            // The one blank column between the panes gets the separator.
+            drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
             renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt);
             renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
+            // The bottom pane starts one row lower than it used to, leaving
+            // a blank row between the panes for the separator (mirroring
+            // the one blank column of a vertical split).
+            drawHLine(win, @intCast(x_off), y_off + top_h, width);
             renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt);
-            renderTree(win, pane.right.?, x_off, y_off + top_h, width, height -| top_h, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt);
+            renderTree(win, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt);
         },
     }
 }
@@ -973,6 +1005,19 @@ pub fn main(init: std.process.Init) !void {
     try vx.enterAltScreen(tty.writer());
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
 
+    // Size the screen from the kernel's ioctl right away, before the event
+    // loop drains the queue: the first winsize event may carry a stale
+    // in-band report (see the .winsize handler), and this guarantees the
+    // very first frame is already at the true console size no matter what
+    // the terminal reported.
+    var last_winsize: ?vaxis.Winsize = null;
+    if (tty.getWinsize() catch null) |ws| {
+        if (ws.cols > 0 and ws.rows > 0) {
+            try vx.resize(gpa, tty.writer(), ws);
+            last_winsize = ws;
+        }
+    }
+
     var pending_ctrl_x = false;
     var pending_ctrl_x_r = false;
     var pending_ctrl_c = false;
@@ -1064,7 +1109,10 @@ pub fn main(init: std.process.Init) !void {
                 // otherwise leave the editor stuck at a fraction of the real
                 // size.
                 const real = tty.getWinsize() catch ws;
-                try vx.resize(gpa, tty.writer(), real);
+                if (real.cols > 0 and real.rows > 0) {
+                    try vx.resize(gpa, tty.writer(), real);
+                    last_winsize = real;
+                }
             },
             .key_press => |key| {
                 const buf: *Buffer = buffers.items[current];
@@ -1614,6 +1662,22 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
             },
+        }
+
+        // Resize anchor: re-check the kernel's ioctl size every frame. A
+        // terminal that fails to deliver its resize notification (a missed
+        // SIGWINCH or a dropped in-band report) would otherwise leave the
+        // screen stuck at a fraction of the real size indefinitely — the
+        // ioctl is always authoritative on a real terminal, and comparing
+        // against it here is one cheap syscall per event.
+        if (tty.getWinsize() catch null) |ws| {
+            if (ws.cols > 0 and ws.rows > 0) {
+                const changed = if (last_winsize) |lw| lw.cols != ws.cols or lw.rows != ws.rows else true;
+                if (changed) {
+                    try vx.resize(gpa, tty.writer(), ws);
+                    last_winsize = ws;
+                }
+            }
         }
 
         const buf: *Buffer = buffers.items[current];

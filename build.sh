@@ -10,11 +10,11 @@ Usage: ./build.sh [OPTIONS] [-- <editor-args>]
 Build and optionally run james with cross-compilation support.
 
 Targets:
-  (none)    Native debug build                        (default)
-  release   Native release build                      (ReleaseSmall)
-  windows   Cross-compile for x86_64-windows          (ReleaseSmall)
-  macos     Cross-compile for aarch64-macos           (ReleaseSmall)
-  linux     Cross-compile for x86_64-linux-musl       (ReleaseSmall)
+  (none)    Native build (ReleaseSmall, stripped)     (default, -> zig-out/bin)
+  release   Native release build                      (ReleaseSmall, stripped, -> zig-out/bin)
+  windows   Cross-compile for x86_64-windows          (ReleaseSmall, -> zig-out/windows)
+  macos     Cross-compile for aarch64-macos           (ReleaseSmall, -> zig-out/macos)
+  linux     Cross-compile for x86_64-linux-musl       (ReleaseSmall, -> zig-out/linux)
   all       Build all of the above into zig-out/<target>/
 
 Options:
@@ -23,8 +23,8 @@ Options:
   -h, --help          Show this message
 
 Examples:
-  ./build.sh                    # native debug
-  ./build.sh -t release         # native release
+  ./build.sh                    # native (ReleaseSmall, stripped)
+  ./build.sh -t release         # native release (same as default)
   ./build.sh -t windows         # cross-compile for Windows
   ./build.sh -t macos           # cross-compile for macOS
   ./build.sh -t linux           # cross-compile for Linux musl
@@ -71,9 +71,8 @@ resolve_target() {
 
 resolve_optimize() {
     case "$1" in
-        native) echo "Debug" ;;
-        release | windows | macos | linux) echo "ReleaseSmall" ;;
-        *) echo "Debug" ;;
+        native | release | windows | macos | linux) echo "ReleaseSmall" ;;
+        *) echo "ReleaseSmall" ;;
     esac
 }
 
@@ -85,6 +84,13 @@ build_one() {
     optimize=$(resolve_optimize "$name")
     local prefix="${2:-}"
     local triple_label
+
+    # Cross-compile presets default to their own subdirectory so they
+    # never clobber the native binary in zig-out/bin (running a Windows
+    # PE or macOS Mach-O on Linux fails with "exec format error").
+    if [[ -z "$prefix" ]] && [[ "$name" == windows || "$name" == macos || "$name" == linux ]]; then
+        prefix="zig-out/$name"
+    fi
 
     if [[ -z "$triple" ]]; then
         triple_label="native"
@@ -136,7 +142,12 @@ case "$TARGET" in
             triple=$(resolve_target "$TARGET")
             if [[ -n "$triple" ]]; then
                 echo "Warning: --run with target '$TARGET' ($triple) — can't run a cross-compiled binary on this host."
-                echo "Binary is in zig-out/bin/james"
+                local bin="zig-out/bin/james"
+                if [[ "$TARGET" == windows || "$TARGET" == macos || "$TARGET" == linux ]]; then
+                    bin="zig-out/$TARGET/bin/james"
+                    [[ "$TARGET" == windows ]] && bin="$bin.exe"
+                fi
+                echo "Binary is in $bin"
             else
                 echo "=== Running james ==="
                 if [[ ${#EDITOR_ARGS[@]} -gt 0 ]]; then

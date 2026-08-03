@@ -17,6 +17,8 @@ zig build run -- path/to/file.txt [more-files...]
 
 Every filename given on the command line opens as its own buffer; the first one is shown initially. With no filenames, james starts on a home screen with a keybinding cheat sheet — =C-x d= from there browses files, or use =C-x C-f= / =C-x b=. First run will fetch libvaxis automatically. To fetch dependencies ahead of time (e.g. for an offline build later): =zig build --fetch=.
 
+A plain =zig build= already produces a ReleaseSmall, stripped binary (james is meant to be run, not debugged). If you do need to debug: =zig build -Doptimize=Debug -Dstrip=false=.
+
 * Cross-compiling
 
 No extra toolchains, no Docker. Confirmed working targets:
@@ -25,10 +27,10 @@ No extra toolchains, no Docker. Confirmed working targets:
 zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSmall
 zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSmall
 zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSmall
-zig build -Doptimize=ReleaseSmall   # native
+zig build   # native, already ReleaseSmall and stripped
 #+end_src
 
-Binaries land in =zig-out/bin/=. Use =-p some/dir= to send each target to a separate folder if you're building several at once.
+Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes to its own folder (=zig-out/windows/=, =zig-out/macos/=, =zig-out/linux/=) so it never overwrites the native binary — running one of those on the wrong host fails with an "exec format error". Use =-p some/dir= to override the output folder.
 
 * Current keybindings
 
@@ -96,7 +98,7 @@ Undo (=C-x u=) restores whole-buffer snapshots taken before each edit, and coale
 
 =C-x d= opens a directory browser (dired) rooted at the directory of the current buffer's file (or =.= if the buffer has no file). A dired is an ordinary buffer, exactly like Emacs: it lives in the buffer list (so several directories can be open at once), shows in any window, and =C-x o= / =C-x b= move around it freely. Opening a file from dired shows it in the window and leaves the dired buffer open; =C-x b= with its path brings it back. While in a dired buffer: =n= / =C-n= / ↓ and =p= / =C-p= / ↑ move the selection, =C= copies the selected entry (target prompt prefilled with the name), =D= deletes it after a y/n confirmation, =^= / =M-e= goes to the parent directory, Enter or =f= descends into a directory (opening a new dired buffer for it) or opens the selected file, =C-s= / =C-r= incremental-search the file names (the selection follows the match), and =q= / =C-g= / =C-c C-k= closes the dired buffer. Entries are sorted with =..= first, then case-insensitive by name; directories and files are interleaved rather than grouped, directories are shown with a trailing =/=, and hidden (dot) files are listed too. Each entry is prefixed with an =ls -al= style metadata line: permissions (rwx bits on Unix, read-only/writable on Windows), size, and modification time. The modeline shows =Dired: <path>= while browsing.
 
-The modeline is a bar that spans the full width of its window, like Emacs's mode line: reverse video in the current window and dimmed in the others, whether split or single-window.
+The modeline is a bar that spans the full width of its window, like Emacs's mode line: reverse video in the current window and dimmed in the others, whether split or single-window. Between the windows of a split, a thin box-drawing line marks the boundary (a vertical =│= between side-by-side panes, a horizontal ==─== between stacked ones), with nested splits joining cleanly.
 
 * Architecture
 

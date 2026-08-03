@@ -15,6 +15,9 @@ This document contains the release notes for james.
 Buffer-list picker for =C-x b=.
 
 - =C-x b= now shows a picker list of every open buffer — file buffers, direds, and the home screen — one per row, the same shape as the bookmark list: n/p (or arrows) move, Enter switches to the selected buffer, q / =C-g= closes. The cursor starts on the current buffer. =C-x C-f= keeps the old status-line prompt (open-or-switch by path), so typing a name to open a new file still works — the same C-x b / C-x C-f split real Emacs makes.
+- Split windows now get a thin box-drawing line between them: a vertical =│= in the one-column gap of a side-by-side (vertical) split, and a horizontal =─= in a new one-row gap of a stacked (horizontal) split — which previously had no gap at all, so its panes butted against each other. Each line spans its own split's rect, so nested splits meet in clean T-junctions.
+- A plain =zig build= now produces a ReleaseSmall, stripped binary instead of an unstripped debug build (the default optimize mode changed from Debug to ReleaseSmall, and stripping is on by default); =zig build -Doptimize=Debug -Dstrip=false= brings the old behaviour back. =./build.sh= passes =ReleaseSmall= for every preset, and cross-compile presets install to =zig-out/<target>/= so they no longer clobber the native binary in =zig-out/bin/=.
+- Window sizing no longer depends on the terminal delivering its resize notification: the screen is now sized from the kernel's ioctl before the first frame, and re-verified against it on every event. A missed SIGWINCH or a dropped in-band size report used to leave the editor stuck at a fraction of the console's width (e.g. two thirds, if the console was wider than the terminal's last report) until a lucky resize — the resize anchor catches it on the very next keystroke.
 
 ** 0.12.0 — <2026-08-02>
 

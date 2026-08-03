@@ -2,7 +2,13 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+
+    // Default builds are ReleaseSmall and stripped: james is meant to be
+    // run, not debugged, so the plain `zig build` should hand back the
+    // smallest practical binary. Debugging builds are still one flag
+    // away: `zig build -Doptimize=Debug -Dstrip=false`.
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseSmall;
+    const strip = b.option(bool, "strip", "Omit debug information") orelse true;
 
     const vaxis = b.dependency("vaxis", .{
         .target = target,
@@ -15,6 +21,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis.module("vaxis") },
             },
