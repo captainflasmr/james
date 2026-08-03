@@ -63,6 +63,7 @@ Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes 
 | =C-c j= / =C-c k= | step back / forward through window layouts (winner-mode) |
 | =C-x C-s= | save |
 | =C-x C-c= | quit (asks first if there are unsaved changes) |
+| =C-x j= / =C-x c= | drop out to a real shell (=exit=/=C-d= or =C-z= returns; =C-x j= / =C-x c= resumes) |
 
 Window keys (mostly aliases of the =C-x= window commands, plus a few extras):
 
@@ -99,6 +100,8 @@ Undo (=C-x u=) restores whole-buffer snapshots taken before each edit, and coale
 =C-x d= opens a directory browser (dired) rooted at the directory of the current buffer's file (or =.= if the buffer has no file). A dired is an ordinary buffer, exactly like Emacs: it lives in the buffer list (so several directories can be open at once), shows in any window, and =C-x o= / =C-x b= move around it freely. Opening a file from dired shows it in the window and leaves the dired buffer open; =C-x b= with its path brings it back. While in a dired buffer: =n= / =C-n= / ↓ and =p= / =C-p= / ↑ move the selection, =C= copies the selected entry (target prompt prefilled with the name), =D= deletes it after a y/n confirmation, =^= / =M-e= goes to the parent directory, Enter or =f= descends into a directory (opening a new dired buffer for it) or opens the selected file, =C-s= / =C-r= incremental-search the file names (the selection follows the match), and =q= / =C-g= / =C-c C-k= closes the dired buffer. Entries are sorted with =..= first, then case-insensitive by name; directories and files are interleaved rather than grouped, directories are shown with a trailing =/=, and hidden (dot) files are listed too. Each entry is prefixed with an =ls -al= style metadata line: permissions (rwx bits on Unix, read-only/writable on Windows), size, and modification time. The modeline shows =Dired: <path>= while browsing.
 
 The modeline is a bar that spans the full width of its window, like Emacs's mode line: reverse video in the current window and dimmed in the others, whether split or single-window. Between the windows of a split, a thin box-drawing line marks the boundary (a vertical =│= between side-by-side panes, a horizontal ==─== between stacked ones), with nested splits joining cleanly.
+
+=C-x j= (or =C-x c=) drops the whole editor out of the way and hands the terminal to a real shell (=$SHELL=, or =/bin/sh=): the alternate screen is left and the terminal restored to its normal mode, so anything that works in your terminal works here — full-screen programs included. =exit= (or =C-d=) comes straight back to the editor, and so does =C-z=, which merely suspends the shell; the next =C-x j= (or =C-x c=) resumes that same session, working directory and all. It's the same suspend-and-swap trick as Emacs's =C-z= (suspend-frame), on one key. POSIX-only for now — Windows has no equivalent of handing the terminal over to a child process group (ConPTY would be the proper approach there).
 
 * Architecture
 

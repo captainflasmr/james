@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 const Buffer = @import("Buffer.zig");
 const Dired = @import("Dired.zig");
@@ -355,6 +356,161 @@ fn drawHLine(win: vaxis.Window, col: u16, row: u16, width: u16) void {
     }
 }
 
+// --- C-x j shell (suspend-and-swap) -------------------------------------
+//
+// POSIX-only for now: dropping to a real shell means handing the terminal
+// to a child process group (tcsetpgrp), which Windows' console model has
+// no equivalent of (ConPTY would be the proper approach there).
+//
+// The shell owns the whole screen until it exits (exit / C-d) or is
+// suspended with C-z, which brings the editor back with the shell still
+// stopped — C-x j then resumes that same session.
+
+// Zig 0.16's std.c has no tcsetpgrp/tcgetpgrp bindings on darwin; libc
+// does. Only called from the macOS paths (Linux uses std.posix, which
+// goes through raw syscalls).
+extern "c" fn tcsetpgrp(fd: c_int, pgrp: c_int) c_int;
+extern "c" fn tcgetpgrp(fd: c_int) c_int;
+
+const ShellWait = enum { exited, stopped };
+
+/// Block until the shell child `pid` exits or is stopped by a job-control
+/// signal (C-z). waitpid with WUNTRACED, bypassing std.process.Child.wait
+/// which only reports exit.
+fn shellWait(pid: std.posix.pid_t) ShellWait {
+    if (comptime builtin.os.tag == .windows) return .exited;
+    if (comptime builtin.os.tag == .linux) {
+        // Raw wait4 syscall: no libc dependency (james is statically
+        // linked on Linux).
+        var status: u32 = 0;
+        while (true) {
+            const rc = std.os.linux.waitpid(pid, &status, std.os.linux.W.UNTRACED);
+            if (rc == 0) return if ((status & 0xff) == 0x7f) .stopped else .exited;
+            // EINTR: interrupted by a signal, wait again. Anything else
+            // (ECHILD etc.) treat as exit.
+            const rc_isize: isize = @bitCast(rc);
+            if (rc_isize != -@as(isize, @intFromEnum(std.os.linux.E.INTR))) return .exited;
+        }
+    }
+    // macOS (libc is always linked there): WUNTRACED is 2 on BSD too.
+    while (true) {
+        var status: c_int = 0;
+        const rc = std.c.waitpid(pid, &status, 2);
+        if (rc == -1) {
+            if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) return .exited;
+            continue;
+        }
+        return if ((status & 0xff) == 0x7f) .stopped else .exited;
+    }
+}
+
+/// Make `pgrp` the foreground process group of the terminal. When the
+/// editor reclaims the terminal it is itself a background member, and
+/// tcsetpgrp from a background process group would stop it with SIGTTOU —
+/// so that signal is blocked around the call. The block is cleared on the
+/// shell's exec, so nothing leaks into it.
+fn setForeground(tty: *vaxis.Tty, pgrp: std.posix.pid_t) void {
+    if (comptime builtin.os.tag == .windows) return;
+    if (comptime builtin.os.tag == .macos) {
+        // Zig 0.16's std.c has no tcsetpgrp binding on darwin; libc does.
+        _ = tcsetpgrp(tty.fd.handle, pgrp);
+        return;
+    }
+    var set = std.posix.sigemptyset();
+    std.posix.sigaddset(&set, std.posix.SIG.TTOU);
+    var old: std.posix.sigset_t = undefined;
+    std.posix.sigprocmask(std.posix.SIG.BLOCK, &set, &old);
+    std.posix.tcsetpgrp(tty.fd.handle, pgrp) catch {};
+    std.posix.sigprocmask(std.posix.SIG.SETMASK, &old, null);
+}
+
+/// The process group currently in the foreground of the terminal — at
+/// startup that is the editor's own group, remembered so the shell swap
+/// can hand the terminal back to it.
+fn shellForegroundPgrp(tty: *vaxis.Tty) ?std.posix.pid_t {
+    if (comptime builtin.os.tag == .windows) return null;
+    if (comptime builtin.os.tag == .macos) {
+        const pgrp = tcgetpgrp(tty.fd.handle);
+        if (pgrp == -1) return null;
+        return pgrp;
+    }
+    return std.posix.tcgetpgrp(tty.fd.handle) catch null;
+}
+
+/// C-x j: hand the terminal to a real shell. Returns the pid of a shell
+/// suspended with C-z (to resume on the next C-x j), or null when the
+/// shell exited or none could be started.
+fn enterShell(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *std.process.Environ.Map,
+    loop: *vaxis.Loop(Event),
+    vx: *vaxis.Vaxis,
+    tty: *vaxis.Tty,
+    shell_pid: ?std.posix.pid_t,
+    editor_pgrp: ?std.posix.pid_t,
+) !?std.posix.pid_t {
+    if (comptime builtin.os.tag == .windows) return null;
+
+    if (comptime builtin.os.tag != .windows) {
+        // Stop the input thread first: while the shell owns the terminal the
+        // editor must not race it for keystrokes.
+        loop.stop();
+        // Discard anything the dying input thread posted while the swap was
+        // in progress — e.g. a keystroke that woke it when no terminal was
+        // there to answer stop()'s DSR. Left in the queue it would leak
+        // back into the editor as a phantom key after the shell returns.
+        while (loop.tryEvent() catch null) |_| {}
+
+        // Give the shell a pristine terminal: show the cursor, reset SGR and
+        // mouse/bracketed-paste modes, leave the alternate screen, and
+        // restore the original cooked termios (job control, echo, ...).
+        vx.resetState(tty.writer()) catch {};
+        std.posix.tcsetattr(tty.fd.handle, .FLUSH, tty.termios) catch {};
+
+        var pid: std.posix.pid_t = undefined;
+        var resuming = false;
+        if (shell_pid) |p| {
+            pid = p;
+            resuming = true;
+        } else {
+            const shell_path = environ_map.get("SHELL") orelse "/bin/sh";
+            const child = std.process.spawn(io, .{ .argv = &.{shell_path}, .pgid = 0 }) catch
+                std.process.spawn(io, .{ .argv = &.{"/bin/sh"}, .pgid = 0 }) catch {
+                // No usable shell: come back to the editor untouched.
+                restoreEditor(gpa, vx, tty) catch {};
+                loop.start() catch {};
+                return null;
+            };
+        pid = @intCast(child.id.?);
+    }
+
+    setForeground(tty, pid);
+    if (resuming) std.posix.kill(pid, std.posix.SIG.CONT) catch {};
+    const result = shellWait(pid);
+
+        // The shell is done (or stopped): reclaim the terminal and the
+        // editor's raw/alt-screen state, forcing a full repaint since the
+        // shell may have resized the window or left the terminal anywhere.
+        setForeground(tty, editor_pgrp orelse pid);
+        restoreEditor(gpa, vx, tty) catch {};
+        loop.start() catch {};
+        return if (result == .stopped) pid else null;
+    }
+    return null;
+}
+
+fn restoreEditor(gpa: std.mem.Allocator, vx: *vaxis.Vaxis, tty: *vaxis.Tty) !void {
+    if (comptime builtin.os.tag == .windows) return;
+    _ = vaxis.Tty.makeRaw(tty.fd.handle) catch {};
+    try vx.enterAltScreen(tty.writer());
+    if (tty.getWinsize() catch null) |ws| {
+        if (ws.cols > 0 and ws.rows > 0) {
+            vx.resize(gpa, tty.writer(), ws) catch {};
+        }
+    }
+}
+
 /// Render one dired listing plus its own compact modeline into `win`, which
 /// may be the whole screen or one pane of a split. Same shape as
 /// `renderPane`, so dired lives inside the current window instead of
@@ -531,6 +687,7 @@ const welcome_text =
     \\    C-space       set the mark; C-w kills the region, C-y yanks
     \\    C-x u         undo
     \\    C-x C-s       save
+    \\    C-x j / C-x c  drop to a real shell (C-z / exit returns)
     \\    C-x C-c       quit
 ;
 
@@ -995,6 +1152,10 @@ pub fn main(init: std.process.Init) !void {
     var tty = try vaxis.Tty.init(io, &tty_buf);
     defer tty.deinit();
 
+    // The editor's foreground process group, remembered before the shell
+    // swap ever happens so C-x j can hand the terminal back to it.
+    const editor_pgrp: ?std.posix.pid_t = shellForegroundPgrp(&tty);
+
     var vx = try vaxis.init(io, gpa, init.environ_map, .{});
     defer vx.deinit(null, tty.writer());
 
@@ -1070,6 +1231,14 @@ pub fn main(init: std.process.Init) !void {
     var buffer_list_active = false;
     var buffer_list_selected: usize = 0;
     var buffer_list_top: usize = 0;
+
+    // C-x j shell: the pid of a shell suspended with C-z (null while one
+    // is merely running, or none). On quit, a stopped shell would be
+    // orphaned forever, so kill it.
+    var shell_pid: ?std.posix.pid_t = null;
+    defer if (comptime builtin.os.tag != .windows) {
+        if (shell_pid) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+    };
 
     // Dired copy / delete prompts (C / D in a dired buffer).
     var dired_copy_prompt = false;
@@ -1437,6 +1606,13 @@ pub fn main(init: std.process.Init) !void {
                             focused = nf;
                             current = focused.buf_idx;
                         }
+                    } else if (key.matches('j', .{}) or key.matches('c', .{})) {
+                        // C-x j / C-x c: drop out of the editor into a real
+                        // shell on the terminal. The shell takes over the
+                        // whole screen until it exits (exit / C-d) or is
+                        // suspended with C-z, which brings the editor back;
+                        // C-x j (or C-x c) then resumes that same shell.
+                        shell_pid = try enterShell(gpa, io, init.environ_map, &loop, &vx, &tty, shell_pid, editor_pgrp);
                     }
                 } else if (pending_ctrl_x_r) {
                     pending_ctrl_x_r = false;
