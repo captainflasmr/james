@@ -285,13 +285,85 @@ fn deleteRange(self: *Buffer, gpa: std.mem.Allocator, start: Pos, end: Pos) !voi
     }
 }
 
-fn rememberKill(gpa: std.mem.Allocator, kill_ring: *std.ArrayList(u8), text: []const u8, append: bool) !void {
-    if (!append) kill_ring.clearRetainingCapacity();
-    try kill_ring.appendSlice(gpa, text);
+fn rememberKill(gpa: std.mem.Allocator, kill_ring: *KillRing, text: []const u8, append: bool) !void {
+    try kill_ring.remember(gpa, text, append);
 }
 
+/// A real Emacs-style kill ring: a list of heap-allocated kill texts with
+/// a head index pointing at the most recent. Consecutive kills append to
+/// the head entry, joined by a newline — killing "foo" then "bar" yanks as
+/// "foo\nbar", not the "foobar" a flat buffer would produce. The ring is
+/// bounded (oldest entries fall off), and M-y cycles back through it.
+pub const KillRing = struct {
+    entries: std.ArrayList([]u8) = .empty,
+    /// Index of the most recent kill.
+    head: usize = 0,
+
+    const max_kills = 60;
+
+    pub fn deinit(self: *KillRing, gpa: std.mem.Allocator) void {
+        for (self.entries.items) |e| gpa.free(e);
+        self.entries.deinit(gpa);
+    }
+
+    pub fn count(self: *const KillRing) usize {
+        return self.entries.items.len;
+    }
+
+    /// The most recent kill, or null when the ring is empty.
+    pub fn current(self: *const KillRing) ?[]const u8 {
+        if (self.entries.items.len == 0) return null;
+        return self.entries.items[self.head];
+    }
+
+    /// The entry at ring index `idx`.
+    pub fn at(self: *const KillRing, idx: usize) []const u8 {
+        return self.entries.items[idx];
+    }
+
+    /// The ring index `steps` before `from` (1 = the previous kill),
+    /// wrapping around the ring.
+    pub fn beforeIdx(self: *const KillRing, from: usize, steps: usize) usize {
+        const n = self.entries.items.len;
+        return (from + n - (steps % n)) % n;
+    }
+
+    /// Remember a kill: start a fresh head entry, or append `text` to the
+    /// head for a consecutive kill (newline-joined when the head doesn't
+    /// already end in one).
+    pub fn remember(self: *KillRing, gpa: std.mem.Allocator, text: []const u8, append: bool) !void {
+        if (append and self.entries.items.len > 0) {
+            const head_entry = &self.entries.items[self.head];
+            // Join with a newline only when neither side has one: killing
+            // "abc" then "def" joins as "abc\ndef", while killing "aaa"
+            // then the line's own "\n" stays "aaa\n" — no doubled newline.
+            const head_ends_nl = head_entry.*.len > 0 and head_entry.*[head_entry.*.len - 1] == '\n';
+            const text_starts_nl = text.len > 0 and text[0] == '\n';
+            const needs_sep = !head_ends_nl and !text_starts_nl;
+            const joined = try std.mem.concat(gpa, u8, &.{
+                head_entry.*,
+                if (needs_sep) "\n" else "",
+                text,
+            });
+            gpa.free(head_entry.*);
+            head_entry.* = joined;
+        } else {
+            const copy = try gpa.dupe(u8, text);
+            if (self.entries.items.len < max_kills) {
+                try self.entries.append(gpa, copy);
+                self.head = self.entries.items.len - 1;
+            } else {
+                // Ring full: overwrite the oldest entry.
+                self.head = (self.head + 1) % self.entries.items.len;
+                gpa.free(self.entries.items[self.head]);
+                self.entries.items[self.head] = copy;
+            }
+        }
+    }
+};
+
 /// C-k: kill to end of line, or kill the newline itself when already at end of line.
-pub fn killLine(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *std.ArrayList(u8), append: bool) !void {
+pub fn killLine(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRing, append: bool) !void {
     const row = self.cursor_row;
     const col = self.cursor_col;
     const nothing_to_kill = col >= self.lines.items[row].items.len and row + 1 >= self.lines.items.len;
@@ -313,7 +385,7 @@ pub fn killLine(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *std.ArrayList
 }
 
 /// C-w: kill the region between point and mark.
-pub fn killRegion(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *std.ArrayList(u8), append: bool) !void {
+pub fn killRegion(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRing, append: bool) !void {
     const region = self.orderedRegion() orelse return;
     try self.recordUndo(gpa, .kill);
     const text = try self.extractRange(gpa, region.start, region.end);
@@ -327,7 +399,7 @@ pub fn killRegion(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *std.ArrayLi
 }
 
 /// M-w: copy the region between point and mark without deleting it.
-pub fn copyRegion(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *std.ArrayList(u8), append: bool) !void {
+pub fn copyRegion(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRing, append: bool) !void {
     const region = self.orderedRegion() orelse return;
     const text = try self.extractRange(gpa, region.start, region.end);
     defer gpa.free(text);
@@ -336,7 +408,7 @@ pub fn copyRegion(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *std.ArrayLi
 
 /// C-c b: copy the whole buffer to the kill ring, leaving point where it
 /// is (and no mark set).
-pub fn copyWholeBuffer(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *std.ArrayList(u8)) !void {
+pub fn copyWholeBuffer(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRing) !void {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     for (self.lines.items, 0..) |line, i| {
@@ -346,16 +418,29 @@ pub fn copyWholeBuffer(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *std.Ar
     try rememberKill(gpa, kill_ring, out.items, false);
 }
 
-/// C-y: insert the most recent kill at point.
-pub fn yank(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *std.ArrayList(u8)) !void {
-    if (kill_ring.items.len == 0) return;
-    try self.recordUndo(gpa, .yank);
-    var it = std.mem.splitScalar(u8, kill_ring.items, '\n');
+fn yankRaw(self: *Buffer, gpa: std.mem.Allocator, text: []const u8) !void {
+    var it = std.mem.splitScalar(u8, text, '\n');
     try self.insertSliceRaw(gpa, it.next().?);
     while (it.next()) |seg| {
         try self.insertNewlineRaw(gpa);
         try self.insertSliceRaw(gpa, seg);
     }
+}
+
+/// C-y: insert kill text at point (the head of the kill ring).
+pub fn yank(self: *Buffer, gpa: std.mem.Allocator, text: []const u8) !void {
+    try self.recordUndo(gpa, .yank);
+    try self.yankRaw(gpa, text);
+}
+
+/// M-y (yank-pop): replace the text yanked between `start` and `end` with
+/// `text`, all inside the original yank's undo step. The cursor ends at
+/// the end of the replacement, ready for the next pop.
+pub fn yankPop(self: *Buffer, gpa: std.mem.Allocator, text: []const u8, start: Pos, end: Pos) !void {
+    try self.deleteRange(gpa, start, end);
+    self.cursor_row = start.row;
+    self.cursor_col = start.col;
+    try self.yankRaw(gpa, text);
 }
 
 /// C-;: comment (or uncomment) the current line by prefixing it with the

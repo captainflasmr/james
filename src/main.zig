@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const vaxis = @import("vaxis");
+const windows = std.os.windows;
 const Buffer = @import("Buffer.zig");
 const Dired = @import("Dired.zig");
 
@@ -22,6 +23,15 @@ fn silence(
     _ = format;
     _ = args;
 }
+
+/// Tracks the last C-y so M-y (yank-pop) can replace it: the buffer the
+/// yank landed in, the ring entry that was yanked, and where it went.
+const YankState = struct {
+    buf_idx: usize,
+    entry: usize,
+    start: Buffer.Pos,
+    end: Buffer.Pos,
+};
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -137,7 +147,7 @@ const DiredPromptView = struct {
 /// may be the whole screen or one pane of a split. An active isearch shows
 /// its match highlight and prompt in this pane, exactly as if the pane were
 /// the whole screen.
-fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, search: ?IsearchView) void {
+fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, search: ?IsearchView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     buf.scrollToCursor(text_height);
 
@@ -161,7 +171,9 @@ fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, 
         else
             (if (s.backward) "I-search backward" else "I-search");
         break :blk std.fmt.bufPrint(modeline_buf, "{s}: {s}", .{ label, s.query }) catch label;
-    } else std.fmt.bufPrint(modeline_buf, "{s}{s}{s}  L{d}:C{d}", .{
+    } else if (status) |m|
+        std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch "Save failed"
+    else std.fmt.bufPrint(modeline_buf, "{s}{s}{s}  L{d}:C{d}", .{
         // Emacs-style modified marker in the bottom-left corner of the
         // modeline.
         if (buf.dirty) "*" else "",
@@ -453,38 +465,39 @@ fn enterShell(
     shell_pid: ?std.posix.pid_t,
     editor_pgrp: ?std.posix.pid_t,
 ) !?std.posix.pid_t {
-    if (comptime builtin.os.tag == .windows) return null;
+    if (comptime builtin.os.tag == .windows) {
+        return enterShellWindows(gpa, io, environ_map, loop, vx, tty);
+    }
 
-    if (comptime builtin.os.tag != .windows) {
-        // Stop the input thread first: while the shell owns the terminal the
-        // editor must not race it for keystrokes.
-        loop.stop();
-        // Discard anything the dying input thread posted while the swap was
-        // in progress — e.g. a keystroke that woke it when no terminal was
-        // there to answer stop()'s DSR. Left in the queue it would leak
-        // back into the editor as a phantom key after the shell returns.
-        while (loop.tryEvent() catch null) |_| {}
+    // Stop the input thread first: while the shell owns the terminal the
+    // editor must not race it for keystrokes.
+    loop.stop();
+    // Discard anything the dying input thread posted while the swap was
+    // in progress — e.g. a keystroke that woke it when no terminal was
+    // there to answer stop()'s DSR. Left in the queue it would leak
+    // back into the editor as a phantom key after the shell returns.
+    while (loop.tryEvent() catch null) |_| {}
 
-        // Give the shell a pristine terminal: show the cursor, reset SGR and
-        // mouse/bracketed-paste modes, leave the alternate screen, and
-        // restore the original cooked termios (job control, echo, ...).
-        vx.resetState(tty.writer()) catch {};
-        std.posix.tcsetattr(tty.fd.handle, .FLUSH, tty.termios) catch {};
+    // Give the shell a pristine terminal: show the cursor, reset SGR and
+    // mouse/bracketed-paste modes, leave the alternate screen, and
+    // restore the original cooked termios (job control, echo, ...).
+    vx.resetState(tty.writer()) catch {};
+    std.posix.tcsetattr(tty.fd.handle, .FLUSH, tty.termios) catch {};
 
-        var pid: std.posix.pid_t = undefined;
-        var resuming = false;
-        if (shell_pid) |p| {
-            pid = p;
-            resuming = true;
-        } else {
-            const shell_path = environ_map.get("SHELL") orelse "/bin/sh";
-            const child = std.process.spawn(io, .{ .argv = &.{shell_path}, .pgid = 0 }) catch
-                std.process.spawn(io, .{ .argv = &.{"/bin/sh"}, .pgid = 0 }) catch {
-                // No usable shell: come back to the editor untouched.
-                restoreEditor(gpa, vx, tty) catch {};
-                loop.start() catch {};
-                return null;
-            };
+    var pid: std.posix.pid_t = undefined;
+    var resuming = false;
+    if (shell_pid) |p| {
+        pid = p;
+        resuming = true;
+    } else {
+        const shell_path = environ_map.get("SHELL") orelse "/bin/sh";
+        const child = std.process.spawn(io, .{ .argv = &.{shell_path}, .pgid = 0 }) catch
+            std.process.spawn(io, .{ .argv = &.{"/bin/sh"}, .pgid = 0 }) catch {
+            // No usable shell: come back to the editor untouched.
+            restoreEditor(gpa, vx, tty) catch {};
+            loop.start() catch {};
+            return null;
+        };
         pid = @intCast(child.id.?);
     }
 
@@ -492,15 +505,67 @@ fn enterShell(
     if (resuming) std.posix.kill(pid, std.posix.SIG.CONT) catch {};
     const result = shellWait(pid);
 
-        // The shell is done (or stopped): reclaim the terminal and the
-        // editor's raw/alt-screen state, forcing a full repaint since the
-        // shell may have resized the window or left the terminal anywhere.
-        setForeground(tty, editor_pgrp orelse pid);
-        restoreEditor(gpa, vx, tty) catch {};
+    // The shell is done (or stopped): reclaim the terminal and the
+    // editor's raw/alt-screen state, forcing a full repaint since the
+    // shell may have resized the window or left the terminal anywhere.
+    setForeground(tty, editor_pgrp orelse pid);
+    restoreEditor(gpa, vx, tty) catch {};
+    loop.start() catch {};
+    return if (result == .stopped) pid else null;
+}
+
+/// The Windows variant of C-x j: the console has no process groups or
+/// job-control stop, so the shell (=$SHELL=, =COMSPEC=, or cmd.exe) simply
+/// takes the console over and returns when it exits. The console's normal
+/// mode and codepage are restored for the shell's duration.
+fn enterShellWindows(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *std.process.Environ.Map,
+    loop: *vaxis.Loop(Event),
+    vx: *vaxis.Vaxis,
+    tty: *vaxis.Tty,
+) !?std.posix.pid_t {
+    loop.stop();
+    while (loop.tryEvent() catch null) |_| {}
+
+    // Reset the editor's terminal state and hand the console back to the
+    // user's normal mode and codepage, so cmd.exe behaves as usual.
+    vx.resetState(tty.writer()) catch {};
+    vaxis.Tty.setConsoleMode(tty.stdin, tty.initial_input_mode) catch {};
+    vaxis.Tty.setConsoleMode(tty.stdout, tty.initial_output_mode) catch {};
+    if (vaxis.Tty.SetConsoleOutputCP(tty.initial_codepage) == .FALSE) {}
+
+    const shell_path = environ_map.get("SHELL") orelse
+        (environ_map.get("COMSPEC") orelse "cmd.exe");
+    var child = std.process.spawn(io, .{ .argv = &.{shell_path} }) catch {
+        // No usable shell: come back to the editor untouched.
+        restoreEditorWindows(gpa, vx, tty) catch {};
         loop.start() catch {};
-        return if (result == .stopped) pid else null;
-    }
+        return null;
+    };
+    _ = child.wait(io) catch {};
+
+    // The shell is done: raw console mode again, back into the alternate
+    // screen, forcing a full repaint.
+    restoreEditorWindows(gpa, vx, tty) catch {};
+    loop.start() catch {};
     return null;
+}
+
+/// Re-enter the editor after a shell on Windows: raw console mode and the
+/// UTF-8 codepage, the alternate screen, and a resize to force a full
+/// repaint.
+fn restoreEditorWindows(gpa: std.mem.Allocator, vx: *vaxis.Vaxis, tty: *vaxis.Tty) !void {
+    vaxis.Tty.setConsoleMode(tty.stdin, vaxis.Tty.input_raw_mode) catch {};
+    vaxis.Tty.setConsoleMode(tty.stdout, vaxis.Tty.output_raw_mode) catch {};
+    if (vaxis.Tty.SetConsoleOutputCP(65001) == .FALSE) {}
+    try vx.enterAltScreen(tty.writer());
+    if (tty.getWinsize() catch null) |ws| {
+        if (ws.cols > 0 and ws.rows > 0) {
+            vx.resize(gpa, tty.writer(), ws) catch {};
+        }
+    }
 }
 
 fn restoreEditor(gpa: std.mem.Allocator, vx: *vaxis.Vaxis, tty: *vaxis.Tty) !void {
@@ -566,7 +631,7 @@ fn armSizeWatchdog(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event)) void {
 /// taking over the whole screen; when a file is chosen it's simply
 /// replaced by the newly opened buffer. An active isearch shows its prompt
 /// in the modeline; the match is the selected entry.
-fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, search: ?IsearchView, dired_prompt: ?DiredPromptView) void {
+fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, search: ?IsearchView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     dired.scrollToSelected(text_height);
     // Entries print their own heap-allocated metadata prefix and name
@@ -628,7 +693,9 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
             .copy => std.fmt.bufPrint(modeline_buf, "Copy {s}{s} to (C-g cancels): {s}", .{ if (is_dir) "directory " else "", name, p.query }) catch "Copy to: ...",
             .delete => std.fmt.bufPrint(modeline_buf, "{s}{s}? (y / n / C-g cancels)", .{ if (is_dir) "Recursively delete " else "Delete ", name }) catch "Delete?",
         };
-    } else std.fmt.bufPrint(modeline_buf, "Dired: {s}   (Enter opens, ^ up, q quits)", .{dired.path.items}) catch "Dired";
+    } else if (status) |m|
+        std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch "Save failed"
+    else std.fmt.bufPrint(modeline_buf, "Dired: {s}   (Enter opens, ^ up, q quits)", .{dired.path.items}) catch "Dired";
     const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true };
     const text_w = win.gwidth(modeline);
     const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
@@ -667,6 +734,7 @@ fn renderTree(
     focused: *Pane,
     search: ?IsearchView,
     dired_prompt: ?DiredPromptView,
+    status: ?[]const u8,
     focused_h: *usize,
 ) void {
     if (pane.isLeaf()) {
@@ -683,11 +751,12 @@ fn renderTree(
         // past a shorter line in a neighbouring buffer.
         const pane_search: ?IsearchView = if (pane == focused) search else null;
         const pane_prompt: ?DiredPromptView = if (pane == focused) dired_prompt else null;
+        const pane_status: ?[]const u8 = if (pane == focused) status else null;
         const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
         if (direds[pane.buf_idx]) |*d| {
-            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_search, pane_prompt);
+            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_search, pane_prompt, pane_status);
         } else {
-            renderPane(child, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_search);
+            renderPane(child, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_search, pane_status);
         }
         return;
     }
@@ -699,8 +768,8 @@ fn renderTree(
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             // The one blank column between the panes gets the separator.
             drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
-            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, focused_h);
-            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, focused_h);
+            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h);
+            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
@@ -708,8 +777,8 @@ fn renderTree(
             // a blank row between the panes for the separator (mirroring
             // the one blank column of a vertical split).
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
-            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, focused_h);
-            renderTree(win, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, focused_h);
+            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h);
+            renderTree(win, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h);
         },
     }
 }
@@ -1041,7 +1110,9 @@ fn mirrorDiredLines(gpa: std.mem.Allocator, buf: *Buffer, d: *const Dired) void 
         if (e.is_dir) line.append(gpa, '/') catch return;
         buf.lines.append(gpa, line) catch return;
     }
-    if (buf.cursor_row >= buf.lines.items.len) buf.cursor_row = buf.lines.items.len -| 1;
+    // Keep the mirror's cursor on the dired selection (isearch in dired
+    // syncs it anyway, but the two should never drift).
+    buf.cursor_row = @min(d.selected, buf.lines.items.len -| 1);
 }
 
 fn refreshDired(gpa: std.mem.Allocator, io: std.Io, buffers: *std.ArrayList(*Buffer), direds: *std.ArrayList(?Dired), idx: usize) void {
@@ -1222,13 +1293,19 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Kill ring is shared across all buffers, same as real Emacs.
-    var kill_ring: std.ArrayList(u8) = .empty;
+    var kill_ring: Buffer.KillRing = .{};
     defer kill_ring.deinit(gpa);
+    // The last C-y, for M-y (yank-pop); cleared by any other key.
+    var yank_state: ?YankState = null;
     var kill_active = false;
 
     var tty_buf: [1024]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
     defer tty.deinit();
+
+    // A transient status message for the modeline (e.g. a failed save);
+    // shown until the next keypress.
+    var status_msg: ?[]const u8 = null;
 
     // The editor's foreground process group, remembered before the shell
     // swap ever happens so C-x j can hand the terminal back to it.
@@ -1391,13 +1468,20 @@ pub fn main(init: std.process.Init) !void {
                 const b: *Buffer = buffers.items[current];
                 if (direds.items[current] == null) {
                     b.insertSlice(gpa, text) catch {};
+                    // A clipboard paste is yankable too, and heads the
+                    // kill ring like any fresh kill.
+                    kill_ring.remember(gpa, text, false) catch {};
                 }
+                yank_state = null;
             },
             .key_press => |key| {
                 // C-l cycles recenter positions only when pressed back to
                 // back (Emacs recenter-top-bottom); any other key makes the
-                // next C-l recenter to the middle again.
+                // next C-l recenter to the middle again. A transient status
+                // message (failed save) lives until the next keypress too.
                 if (!key.matches('l', .{ .ctrl = true })) last_was_recenter = false;
+                if (!key.matches('y', .{ .alt = true })) yank_state = null;
+                status_msg = null;
                 const buf: *Buffer = buffers.items[current];
 
                 if (confirming_quit) {
@@ -1415,11 +1499,11 @@ pub fn main(init: std.process.Init) !void {
                     pending_ctrl_c = false;
                     if (key.matches('b', .{})) {
                         try buf.copyWholeBuffer(gpa, &kill_ring);
-                        syncClipboard(&vx, &tty, gpa, kill_ring.items);
+                        syncClipboard(&vx, &tty, gpa, kill_ring.current() orelse "");
                         kill_active = true;
                     } else if (key.matches('w', .{})) {
                         try buf.copyRegion(gpa, &kill_ring, false);
-                        syncClipboard(&vx, &tty, gpa, kill_ring.items);
+                        syncClipboard(&vx, &tty, gpa, kill_ring.current() orelse "");
                         buf.mark = null;
                         kill_active = true;
                     } else if (key.matches('k', .{ .ctrl = true })) {
@@ -1455,7 +1539,7 @@ pub fn main(init: std.process.Init) !void {
                         switching_buffer = false;
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
                         if (switch_query.items.len > 0) _ = switch_query.pop();
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
                         switching_buffer = false;
                         const name = std.mem.trim(u8, switch_query.items, " ");
                         if (name.len > 0) {
@@ -1474,7 +1558,7 @@ pub fn main(init: std.process.Init) !void {
                         bookmark_prompt = null;
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
                         if (bookmark_query.items.len > 0) _ = bookmark_query.pop();
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
                         const name = std.mem.trim(u8, bookmark_query.items, " ");
                         bookmark_prompt = null;
                         if (name.len > 0) switch (mode) {
@@ -1498,7 +1582,7 @@ pub fn main(init: std.process.Init) !void {
                         dired_copy_prompt = false;
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
                         if (dired_copy_query.items.len > 0) _ = dired_copy_query.pop();
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
                         const target_raw = std.mem.trim(u8, dired_copy_query.items, " ");
                         dired_copy_prompt = false;
                         if (target_raw.len > 0 and direds.items[current] != null) {
@@ -1572,7 +1656,7 @@ pub fn main(init: std.process.Init) !void {
                         if (buffer_list_selected + 1 < buffers.items.len) buffer_list_selected += 1;
                     } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
                         if (buffer_list_selected > 0) buffer_list_selected -= 1;
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
                         if (buffer_list_selected < buffers.items.len) {
                             buffer_list_active = false;
                             recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
@@ -1637,7 +1721,7 @@ pub fn main(init: std.process.Init) !void {
                         } else {
                             isearch_failed = true;
                         }
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                         // Confirm the search: the match stays selected.
                         syncDiredSelection(direds.items, current, buf);
                         isearch_active = false;
@@ -1658,7 +1742,9 @@ pub fn main(init: std.process.Init) !void {
                 } else if (pending_ctrl_x) {
                     pending_ctrl_x = false;
                     if (key.matches('s', .{ .ctrl = true })) {
-                        buf.save(gpa, io) catch {};
+                        buf.save(gpa, io) catch {
+                            status_msg = "Save failed";
+                        };
                     } else if (key.matches('c', .{ .ctrl = true })) {
                         // Buffers with no backing file (the home screen) are
                         // scratch space — quitting them never prompts.
@@ -1698,7 +1784,7 @@ pub fn main(init: std.process.Init) !void {
                         buf.moveBufEnd();
                     } else if (key.matches('k', .{ .ctrl = true })) {
                         try buf.killRegion(gpa, &kill_ring, kill_active);
-                        syncClipboard(&vx, &tty, gpa, kill_ring.items);
+                        syncClipboard(&vx, &tty, gpa, kill_ring.current() orelse "");
                         kill_active = true;
                     } else if (key.matches('2', .{}) or key.matches('3', .{})) {
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
@@ -1884,19 +1970,29 @@ pub fn main(init: std.process.Init) !void {
                         buf.mark = null;
                     } else if (key.matches('k', .{ .ctrl = true })) {
                         try buf.killLine(gpa, &kill_ring, was_kill);
-                        syncClipboard(&vx, &tty, gpa, kill_ring.items);
+                        syncClipboard(&vx, &tty, gpa, kill_ring.current() orelse "");
                         kill_active = true;
                     } else if (key.matches('w', .{ .ctrl = true })) {
                         // C-w is save-buffer; kill-region lives at C-x C-k.
-                        buf.save(gpa, io) catch {};
+                        buf.save(gpa, io) catch {
+                            status_msg = "Save failed";
+                        };
                     } else if (key.matches('w', .{ .alt = true })) {
                         try buf.copyRegion(gpa, &kill_ring, was_kill);
-                        syncClipboard(&vx, &tty, gpa, kill_ring.items);
+                        syncClipboard(&vx, &tty, gpa, kill_ring.current() orelse "");
+                        buf.mark = null; // copy drops the mark, like C-c w
                         kill_active = true;
                     } else if (key.matches('y', .{ .ctrl = true })) {
                         if (editing) {
-                            if (kill_ring.items.len > 0) {
-                                try buf.yank(gpa, &kill_ring);
+                            if (kill_ring.current()) |text| {
+                                const start: Buffer.Pos = .{ .row = buf.cursor_row, .col = buf.cursor_col };
+                                try buf.yank(gpa, text);
+                                yank_state = .{
+                                    .buf_idx = current,
+                                    .entry = kill_ring.head,
+                                    .start = start,
+                                    .end = .{ .row = buf.cursor_row, .col = buf.cursor_col },
+                                };
                             } else {
                                 // Nothing has been killed yet: yank the
                                 // system clipboard instead (Emacs consults
@@ -1904,6 +2000,24 @@ pub fn main(init: std.process.Init) !void {
                                 // ring is empty). The terminal answers
                                 // asynchronously with a .paste event.
                                 vx.requestSystemClipboard(tty.writer()) catch {};
+                            }
+                        }
+                    } else if (key.matches('y', .{ .alt = true })) {
+                        // M-y: yank-pop — replace the previous yank with
+                        // the next older kill, staying inside the original
+                        // yank's undo step.
+                        if (editing) {
+                            if (yank_state) |ys| {
+                                if (ys.buf_idx == current and kill_ring.count() > 1) {
+                                    const next = kill_ring.beforeIdx(ys.entry, 1);
+                                    try buf.yankPop(gpa, kill_ring.at(next), ys.start, ys.end);
+                                    yank_state = .{
+                                        .buf_idx = current,
+                                        .entry = next,
+                                        .start = ys.start,
+                                        .end = .{ .row = buf.cursor_row, .col = buf.cursor_col },
+                                    };
+                                }
                             }
                         }
                     } else if (key.matches('f', .{ .ctrl = true }) or key.matches(vaxis.Key.right, .{})) {
@@ -1990,7 +2104,7 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('j', .{ .alt = true, .ctrl = true })) {
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         root.resizeDivider(focused, .horizontal, 8);
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
                         if (editing) try buf.insertNewline(gpa);
                     } else if (key.text) |t| {
                         // Dired buffers are read-only: typing is ignored.
@@ -2048,7 +2162,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, search_view, dired_prompt_view, &focused_text_height);
+            renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, search_view, dired_prompt_view, status_msg, &focused_text_height);
             try vx.render(tty.writer());
             continue;
         }
@@ -2122,7 +2236,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal) {
             if (direds.items[current]) |*d| {
                 var modeline_buf: [2048]u8 = undefined;
-                renderDiredPane(win, d, true, 0, win.height, &modeline_buf, search_view, dired_prompt_view);
+                renderDiredPane(win, d, true, 0, win.height, &modeline_buf, search_view, dired_prompt_view, status_msg);
                 try vx.render(tty.writer());
                 continue;
             }
@@ -2151,6 +2265,8 @@ pub fn main(init: std.process.Init) !void {
 
         const modeline = if (confirming_quit)
             std.fmt.bufPrint(&modeline_buf, "Save file {s} before exiting? (y / n / C-g cancels)", .{buf.filename orelse "?"}) catch "Save before exiting? (y/n)"
+        else if (status_msg) |m|
+            std.fmt.bufPrint(&modeline_buf, "{s}", .{m}) catch "Save failed"
         else if (switching_buffer)
             std.fmt.bufPrint(&modeline_buf, "Switch to buffer (open if new): {s}", .{switch_query.items}) catch "Switch to buffer: ..."
         else if (bookmark_prompt) |mode| blk: {
