@@ -1106,6 +1106,18 @@ pub fn main(init: std.process.Init) !void {
                                 current = try openBufferOrDired(gpa, io, &buffers, &direds, parent);
                                 focused.buf_idx = current;
                             }
+                        } else if (key.matches('<', .{ .alt = true })) {
+                            // M-<: beginning of the listing.
+                            d.selected = 0;
+                        } else if (key.matches('>', .{ .alt = true })) {
+                            // M->: end of the listing.
+                            d.selected = d.entries.items.len -| 1;
+                        } else if (key.matches('j', .{ .alt = true })) {
+                            // M-j: 5 entries down.
+                            d.selected = @min(d.selected + 5, d.entries.items.len -| 1);
+                        } else if (key.matches('k', .{ .alt = true })) {
+                            // M-k: 5 entries up.
+                            d.selected -|= 5;
                         } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('f', .{})) {
                             // Enter / C-j, or "f" (the dirlst-find-file key from
                             // the Jasspa setup): open the selected entry.
