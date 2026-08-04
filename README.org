@@ -132,10 +132,6 @@ Keeping that split matters: it's the same portability discipline MicroEmacs used
 
 Open buffers live in =main.zig= as =std.ArrayList(*Buffer)= — a list of *pointers* to individually heap-allocated buffers, not a list of buffers by value. That's deliberate: appending to the list (opening a new file) can reallocate the list's own backing array, which would silently invalidate a plain =*Buffer= pointer taken from it earlier. A pointer to an independently allocated =Buffer= stays valid regardless of what the list around it does. The kill ring is the one piece of state that lives above the buffer list entirely, shared by every buffer, matching real Emacs.
 
-* Known caveat
-
-Quitting (=C-x C-c=) relies on libvaxis's normal shutdown path, which sends a terminal status query to wake up its background input thread — real terminal emulators answer this automatically. This worked correctly for every editing and saving operation I tested through a real pseudo-terminal, but I could not fully confirm the exit path from inside a sandboxed test harness that lacks a real terminal emulator. If it ever seems to hang on quit in your actual terminal (unexpected — flag it if so), closing the terminal window or =C-c= from another shell will always work as a fallback.
-
 * Roadmap
 
 1. +*Kill ring + yank*+ — done (=C-space=, =C-k=, =C-x C-k=, =M-w=, =C-y=). =Buffer.mark= is a plain snapshot, not a self-adjusting marker, so it can go stale if you edit the buffer between setting mark and using the region — acceptable for now, worth revisiting if it bites you.

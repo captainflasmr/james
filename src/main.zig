@@ -1380,6 +1380,38 @@ pub fn main(init: std.process.Init) !void {
 
     var tty_buf: [1024]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
+
+    // When launched from a .desktop file with Terminal=true (e.g. via
+    // rofi drun or a similar launcher), the desktop environment opens a
+    // terminal whose shell runs james. On quit that shell is the blank
+    // remnant left behind — killing it closes the terminal window. Gated
+    // by an env var so an interactive `james` from your own shell never
+    // touches it; only the .desktop launch sets the var.
+    const kill_parent_on_exit = blk: {
+        if (init.environ_map.get("JAMES_KILL_PARENT_ON_EXIT")) |v| {
+            if (std.mem.eql(u8, v, "1")) break :blk true;
+        }
+        break :blk false;
+    };
+    defer if (comptime builtin.os.tag != .windows) {
+        if (kill_parent_on_exit) {
+            // Ignore SIGHUP so the terminal's death-rattle (sent to the
+            // process group when the shell exits and the terminal closes)
+            // doesn't cut our own cleanup short.
+            var sa = std.posix.Sigaction{
+                .handler = .{ .handler = std.posix.SIG.IGN },
+                .mask = switch (builtin.os.tag) {
+                    .macos => 0,
+                    else => std.posix.sigemptyset(),
+                },
+                .flags = 0,
+            };
+            std.posix.sigaction(std.posix.SIG.HUP, &sa, null);
+            const ppid = std.posix.getppid();
+            if (ppid > 1) std.posix.kill(ppid, std.posix.SIG.HUP) catch {};
+        }
+    };
+
     defer tty.deinit();
 
     // A transient status message for the modeline (e.g. a failed save);
@@ -1395,7 +1427,16 @@ pub fn main(init: std.process.Init) !void {
 
     var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);
     try loop.start();
-    defer loop.stop();
+    // loop.stop() is deliberately not deferred here. It sends a
+    // device-status-report to wake the input thread, then blocks on
+    // thread.await() until the terminal answers — and that await can
+    // hang (the thread never wakes), leaving the alt screen up as a
+    // blank window only C-c could escape. Instead the vx.deinit() and
+    // tty.deinit() defers restore the terminal, and the still-blocked
+    // input thread is killed when the process exits. The C-x j
+    // shell-swap path still calls loop.stop() explicitly — it needs
+    // the thread dead before handing the tty to a shell, so the
+    // blocking await is correct there.
 
     try vx.enterAltScreen(tty.writer());
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
