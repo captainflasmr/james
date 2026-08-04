@@ -1200,7 +1200,7 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
         };
     } else if (status) |m|
         std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch "Save failed"
-    else std.fmt.bufPrint(modeline_buf, "Dired: {s}   (Enter opens, ^ up, q quits)", .{dired.path.items}) catch "Dired";
+    else std.fmt.bufPrint(modeline_buf, "Dired: {s}", .{dired.path.items}) catch "Dired";
     const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true };
     const text_w = win.gwidth(modeline);
     const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
