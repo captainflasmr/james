@@ -331,6 +331,28 @@ fn moveFocus(root: *Pane, focused: *Pane, step: isize) ?*Pane {
     return null;
 }
 
+/// The Emacs dired-dwim-target: the buffer index of the next dired window
+/// after the focused one in render order (wrapping around). With two dired
+/// windows — a source on one side, a destination on the other — C in either
+/// copies the focused window's selected entry into the other window's
+/// directory; whichever window holds the cursor is the source. Null when no
+/// other window shows a dired.
+fn dwimTargetBuf(root: *Pane, focused: *Pane, direds: []?Dired) ?usize {
+    var leaves: [MAX_PANES]*Pane = undefined;
+    var n: usize = 0;
+    root.collectLeaves(&leaves, &n);
+    if (n < 2) return null;
+    var i: usize = 0;
+    while (i < n and leaves[i] != focused) : (i += 1) {}
+    if (i == n) return null;
+    var j = (i + 1) % n;
+    while (j != i) : (j = (j + 1) % n) {
+        const b = leaves[j].buf_idx;
+        if (direds[b] != null) return b;
+    }
+    return null;
+}
+
 /// C-x 1 / M-a: collapse the whole tree back to a single pane showing the
 /// focused buffer. Returns the buffer index the single pane should show.
 fn deleteOtherWindows(gpa: std.mem.Allocator, root: *Pane, focused: *Pane) usize {
@@ -1726,6 +1748,13 @@ pub fn main(init: std.process.Init) !void {
                                         std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), target, io, .{}) catch {};
                                     }
                                     refreshDired(gpa, io, &buffers, &direds, current);
+                                    // The destination dired (the other
+                                    // window, if there is one) needs a
+                                    // refresh too, so the copied entry
+                                    // shows up there as well.
+                                    if (dwimTargetBuf(root, focused, direds.items)) |ti| {
+                                        refreshDired(gpa, io, &buffers, &direds, ti);
+                                    }
                                 }
                             }
                         }
@@ -2129,11 +2158,23 @@ pub fn main(init: std.process.Init) !void {
                             // M-k: 5 entries up.
                             d.selected -|= 5;
                         } else if (key.matches('C', .{})) {
-                            // C: copy the selected entry (Emacs dired).
+                            // C: copy the selected entry (Emacs dired). With
+                            // another dired window in the split, the copy
+                            // target defaults to that window's directory
+                            // (Emacs dired-dwim-target): the query is pre-
+                            // filled with the full target path, so Enter
+                            // copies the entry across windows as-is.
                             const e = d.entries.items[d.selected];
                             if (!std.mem.eql(u8, e.name, "..")) {
                                 dired_copy_prompt = true;
                                 dired_copy_query.clearRetainingCapacity();
+                                if (dwimTargetBuf(root, focused, direds.items)) |ti| {
+                                    const base = direds.items[ti].?.path.items;
+                                    dired_copy_query.appendSlice(gpa, base) catch {};
+                                    if (base.len == 0 or base[base.len - 1] != '/') {
+                                        dired_copy_query.appendSlice(gpa, "/") catch {};
+                                    }
+                                }
                                 dired_copy_query.appendSlice(gpa, e.name) catch {};
                             }
                         } else if (key.matches('D', .{})) {
