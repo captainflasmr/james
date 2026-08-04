@@ -2360,7 +2360,9 @@ pub fn main(init: std.process.Init) !void {
                         if (bookmark_list_selected + 1 < bookmarks.items.len) bookmark_list_selected += 1;
                     } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
                         if (bookmark_list_selected > 0) bookmark_list_selected -= 1;
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches('f', .{})) {
+                        // Enter / C-j, or "f" (the dirlst-find-file key from
+                        // the Jasspa setup): open the selected bookmark.
                         if (bookmark_list_selected < bookmarks.items.len) {
                             const name = bookmarks.items[bookmark_list_selected].name;
                             bookmark_list_active = false;
@@ -2378,7 +2380,7 @@ pub fn main(init: std.process.Init) !void {
                         if (buffer_list_selected + 1 < buffers.items.len) buffer_list_selected += 1;
                     } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
                         if (buffer_list_selected > 0) buffer_list_selected -= 1;
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches('f', .{})) {
                         if (buffer_list_selected < buffers.items.len) {
                             buffer_list_active = false;
                             recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
@@ -3191,7 +3193,7 @@ pub fn main(init: std.process.Init) !void {
                 list_row += 1;
             }
             var list_ml_buf: [2048]u8 = undefined;
-            const list_ml = std.fmt.bufPrint(&list_ml_buf, "Bookmarks ({d}/{d})   (Enter jumps, n/p move, q closes)", .{
+            const list_ml = std.fmt.bufPrint(&list_ml_buf, "Bookmarks ({d}/{d})   (Enter/f jumps, n/p move, q closes)", .{
                 bookmark_list_selected + 1,
                 bookmarks.items.len,
             }) catch "Bookmarks";
@@ -3219,7 +3221,7 @@ pub fn main(init: std.process.Init) !void {
                 list_row += 1;
             }
             var list_ml_buf: [2048]u8 = undefined;
-            const list_ml = std.fmt.bufPrint(&list_ml_buf, "Buffers ({d}/{d})   (Enter switches, n/p move, q closes)", .{
+            const list_ml = std.fmt.bufPrint(&list_ml_buf, "Buffers ({d}/{d})   (Enter/f switches, n/p move, q closes)", .{
                 buffer_list_selected + 1,
                 buffers.items.len,
             }) catch "Buffers";
