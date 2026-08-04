@@ -135,11 +135,13 @@ const IsearchView = struct {
     backward: bool,
 };
 
-/// An in-pane dired prompt (copy target / delete confirmation): the
-/// listing stays in its window and the prompt text appears in that pane's
-/// modeline, so the layout never changes.
+const DiredPromptKind = enum { copy, rename, delete, create_dir, create_file };
+
+/// An in-pane dired prompt (copy / rename target, delete confirmation):
+/// the listing stays in its window and the prompt text appears in that
+/// pane's modeline, so the layout never changes.
 const DiredPromptView = struct {
-    kind: enum { copy, delete },
+    kind: DiredPromptKind,
     query: []const u8 = &.{},
 };
 
@@ -351,6 +353,23 @@ fn dwimTargetBuf(root: *Pane, focused: *Pane, direds: []?Dired) ?usize {
         if (direds[b] != null) return b;
     }
     return null;
+}
+
+/// The pre-filled target text for a dired copy/rename prompt: the dwim
+/// target (the next dired window's directory, per Emacs
+/// dired-dwim-target) followed by the selected entry's name, or just the
+/// name when there is no other dired window. Caller frees with gpa.
+fn diredTargetPrefill(gpa: std.mem.Allocator, direds: []?Dired, root: *Pane, focused: *Pane, name: []const u8) ![]u8 {
+    if (dwimTargetBuf(root, focused, direds)) |ti| {
+        const base = direds[ti].?.path.items;
+        const slash: usize = if (base.len == 0 or base[base.len - 1] == '/') 0 else 1;
+        const out = try gpa.alloc(u8, base.len + slash + name.len);
+        @memcpy(out[0..base.len], base);
+        if (slash == 1) out[base.len] = '/';
+        @memcpy(out[base.len + slash ..], name);
+        return out;
+    }
+    return gpa.dupe(u8, name);
 }
 
 /// C-x 1 / M-a: collapse the whole tree back to a single pane showing the
@@ -743,6 +762,9 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
         const name = if (dired.selected < dired.entries.items.len) dired.entries.items[dired.selected].name else "";
         break :blk switch (p.kind) {
             .copy => std.fmt.bufPrint(modeline_buf, "Copy {s}{s} to (C-g cancels): {s}", .{ if (is_dir) "directory " else "", name, p.query }) catch "Copy to: ...",
+            .rename => std.fmt.bufPrint(modeline_buf, "Rename {s}{s} to (C-g cancels): {s}", .{ if (is_dir) "directory " else "", name, p.query }) catch "Rename to: ...",
+            .create_dir => std.fmt.bufPrint(modeline_buf, "Create directory (C-g cancels): {s}", .{p.query}) catch "Create directory: ...",
+            .create_file => std.fmt.bufPrint(modeline_buf, "Create file (C-g cancels): {s}", .{p.query}) catch "Create file: ...",
             .delete => std.fmt.bufPrint(modeline_buf, "{s}{s}? (y / n / C-g cancels)", .{ if (is_dir) "Recursively delete " else "Delete ", name }) catch "Delete?",
         };
     } else if (status) |m|
@@ -1174,6 +1196,21 @@ fn refreshDired(gpa: std.mem.Allocator, io: std.Io, buffers: *std.ArrayList(*Buf
     mirrorDiredLines(gpa, buffers.items[idx], d);
 }
 
+/// Move a dired's selection (and its buffer mirror) to the entry named
+/// `name` after a refresh — used to land on a just-created entry, like
+/// Emacs dired moving point to a newly created directory.
+fn selectDiredEntry(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer), direds: *std.ArrayList(?Dired), idx: usize, name: []const u8) void {
+    if (idx >= direds.items.len or direds.items[idx] == null) return;
+    const d = &direds.items[idx].?;
+    for (d.entries.items, 0..) |e, i| {
+        if (std.mem.eql(u8, e.name, name)) {
+            d.selected = i;
+            mirrorDiredLines(gpa, buffers.items[idx], d);
+            return;
+        }
+    }
+}
+
 /// A named (file, position) pair, like an Emacs bookmark. Persisted to
 /// ~/.james-bookmarks as "name<TAB>path<TAB>row<TAB>col" lines.
 const Bookmark = struct {
@@ -1562,8 +1599,10 @@ pub fn main(init: std.process.Init) !void {
         if (shell_pid) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
     };
 
-    // Dired copy / delete prompts (C / D in a dired buffer).
+    // Dired copy / rename / delete prompts (C / R / D in a dired buffer).
     var dired_copy_prompt = false;
+    // What the target prompt will do on Enter (C = copy, R = rename).
+    var dired_copy_kind: DiredPromptKind = .copy;
     var dired_copy_query: std.ArrayList(u8) = .empty;
     defer dired_copy_query.deinit(gpa);
     var confirming_delete = false;
@@ -1732,30 +1771,76 @@ pub fn main(init: std.process.Init) !void {
                         dired_copy_prompt = false;
                         if (target_raw.len > 0 and direds.items[current] != null) {
                             const d = &direds.items[current].?;
-                            const e = d.entries.items[d.selected];
-                            if (!std.mem.eql(u8, e.name, "..")) {
-                                const src = try std.fs.path.join(gpa, &.{ d.path.items, e.name });
-                                defer gpa.free(src);
-                                const target = if (std.fs.path.isAbsolute(target_raw))
-                                    try gpa.dupe(u8, target_raw)
-                                else
-                                    try std.fs.path.join(gpa, &.{ d.path.items, target_raw });
-                                defer gpa.free(target);
-                                if (!std.mem.eql(u8, src, target) and !pathStartsWith(target, src)) {
-                                    if (e.is_dir) {
-                                        copyTree(gpa, io, src, target);
-                                    } else {
-                                        std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), target, io, .{}) catch {};
+                            const target = if (std.fs.path.isAbsolute(target_raw))
+                                try gpa.dupe(u8, target_raw)
+                            else
+                                try std.fs.path.join(gpa, &.{ d.path.items, target_raw });
+                            defer gpa.free(target);
+                            switch (dired_copy_kind) {
+                                .create_dir, .create_file => {
+                                    // + / _: make a directory or an empty
+                                    // file here, then land the selection on
+                                    // it, like Emacs dired moving point to a
+                                    // newly created directory.
+                                    const ok = if (dired_copy_kind == .create_dir) blk: {
+                                        std.Io.Dir.cwd().createDirPath(io, target) catch break :blk false;
+                                        break :blk true;
+                                    } else blk: {
+                                        if (std.Io.Dir.cwd().createFile(io, target, .{ .truncate = false })) |f| {
+                                            f.close(io);
+                                            break :blk true;
+                                        } else |_| break :blk false;
+                                    };
+                                    if (ok) {
+                                        refreshDired(gpa, io, &buffers, &direds, current);
+                                        selectDiredEntry(gpa, &buffers, &direds, current, std.fs.path.basename(target));
                                     }
-                                    refreshDired(gpa, io, &buffers, &direds, current);
-                                    // The destination dired (the other
-                                    // window, if there is one) needs a
-                                    // refresh too, so the copied entry
-                                    // shows up there as well.
-                                    if (dwimTargetBuf(root, focused, direds.items)) |ti| {
-                                        refreshDired(gpa, io, &buffers, &direds, ti);
+                                },
+                                .delete => unreachable,
+                                else => {
+                                    const e = d.entries.items[d.selected];
+                                    if (!std.mem.eql(u8, e.name, "..")) {
+                                        const src = try std.fs.path.join(gpa, &.{ d.path.items, e.name });
+                                        defer gpa.free(src);
+                                        if (!std.mem.eql(u8, src, target) and !pathStartsWith(target, src)) {
+                                            if (dired_copy_kind == .rename) {
+                                                // R: move the entry. rename()
+                                                // is the whole job — atomic
+                                                // and copy-free — except
+                                                // across filesystems, where it
+                                                // fails with CrossDevice and
+                                                // the fallback is copy +
+                                                // delete, like Emacs's
+                                                // dired-do-rename.
+                                                if (std.Io.Dir.cwd().rename(src, std.Io.Dir.cwd(), target, io)) |_| {
+                                                } else |err| switch (err) {
+                                                    error.CrossDevice => {
+                                                        if (e.is_dir) {
+                                                            copyTree(gpa, io, src, target);
+                                                            std.Io.Dir.cwd().deleteTree(io, src) catch {};
+                                                        } else {
+                                                            std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), target, io, .{}) catch {};
+                                                            std.Io.Dir.cwd().deleteFile(io, src) catch {};
+                                                        }
+                                                    },
+                                                    else => {},
+                                                }
+                                            } else if (e.is_dir) {
+                                                copyTree(gpa, io, src, target);
+                                            } else {
+                                                std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), target, io, .{}) catch {};
+                                            }
+                                            refreshDired(gpa, io, &buffers, &direds, current);
+                                            // The destination dired (the other
+                                            // window, if there is one) needs a
+                                            // refresh too, so the moved/copied
+                                            // entry shows up there as well.
+                                            if (dwimTargetBuf(root, focused, direds.items)) |ti| {
+                                                refreshDired(gpa, io, &buffers, &direds, ti);
+                                            }
+                                        }
                                     }
-                                }
+                                },
                             }
                         }
                     } else if (key.text) |t| {
@@ -2166,17 +2251,48 @@ pub fn main(init: std.process.Init) !void {
                             // copies the entry across windows as-is.
                             const e = d.entries.items[d.selected];
                             if (!std.mem.eql(u8, e.name, "..")) {
+                                dired_copy_kind = .copy;
                                 dired_copy_prompt = true;
                                 dired_copy_query.clearRetainingCapacity();
-                                if (dwimTargetBuf(root, focused, direds.items)) |ti| {
-                                    const base = direds.items[ti].?.path.items;
-                                    dired_copy_query.appendSlice(gpa, base) catch {};
-                                    if (base.len == 0 or base[base.len - 1] != '/') {
-                                        dired_copy_query.appendSlice(gpa, "/") catch {};
-                                    }
+                                if (diredTargetPrefill(gpa, direds.items, root, focused, e.name)) |prefill| {
+                                    defer gpa.free(prefill);
+                                    dired_copy_query.appendSlice(gpa, prefill) catch {};
+                                } else |_| {
+                                    dired_copy_query.appendSlice(gpa, e.name) catch {};
                                 }
-                                dired_copy_query.appendSlice(gpa, e.name) catch {};
                             }
+                        } else if (key.matches('R', .{})) {
+                            // R: rename (move) the selected entry (Emacs
+                            // dired-do-rename). The same target prompt as C,
+                            // but Enter moves the entry instead of copying it
+                            // — with another dired window open, that moves it
+                            // into that window's directory.
+                            const e = d.entries.items[d.selected];
+                            if (!std.mem.eql(u8, e.name, "..")) {
+                                dired_copy_kind = .rename;
+                                dired_copy_prompt = true;
+                                dired_copy_query.clearRetainingCapacity();
+                                if (diredTargetPrefill(gpa, direds.items, root, focused, e.name)) |prefill| {
+                                    defer gpa.free(prefill);
+                                    dired_copy_query.appendSlice(gpa, prefill) catch {};
+                                } else |_| {
+                                    dired_copy_query.appendSlice(gpa, e.name) catch {};
+                                }
+                            }
+                        } else if (key.matches('+', .{})) {
+                            // +: create a directory in this dired (Emacs
+                            // dired). Enter makes it (nested paths too) and
+                            // the selection lands on it.
+                            dired_copy_kind = .create_dir;
+                            dired_copy_prompt = true;
+                            dired_copy_query.clearRetainingCapacity();
+                        } else if (key.matches('_', .{})) {
+                            // _: create an empty file in this dired. Enter
+                            // creates it (without clobbering an existing
+                            // file) and the selection lands on it.
+                            dired_copy_kind = .create_file;
+                            dired_copy_prompt = true;
+                            dired_copy_query.clearRetainingCapacity();
                         } else if (key.matches('D', .{})) {
                             // D: delete the selected entry (Emacs dired).
                             const e = d.entries.items[d.selected];
@@ -2436,7 +2552,7 @@ pub fn main(init: std.process.Init) !void {
             null;
 
         const dired_prompt_view: ?DiredPromptView = if (dired_copy_prompt)
-            .{ .kind = .copy, .query = dired_copy_query.items }
+            .{ .kind = dired_copy_kind, .query = dired_copy_query.items }
         else if (confirming_delete)
             .{ .kind = .delete }
         else
