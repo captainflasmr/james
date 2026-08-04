@@ -293,6 +293,56 @@ const Pane = struct {
     }
 };
 
+/// A tab: an independent window layout (its own pane tree) over the
+/// shared buffer list, numbered 1..N and shown as blocks at the top of
+/// the screen once a second one exists. M-l = opens a new tab at the
+/// right end of the set, M-l - closes the current one, M-1..M-9 selects
+/// by number, M-i / M-u step right / left. The active tab's layout is
+/// tracked directly in main's root/focused/current; the other tabs live
+/// here, saved on switch.
+const Tab = struct {
+    root: *Pane,
+    focused: *Pane,
+    current: usize,
+};
+
+/// The tab set is capped at this many tabs: the tab bar gives each tab
+/// its own label buffer, and beyond a screenful of blocks a numbered
+/// tab bar stops meaning anything.
+const MAX_TABS = 16;
+
+/// The tab bar: one numbered block per tab, in the top row of `win`.
+/// Only drawn when more than one tab exists; the active tab's block is
+/// highlighted. `labels` gives each tab its own buffer — vaxis stores
+/// grapheme slices into the label text until the frame is drawn, so one
+/// shared buffer would show the last tab's number on every block.
+fn renderTabBar(win: vaxis.Window, labels: *[MAX_TABS][16]u8, tabs_len: usize, active: usize) void {
+    const shown = @min(tabs_len, MAX_TABS);
+    var col: u16 = 0;
+    var i: usize = 0;
+    while (i < shown) : (i += 1) {
+        const label = std.fmt.bufPrint(&labels[i], "[ {d} ]", .{i + 1}) catch break;
+        const style: vaxis.Style = if (i == active) highlight_style else .{ .dim = true };
+        _ = win.printSegment(.{ .text = label, .style = style }, .{ .row_offset = 0, .col_offset = col });
+        col += win.gwidth(label) + 1;
+    }
+}
+
+/// Make tab `idx` the active tab: save the current tab's layout into
+/// its slot, load the target's into the editor, and reset the window
+/// history (it never crosses tabs). A no-op for the already-active or
+/// out-of-range tab.
+fn selectTab(tabs: *std.ArrayList(Tab), active_tab: *usize, idx: usize, root: **Pane, focused: **Pane, current: *usize, window_undo: *std.ArrayList(WindowSnapshot), window_redo: *std.ArrayList(WindowSnapshot)) void {
+    if (idx >= tabs.items.len or idx == active_tab.*) return;
+    tabs.items[active_tab.*] = .{ .root = root.*, .focused = focused.*, .current = current.* };
+    active_tab.* = idx;
+    root.* = tabs.items[idx].root;
+    focused.* = tabs.items[idx].focused;
+    current.* = tabs.items[idx].current;
+    window_undo.clearRetainingCapacity();
+    window_redo.clearRetainingCapacity();
+}
+
 const MAX_PANES = 16;
 
 /// C-x 0 / M-q: delete the focused pane, giving its space to the sibling.
@@ -962,6 +1012,7 @@ const welcome_text =
     \\    C-x u         undo
     \\    C-x C-s       save
     \\    C-x j / C-x c  drop to a real shell (C-z / exit returns)
+    \\    M-l = / M-l -  new / close tab; M-1..M-9, M-i / M-u select
     \\    C-x C-c       quit
 ;
 
@@ -1637,6 +1688,23 @@ pub fn main(init: std.process.Init) !void {
         current = focused.buf_idx;
     }
 
+    // Tabs: tab 0 is this initial layout; M-l = appends a new tab at
+    // the right end, M-l - removes the current one, M-1..M-9 selects by
+    // number. Only the active tab's layout is held in root/focused/
+    // current; the others are stored here, saved on every switch. The
+    // tab bar appears only once a second tab exists.
+    var tabs: std.ArrayList(Tab) = .empty;
+    var active_tab: usize = 0;
+    defer {
+        // The active tab's tree is freed by the root.destroy defer
+        // above; the remaining tabs' trees live only here.
+        for (tabs.items, 0..) |tab, i| {
+            if (i != active_tab) tab.root.destroy(gpa);
+        }
+        tabs.deinit(gpa);
+    }
+    tabs.append(gpa, .{ .root = root, .focused = focused, .current = current }) catch {};
+
     var switching_buffer = false;
     var switch_query: std.ArrayList(u8) = .empty;
     defer switch_query.deinit(gpa);
@@ -2278,6 +2346,64 @@ pub fn main(init: std.process.Init) !void {
                             defer gpa.free(p);
                             current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
                         }
+                    } else if (key.matches('=', .{})) {
+                        // M-l =: open a new tab at the right end of the
+                        // tab set (capped at MAX_TABS). The new tab is a
+                        // single window on the scratch buffer (created if
+                        // missing), like a fresh start.
+                        new_tab: {
+                            if (tabs.items.len >= MAX_TABS) {
+                                status_msg = "Max tabs reached";
+                                break :new_tab;
+                            }
+                            const new_root = gpa.create(Pane) catch break :new_tab;
+                            tabs.items[active_tab] = .{ .root = root, .focused = focused, .current = current };
+                            var new_current = current;
+                            if (std.Io.Dir.cwd().createFile(io, "scratch.txt", .{ .truncate = false })) |f| {
+                                f.close(io);
+                                new_current = openBufferOrDired(gpa, io, &buffers, &direds, "scratch.txt") catch current;
+                            } else |_| {}
+                            new_root.* = .{ .buf_idx = new_current };
+                            tabs.append(gpa, .{ .root = new_root, .focused = new_root, .current = new_current }) catch {
+                                new_root.destroy(gpa);
+                                break :new_tab;
+                            };
+                            active_tab = tabs.items.len - 1;
+                            root = new_root;
+                            focused = new_root;
+                            current = new_current;
+                            // Window history doesn't cross tabs.
+                            window_undo.clearRetainingCapacity();
+                            window_redo.clearRetainingCapacity();
+                        }
+                    } else if (key.matches('-', .{})) {
+                        // M-l -: close the current tab. The last tab can't
+                        // be closed; the tab to its left becomes active.
+                        if (tabs.items.len > 1) {
+                            root.destroy(gpa);
+                            _ = tabs.orderedRemove(active_tab);
+                            active_tab = @min(active_tab, tabs.items.len - 1);
+                            root = tabs.items[active_tab].root;
+                            focused = tabs.items[active_tab].focused;
+                            current = tabs.items[active_tab].current;
+                            // Window history doesn't cross tabs.
+                            window_undo.clearRetainingCapacity();
+                            window_redo.clearRetainingCapacity();
+                        }
+                    }
+                } else if (key.matches('1', .{ .alt = true }) or key.matches('2', .{ .alt = true }) or key.matches('3', .{ .alt = true }) or key.matches('4', .{ .alt = true }) or key.matches('5', .{ .alt = true }) or key.matches('6', .{ .alt = true }) or key.matches('7', .{ .alt = true }) or key.matches('8', .{ .alt = true }) or key.matches('9', .{ .alt = true })) {
+                    // M-1..M-9: select a tab by number (the numbered tab
+                    // set's natural selector).
+                    selectTab(&tabs, &active_tab, @intCast(key.codepoint - '1'), &root, &focused, &current, &window_undo, &window_redo);
+                } else if (key.matches('u', .{ .alt = true })) {
+                    // M-u: move to the tab on the left (wrapping).
+                    if (tabs.items.len > 1) {
+                        selectTab(&tabs, &active_tab, (active_tab + tabs.items.len - 1) % tabs.items.len, &root, &focused, &current, &window_undo, &window_redo);
+                    }
+                } else if (key.matches('i', .{ .alt = true })) {
+                    // M-i: move to the tab on the right (wrapping).
+                    if (tabs.items.len > 1) {
+                        selectTab(&tabs, &active_tab, (active_tab + 1) % tabs.items.len, &root, &focused, &current, &window_undo, &window_redo);
                     }
                 } else {
                     const was_kill = kill_active;
@@ -2648,7 +2774,15 @@ pub fn main(init: std.process.Init) !void {
         // selection, the isearch match, and point.
         win.setCursorShape(.block_blink);
 
-        const text_height: usize = if (win.height > 1) win.height - 1 else win.height;
+        // The tab bar (only when more than one tab exists) takes the top
+        // row; everything else renders into the rows below it. The label
+        // buffers live until the frame is drawn (vaxis keeps grapheme
+        // slices into them), so they're scoped to this render pass.
+        const body = if (tabs.items.len > 1) win.child(.{ .x_off = 0, .y_off = 1, .width = win.width, .height = win.height -| 1 }) else win;
+        var tab_blocks: [MAX_TABS][16]u8 = undefined;
+        if (tabs.items.len > 1) renderTabBar(win, &tab_blocks, tabs.items.len, active_tab);
+
+        const text_height: usize = if (body.height > 1) body.height - 1 else body.height;
         // The focused pane's text area (the whole window when unsplit),
         // remembered for C-l so it can recenter within the right window.
         focused_text_height = text_height;
@@ -2672,7 +2806,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(win, root, 0, 0, win.width, win.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, search_view, dired_prompt_view, status_msg, &focused_text_height);
+            renderTree(body, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, search_view, dired_prompt_view, status_msg, &focused_text_height);
             try vx.render(tty.writer());
             continue;
         }
@@ -2693,13 +2827,13 @@ pub fn main(init: std.process.Init) !void {
                 // it. For a dired bookmark the path is a directory, so it
                 // shows itself; for a file bookmark, its parent directory.
                 const b = bookmarks.items[i];
-                _ = win.printSegment(.{ .text = b.name, .style = .{} }, .{ .row_offset = list_row });
+                _ = body.printSegment(.{ .text = b.name, .style = .{} }, .{ .row_offset = list_row });
                 const dir: ?[]const u8 = if (isDirectory(io, b.path))
                     b.path
                 else
                     std.fs.path.dirname(b.path);
                 if (dir) |d| {
-                    _ = win.printSegment(.{ .text = d, .style = .{ .dim = true } }, .{ .row_offset = list_row, .col_offset = win.gwidth(b.name) + 2 });
+                    _ = body.printSegment(.{ .text = d, .style = .{ .dim = true } }, .{ .row_offset = list_row, .col_offset = body.gwidth(b.name) + 2 });
                 }
                 list_row += 1;
             }
@@ -2708,9 +2842,9 @@ pub fn main(init: std.process.Init) !void {
                 bookmark_list_selected + 1,
                 bookmarks.items.len,
             }) catch "Bookmarks";
-            _ = win.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = win.height -| 1 });
+            _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
             // No highlights: the block cursor marks the selected bookmark.
-            win.showCursor(0, @intCast(bookmark_list_selected - bookmark_list_top));
+            body.showCursor(0, @intCast(bookmark_list_selected - bookmark_list_top));
             try vx.render(tty.writer());
             continue;
         }
@@ -2728,7 +2862,7 @@ pub fn main(init: std.process.Init) !void {
             var i = buffer_list_top;
             while (i < buffers.items.len and list_row < text_height) : (i += 1) {
                 const b: *Buffer = buffers.items[i];
-                _ = win.printSegment(.{ .text = b.display_name orelse b.filename orelse "?", .style = .{} }, .{ .row_offset = list_row });
+                _ = body.printSegment(.{ .text = b.display_name orelse b.filename orelse "?", .style = .{} }, .{ .row_offset = list_row });
                 list_row += 1;
             }
             var list_ml_buf: [2048]u8 = undefined;
@@ -2736,9 +2870,9 @@ pub fn main(init: std.process.Init) !void {
                 buffer_list_selected + 1,
                 buffers.items.len,
             }) catch "Buffers";
-            _ = win.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = win.height -| 1 });
+            _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
             // No highlights: the block cursor marks the selected buffer.
-            win.showCursor(0, if (text_height > 0) @intCast(buffer_list_selected - buffer_list_top) else 0);
+            body.showCursor(0, if (text_height > 0) @intCast(buffer_list_selected - buffer_list_top) else 0);
             try vx.render(tty.writer());
             continue;
         }
@@ -2746,7 +2880,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal) {
             if (direds.items[current]) |*d| {
                 var modeline_buf: [2048]u8 = undefined;
-                renderDiredPane(win, d, true, 0, win.height, &modeline_buf, search_view, dired_prompt_view, status_msg);
+                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, search_view, dired_prompt_view, status_msg);
                 try vx.render(tty.writer());
                 continue;
             }
@@ -2763,7 +2897,7 @@ pub fn main(init: std.process.Init) !void {
             const h = highlightFor(buf, i, search_view != null, if (search_view) |s| (if (s.failed) null else s.match) else null, if (search_view) |s| s.query.len else 0);
             var seg_storage: [3]vaxis.Segment = undefined;
             const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage);
-            _ = win.print(segs, .{ .row_offset = row });
+            _ = body.print(segs, .{ .row_offset = row });
             row += 1;
         }
 
@@ -2810,12 +2944,12 @@ pub fn main(init: std.process.Init) !void {
         // Same full-width bar as the pane modelines: the whole row is one
         // segment in `modeline_buf`, kept alive until after the render.
         const style: vaxis.Style = highlight_style;
-        const text_w = win.gwidth(modeline);
-        const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
+        const text_w = body.gwidth(modeline);
+        const fill_n = @min(@as(usize, @intCast(body.width -| text_w)), modeline_buf.len - modeline.len);
         if (fill_n > 0) @memset(modeline_buf[modeline.len .. modeline.len + fill_n], ' ');
-        _ = win.printSegment(.{ .text = modeline_buf[0 .. modeline.len + fill_n], .style = style }, .{ .row_offset = win.height -| 1 });
+        _ = body.printSegment(.{ .text = modeline_buf[0 .. modeline.len + fill_n], .style = style }, .{ .row_offset = body.height -| 1 });
 
-        win.showCursor(
+        body.showCursor(
             @intCast(buf.cursor_col),
             @intCast(buf.cursor_row - buf.top_line),
         );

@@ -102,9 +102,13 @@ Jump keys (the =my-jump-keymap= prefix from the author's Emacs setup: =M-l=, the
 | =M-l r= | switch to the scratch buffer (=scratch.txt=, created if missing) |
 | =M-l s= | jump to =~/source= |
 | =M-l y= | jump to =~/.emacs.d/Emacs-DIYer= |
+| =M-l == | open a new tab at the right end of the tab set (numbered tabs; see below) |
+| =M-l -= | close the current tab |
 | =C-g= / Esc | cancel the =M-l= prefix |
 
 The path resolution mirrors the elisp's =system-type= checks exactly: on Windows =M-l d= consults =%USERPROFILE%\Downloads= (with the =~/Downloads= fallback), =M-l g= consults =%APPDATA%= (with the =~/AppData/Roaming= fallback), and =M-l h= consults =%USERPROFILE%=; elsewhere they are plain =~/Downloads=, =~/.config= and =~=. A jump that can't be opened (a missing =~/bin=, say) just leaves the window alone, and every jump is recorded in the winner-mode history, so =C-c j= steps back out of it.
+
+Tabs (a numbered tab set in the spirit of Emacs =tab-bar-mode=, without per-tab buffer association): =M-l == opens a new tab at the right end of the set, =M-l -= closes the current one, =M-1=..=M-9= selects a tab by number, and =M-i= / =M-u= step to the next / previous tab (wrapping). Each tab is an independent window layout over the shared buffer list. The tab bar — one numbered block per tab, the active one highlighted — appears at the top of the screen only once a second tab exists; with a single tab the screen is exactly as before. Window history does not cross tabs.
 
 While searching: type to extend the query, =C-s=/=C-r= again jumps to the next/previous match, Backspace shrinks the query, =C-g= cancels back to where you started, and Enter (or any other key) confirms and leaves the cursor at the match. A search with no match shows "Failing I-search" and stops moving the cursor until you backspace back to something that matches.
 
