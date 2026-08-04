@@ -23,6 +23,10 @@ pub const Entry = struct {
     name: []u8,
     is_dir: bool,
     is_link: bool = false,
+    /// Set by m in dired (Emacs dired-mark): marked entries are the
+    /// operands of C (copy) and R (rename), shown with a * in column 0.
+    /// Rebuilt entries from a refresh are unmarked.
+    marked: bool = false,
     /// The raw sort keys, captured from the stat so sorting by size or
     /// date doesn't have to parse the formatted meta string back out.
     size: u64 = 0,

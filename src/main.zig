@@ -372,6 +372,69 @@ fn diredTargetPrefill(gpa: std.mem.Allocator, direds: []?Dired, root: *Pane, foc
     return gpa.dupe(u8, name);
 }
 
+/// How many entries are marked (excluding "..", which the copy/rename
+/// operations skip): the operands of the next C or R, defaulting to the
+/// selected entry alone when nothing is marked.
+fn diredMarkedCount(d: *const Dired) usize {
+    var n: usize = 0;
+    for (d.entries.items) |e| {
+        if (e.marked and !std.mem.eql(u8, e.name, "..")) n += 1;
+    }
+    return n;
+}
+
+/// Append the indices of the entries an operation (C / R / D) applies to:
+/// every marked entry, or just the selected one when nothing is marked.
+/// ".." is never included. The indices point into the dired's current
+/// entries, so the listing must not change between the call and the
+/// operation.
+fn diredOpIndices(gpa: std.mem.Allocator, d: *const Dired, out: *std.ArrayList(usize)) void {
+    for (d.entries.items, 0..) |en, i| {
+        if (en.marked and !std.mem.eql(u8, en.name, "..")) {
+            out.append(gpa, i) catch return;
+        }
+    }
+    if (out.items.len == 0 and !std.mem.eql(u8, d.entries.items[d.selected].name, "..")) {
+        out.append(gpa, d.selected) catch {};
+    }
+}
+
+/// Open the dired copy/rename target prompt for `d` (a no-op when the
+/// selection is ".." and nothing is marked). With more than one marked
+/// entry the query is pre-filled with just the dwim target directory, and
+/// each entry lands in it keeping its own name; with none or one it is the
+/// full dwim target path of that single entry (the marked one when exactly
+/// one is marked, else the selected one).
+fn openDiredTargetPrompt(gpa: std.mem.Allocator, direds: *std.ArrayList(?Dired), root: *Pane, focused: *Pane, d: *Dired, prompt: *bool, query: *std.ArrayList(u8)) void {
+    const e = d.entries.items[d.selected];
+    const marked = diredMarkedCount(d);
+    if (marked == 0 and std.mem.eql(u8, e.name, "..")) return;
+    prompt.* = true;
+    query.clearRetainingCapacity();
+    if (marked > 1) {
+        if (dwimTargetBuf(root, focused, direds.items)) |ti| {
+            const base = direds.items[ti].?.path.items;
+            query.appendSlice(gpa, base) catch {};
+            if (base.len == 0 or base[base.len - 1] != '/') {
+                query.appendSlice(gpa, "/") catch {};
+            }
+        }
+    } else {
+        const name = if (marked == 1) blk: {
+            for (d.entries.items) |en| {
+                if (en.marked) break :blk en.name;
+            }
+            break :blk e.name;
+        } else e.name;
+        if (diredTargetPrefill(gpa, direds.items, root, focused, name)) |prefill| {
+            defer gpa.free(prefill);
+            query.appendSlice(gpa, prefill) catch {};
+        } else |_| {
+            query.appendSlice(gpa, name) catch {};
+        }
+    }
+}
+
 /// C-x 1 / M-a: collapse the whole tree back to a single pane showing the
 /// focused buffer. Returns the buffer index the single pane should show.
 fn deleteOtherWindows(gpa: std.mem.Allocator, root: *Pane, focused: *Pane) usize {
@@ -719,8 +782,11 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
     while (i < dired.entries.items.len and row < text_height) : (i += 1) {
         const e = dired.entries.items[i];
         const style: vaxis.Style = .{};
-        _ = win.printSegment(.{ .text = e.meta, .style = style }, .{ .row_offset = row_base + row });
-        const name_col = win.gwidth(e.meta);
+        // Column 0 is the mark column, like Emacs: "*" for a marked
+        // entry, a blank otherwise.
+        _ = win.printSegment(.{ .text = if (e.marked) "*" else " ", .style = style }, .{ .row_offset = row_base + row });
+        _ = win.printSegment(.{ .text = e.meta, .style = style }, .{ .row_offset = row_base + row, .col_offset = 1 });
+        const name_col = 1 + win.gwidth(e.meta);
         const hl: ?Highlight = if (searching) blk: {
             if (match) |m| {
                 if (i == m.row) {
@@ -761,11 +827,22 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
         const is_dir = dired.selected < dired.entries.items.len and dired.entries.items[dired.selected].is_dir;
         const name = if (dired.selected < dired.entries.items.len) dired.entries.items[dired.selected].name else "";
         break :blk switch (p.kind) {
-            .copy => std.fmt.bufPrint(modeline_buf, "Copy {s}{s} to (C-g cancels): {s}", .{ if (is_dir) "directory " else "", name, p.query }) catch "Copy to: ...",
-            .rename => std.fmt.bufPrint(modeline_buf, "Rename {s}{s} to (C-g cancels): {s}", .{ if (is_dir) "directory " else "", name, p.query }) catch "Rename to: ...",
+            .copy => prompt_blk: {
+                const n = diredMarkedCount(dired);
+                if (n > 1) break :prompt_blk std.fmt.bufPrint(modeline_buf, "Copy {d} entries to (C-g cancels): {s}", .{ n, p.query }) catch "Copy to: ...";
+                break :prompt_blk std.fmt.bufPrint(modeline_buf, "Copy {s}{s} to (C-g cancels): {s}", .{ if (is_dir) "directory " else "", name, p.query }) catch "Copy to: ...";
+            },
+            .rename => prompt_blk: {
+                const n = diredMarkedCount(dired);
+                if (n > 1) break :prompt_blk std.fmt.bufPrint(modeline_buf, "Rename {d} entries to (C-g cancels): {s}", .{ n, p.query }) catch "Rename to: ...";
+                break :prompt_blk std.fmt.bufPrint(modeline_buf, "Rename {s}{s} to (C-g cancels): {s}", .{ if (is_dir) "directory " else "", name, p.query }) catch "Rename to: ...";
+            },
             .create_dir => std.fmt.bufPrint(modeline_buf, "Create directory (C-g cancels): {s}", .{p.query}) catch "Create directory: ...",
             .create_file => std.fmt.bufPrint(modeline_buf, "Create file (C-g cancels): {s}", .{p.query}) catch "Create file: ...",
-            .delete => std.fmt.bufPrint(modeline_buf, "{s}{s}? (y / n / C-g cancels)", .{ if (is_dir) "Recursively delete " else "Delete ", name }) catch "Delete?",
+            .delete => if (diredMarkedCount(dired) > 1)
+                std.fmt.bufPrint(modeline_buf, "Delete {d} entries? (y / n / C-g cancels)", .{diredMarkedCount(dired)}) catch "Delete?"
+            else
+                std.fmt.bufPrint(modeline_buf, "{s}{s}? (y / n / C-g cancels)", .{ if (is_dir) "Recursively delete " else "Delete ", name }) catch "Delete?",
         };
     } else if (status) |m|
         std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch "Save failed"
@@ -778,10 +855,11 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
 
     if (is_focused) {
         // The cursor sits at the start of the entry's name, after the
-        // metadata prefix, rather than at the start of the line.
+        // mark column and the metadata prefix, rather than at the start
+        // of the line.
         const sel = dired.selected;
         const name_col: u16 = if (sel < dired.entries.items.len)
-            win.gwidth(dired.entries.items[sel].meta)
+            1 + win.gwidth(dired.entries.items[sel].meta)
         else
             0;
         win.showCursor(name_col, @intCast(sel - dired.top));
@@ -1798,11 +1876,28 @@ pub fn main(init: std.process.Init) !void {
                                 },
                                 .delete => unreachable,
                                 else => {
-                                    const e = d.entries.items[d.selected];
-                                    if (!std.mem.eql(u8, e.name, "..")) {
-                                        const src = try std.fs.path.join(gpa, &.{ d.path.items, e.name });
+                                    // C / R: apply to every marked entry,
+                                    // or just the selected one when nothing
+                                    // is marked. A single entry's target is
+                                    // the query as typed (it includes the
+                                    // name); a marked set treats the query
+                                    // as a directory and keeps each entry's
+                                    // own name.
+                                    var idxs: std.ArrayList(usize) = .empty;
+                                    defer idxs.deinit(gpa);
+                                    diredOpIndices(gpa, d, &idxs);
+                                    var any = false;
+                                    for (idxs.items) |i| {
+                                        const en = d.entries.items[i];
+                                        const src = try std.fs.path.join(gpa, &.{ d.path.items, en.name });
                                         defer gpa.free(src);
-                                        if (!std.mem.eql(u8, src, target) and !pathStartsWith(target, src)) {
+                                        const multi = idxs.items.len > 1;
+                                        const dst = if (multi)
+                                            try std.fs.path.join(gpa, &.{ target, en.name })
+                                        else
+                                            target;
+                                        defer if (multi) gpa.free(dst);
+                                        if (!std.mem.eql(u8, src, dst) and !pathStartsWith(dst, src)) {
                                             if (dired_copy_kind == .rename) {
                                                 // R: move the entry. rename()
                                                 // is the whole job — atomic
@@ -1812,32 +1907,35 @@ pub fn main(init: std.process.Init) !void {
                                                 // the fallback is copy +
                                                 // delete, like Emacs's
                                                 // dired-do-rename.
-                                                if (std.Io.Dir.cwd().rename(src, std.Io.Dir.cwd(), target, io)) |_| {
+                                                if (std.Io.Dir.cwd().rename(src, std.Io.Dir.cwd(), dst, io)) |_| {
                                                 } else |err| switch (err) {
                                                     error.CrossDevice => {
-                                                        if (e.is_dir) {
-                                                            copyTree(gpa, io, src, target);
+                                                        if (en.is_dir) {
+                                                            copyTree(gpa, io, src, dst);
                                                             std.Io.Dir.cwd().deleteTree(io, src) catch {};
                                                         } else {
-                                                            std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), target, io, .{}) catch {};
+                                                            std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), dst, io, .{}) catch {};
                                                             std.Io.Dir.cwd().deleteFile(io, src) catch {};
                                                         }
                                                     },
                                                     else => {},
                                                 }
-                                            } else if (e.is_dir) {
-                                                copyTree(gpa, io, src, target);
+                                            } else if (en.is_dir) {
+                                                copyTree(gpa, io, src, dst);
                                             } else {
-                                                std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), target, io, .{}) catch {};
+                                                std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), dst, io, .{}) catch {};
                                             }
-                                            refreshDired(gpa, io, &buffers, &direds, current);
-                                            // The destination dired (the other
-                                            // window, if there is one) needs a
-                                            // refresh too, so the moved/copied
-                                            // entry shows up there as well.
-                                            if (dwimTargetBuf(root, focused, direds.items)) |ti| {
-                                                refreshDired(gpa, io, &buffers, &direds, ti);
-                                            }
+                                            any = true;
+                                        }
+                                    }
+                                    if (any) {
+                                        refreshDired(gpa, io, &buffers, &direds, current);
+                                        // The destination dired (the other
+                                        // window, if there is one) needs a
+                                        // refresh too, so the moved/copied
+                                        // entries show up there as well.
+                                        if (dwimTargetBuf(root, focused, direds.items)) |ti| {
+                                            refreshDired(gpa, io, &buffers, &direds, ti);
                                         }
                                     }
                                 },
@@ -1852,17 +1950,24 @@ pub fn main(init: std.process.Init) !void {
                     if (key.matches('y', .{}) or key.matches('Y', .{})) {
                         confirming_delete = false;
                         if (direds.items[current]) |*d| {
-                            const e = d.entries.items[d.selected];
-                            if (!std.mem.eql(u8, e.name, "..")) {
-                                const path = try std.fs.path.join(gpa, &.{ d.path.items, e.name });
+                            // Delete every marked entry, or just the
+                            // selected one when nothing is marked.
+                            var idxs: std.ArrayList(usize) = .empty;
+                            defer idxs.deinit(gpa);
+                            diredOpIndices(gpa, d, &idxs);
+                            var any = false;
+                            for (idxs.items) |i| {
+                                const en = d.entries.items[i];
+                                const path = try std.fs.path.join(gpa, &.{ d.path.items, en.name });
                                 defer gpa.free(path);
-                                if (e.is_dir) {
+                                if (en.is_dir) {
                                     std.Io.Dir.cwd().deleteTree(io, path) catch {};
                                 } else {
                                     std.Io.Dir.cwd().deleteFile(io, path) catch {};
                                 }
-                                refreshDired(gpa, io, &buffers, &direds, current);
+                                any = true;
                             }
+                            if (any) refreshDired(gpa, io, &buffers, &direds, current);
                         }
                     } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                         confirming_delete = false;
@@ -2200,6 +2305,27 @@ pub fn main(init: std.process.Init) !void {
                             d.moveDown();
                         } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
                             d.moveUp();
+                        } else if (key.matches('m', .{})) {
+                            // m: mark the selected entry (Emacs dired-mark)
+                            // and move down, so a run of m's marks a block.
+                            d.entries.items[d.selected].marked = true;
+                            d.moveDown();
+                        } else if (key.matches('u', .{})) {
+                            // u: unmark the selected entry (Emacs
+                            // dired-unmark) and move down.
+                            d.entries.items[d.selected].marked = false;
+                            d.moveDown();
+                        } else if (key.matches('U', .{})) {
+                            // U: unmark every entry (Emacs
+                            // dired-unmark-all-marks).
+                            for (d.entries.items) |*e| e.marked = false;
+                        } else if (key.matches('t', .{})) {
+                            // t: toggle marks (Emacs dired-toggle-marks).
+                            // Nothing marked marks everything; a partial or
+                            // full set is inverted. ".." is never marked.
+                            for (d.entries.items) |*en| {
+                                if (!std.mem.eql(u8, en.name, "..")) en.marked = !en.marked;
+                            }
                         } else if (key.matches('l', .{ .ctrl = true })) {
                             // C-l: recenter the listing on the selection.
                             d.recenterTopBottom(focused_text_height, last_was_recenter);
@@ -2243,42 +2369,26 @@ pub fn main(init: std.process.Init) !void {
                             // M-k: 5 entries up.
                             d.selected -|= 5;
                         } else if (key.matches('C', .{})) {
-                            // C: copy the selected entry (Emacs dired). With
-                            // another dired window in the split, the copy
-                            // target defaults to that window's directory
-                            // (Emacs dired-dwim-target): the query is pre-
-                            // filled with the full target path, so Enter
-                            // copies the entry across windows as-is.
-                            const e = d.entries.items[d.selected];
-                            if (!std.mem.eql(u8, e.name, "..")) {
-                                dired_copy_kind = .copy;
-                                dired_copy_prompt = true;
-                                dired_copy_query.clearRetainingCapacity();
-                                if (diredTargetPrefill(gpa, direds.items, root, focused, e.name)) |prefill| {
-                                    defer gpa.free(prefill);
-                                    dired_copy_query.appendSlice(gpa, prefill) catch {};
-                                } else |_| {
-                                    dired_copy_query.appendSlice(gpa, e.name) catch {};
-                                }
-                            }
+                            // C: copy the marked entries, or just the
+                            // selected one when nothing is marked (Emacs
+                            // dired-do-copy). With another dired window in
+                            // the split, the target defaults to that
+                            // window's directory (Emacs dired-dwim-target):
+                            // a single entry pre-fills the full target path,
+                            // a marked set just the target directory, so
+                            // Enter copies the entries across as-is.
+                            dired_copy_kind = .copy;
+                            openDiredTargetPrompt(gpa, &direds, root, focused, d, &dired_copy_prompt, &dired_copy_query);
                         } else if (key.matches('R', .{})) {
-                            // R: rename (move) the selected entry (Emacs
-                            // dired-do-rename). The same target prompt as C,
-                            // but Enter moves the entry instead of copying it
-                            // — with another dired window open, that moves it
-                            // into that window's directory.
-                            const e = d.entries.items[d.selected];
-                            if (!std.mem.eql(u8, e.name, "..")) {
-                                dired_copy_kind = .rename;
-                                dired_copy_prompt = true;
-                                dired_copy_query.clearRetainingCapacity();
-                                if (diredTargetPrefill(gpa, direds.items, root, focused, e.name)) |prefill| {
-                                    defer gpa.free(prefill);
-                                    dired_copy_query.appendSlice(gpa, prefill) catch {};
-                                } else |_| {
-                                    dired_copy_query.appendSlice(gpa, e.name) catch {};
-                                }
-                            }
+                            // R: rename (move) the marked entries, or just
+                            // the selected one when nothing is marked
+                            // (Emacs dired-do-rename). The same target
+                            // prompt as C, but Enter moves the entries
+                            // instead of copying them — with another dired
+                            // window open, that moves them into that
+                            // window's directory.
+                            dired_copy_kind = .rename;
+                            openDiredTargetPrompt(gpa, &direds, root, focused, d, &dired_copy_prompt, &dired_copy_query);
                         } else if (key.matches('+', .{})) {
                             // +: create a directory in this dired (Emacs
                             // dired). Enter makes it (nested paths too) and
@@ -2294,9 +2404,10 @@ pub fn main(init: std.process.Init) !void {
                             dired_copy_prompt = true;
                             dired_copy_query.clearRetainingCapacity();
                         } else if (key.matches('D', .{})) {
-                            // D: delete the selected entry (Emacs dired).
-                            const e = d.entries.items[d.selected];
-                            if (!std.mem.eql(u8, e.name, "..")) {
+                            // D: delete the marked entries, or just the
+                            // selected one when nothing is marked (Emacs
+                            // dired-do-delete).
+                            if (diredMarkedCount(d) > 0 or !std.mem.eql(u8, d.entries.items[d.selected].name, "..")) {
                                 confirming_delete = true;
                             }
                         } else if (key.matches('W', .{})) {
