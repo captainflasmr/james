@@ -51,37 +51,42 @@ const Highlight = struct { start: usize, end: usize };
 /// Build the segments needed to draw a line, reverse-videoing the given
 /// column range (if any). `empty_line_marker` shows a single highlighted
 /// space for a blank line that's fully inside a highlighted span, since
-/// there's otherwise nothing to invert. `storage` just gives the segments
-/// somewhere to live; at most 3 are ever needed (before/inside/after).
-fn lineSegments(line: []const u8, hl: ?Highlight, empty_line_marker: bool, storage: *[3]vaxis.Segment) []const vaxis.Segment {
+/// there's otherwise nothing to invert. `current` makes the whole line
+/// bold — the cursor's line stands out even where the block cursor is
+/// hard to see, and the reverse-video highlight merges with it rather
+/// than replacing it. `storage` just gives the segments somewhere to
+/// live; at most 3 are ever needed (before/inside/after).
+fn lineSegments(line: []const u8, hl: ?Highlight, empty_line_marker: bool, storage: *[3]vaxis.Segment, current: bool) []const vaxis.Segment {
+    const base_style: vaxis.Style = if (current) .{ .bold = true } else .{};
+    const hl_style: vaxis.Style = if (current) .{ .reverse = true, .bold = true } else highlight_style;
     const range = hl orelse {
-        storage[0] = .{ .text = line };
+        storage[0] = .{ .text = line, .style = base_style };
         return storage[0..1];
     };
 
     if (line.len == 0) {
         storage[0] = if (empty_line_marker)
-            .{ .text = " ", .style = highlight_style }
+            .{ .text = " ", .style = hl_style }
         else
-            .{ .text = line };
+            .{ .text = line, .style = base_style };
         return storage[0..1];
     }
 
     var n: usize = 0;
     if (range.start > 0) {
-        storage[n] = .{ .text = line[0..range.start] };
+        storage[n] = .{ .text = line[0..range.start], .style = base_style };
         n += 1;
     }
     if (range.end > range.start) {
-        storage[n] = .{ .text = line[range.start..range.end], .style = highlight_style };
+        storage[n] = .{ .text = line[range.start..range.end], .style = hl_style };
         n += 1;
     }
     if (range.end < line.len) {
-        storage[n] = .{ .text = line[range.end..] };
+        storage[n] = .{ .text = line[range.end..], .style = base_style };
         n += 1;
     }
     if (n == 0) {
-        storage[0] = .{ .text = line };
+        storage[0] = .{ .text = line, .style = base_style };
         n = 1;
     }
     return storage[0..n];
@@ -162,7 +167,7 @@ fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, 
     while (i < buf.lines.items.len and row < text_height) : (i += 1) {
         const h = highlightFor(buf, i, searching, match, query_len);
         var seg_storage: [3]vaxis.Segment = undefined;
-        const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage);
+        const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage, is_focused and i == buf.cursor_row);
         _ = win.print(segs, .{ .row_offset = row_base + row });
         row += 1;
     }
@@ -763,11 +768,92 @@ fn openExternal(io: std.Io, gpa: std.mem.Allocator, environ_map: *std.process.En
     };
 }
 
+// --- native Windows clipboard ------------------------------------------
+//
+// The Windows console's OSC 52 support is spotty (the legacy console
+// ignores it entirely, and Windows Terminal gates it behind settings), so
+// on Windows the kill-ring <-> clipboard sync goes through the Win32
+// clipboard API instead of an OSC 52 round trip through the terminal.
+// These externs are only analyzed when the Windows helpers are called, so
+// Unix builds never reference them (or need user32).
+
+const CF_UNICODETEXT: windows.UINT = 13;
+const GMEM_MOVEABLE: windows.UINT = 0x2;
+
+extern "user32" fn OpenClipboard(hWndNewOwner: ?windows.HWND) callconv(.winapi) windows.BOOL;
+extern "user32" fn EmptyClipboard() callconv(.winapi) windows.BOOL;
+extern "user32" fn CloseClipboard() callconv(.winapi) windows.BOOL;
+extern "user32" fn SetClipboardData(uFormat: windows.UINT, hMem: windows.HANDLE) callconv(.winapi) ?windows.HANDLE;
+extern "user32" fn GetClipboardData(uFormat: windows.UINT) callconv(.winapi) ?windows.HANDLE;
+extern "user32" fn IsClipboardFormatAvailable(format: windows.UINT) callconv(.winapi) windows.BOOL;
+extern "kernel32" fn GlobalAlloc(uFlags: windows.UINT, dwBytes: usize) callconv(.winapi) ?windows.HANDLE;
+extern "kernel32" fn GlobalLock(hMem: windows.HANDLE) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalUnlock(hMem: windows.HANDLE) callconv(.winapi) windows.BOOL;
+extern "kernel32" fn GlobalFree(hMem: windows.HANDLE) callconv(.winapi) ?windows.HANDLE;
+extern "kernel32" fn GlobalSize(hMem: windows.HANDLE) callconv(.winapi) usize;
+
+/// Put `text` on the Win32 clipboard as CF_UNICODETEXT. The clipboard
+/// owns the allocated block once SetClipboardData succeeds; on any
+/// failure the block is freed here. Returns whether the clipboard was
+/// written.
+fn winClipboardSet(gpa: std.mem.Allocator, text: []const u8) bool {
+    var utf16: std.ArrayList(u16) = .empty;
+    defer utf16.deinit(gpa);
+    utf16.ensureTotalCapacity(gpa, text.len) catch return false;
+    const n = std.unicode.utf8ToUtf16Le(utf16.unusedCapacitySlice(), text) catch return false;
+    utf16.items.len = n;
+
+    const bytes: usize = (utf16.items.len + 1) * @sizeOf(u16);
+    const h = GlobalAlloc(GMEM_MOVEABLE, bytes) orelse return false;
+    if (GlobalLock(h)) |p| {
+        const dst: [*]u16 = @ptrCast(@alignCast(p));
+        @memcpy(dst[0..utf16.items.len], utf16.items);
+        dst[utf16.items.len] = 0;
+        _ = GlobalUnlock(h);
+    } else {
+        _ = GlobalFree(h);
+        return false;
+    }
+    if (OpenClipboard(null) == .FALSE) {
+        _ = GlobalFree(h);
+        return false;
+    }
+    defer _ = CloseClipboard();
+    _ = EmptyClipboard();
+    if (SetClipboardData(CF_UNICODETEXT, h) == null) {
+        _ = GlobalFree(h);
+        return false;
+    }
+    return true;
+}
+
+/// Read the Win32 clipboard's CF_UNICODETEXT as UTF-8, or null when there
+/// is no text on the clipboard. Caller frees with gpa.
+fn winClipboardGet(gpa: std.mem.Allocator) ?[]u8 {
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT) == .FALSE) return null;
+    if (OpenClipboard(null) == .FALSE) return null;
+    defer _ = CloseClipboard();
+    const h = GetClipboardData(CF_UNICODETEXT) orelse return null;
+    const p = GlobalLock(h) orelse return null;
+    defer _ = GlobalUnlock(h);
+    const len = GlobalSize(h) / @sizeOf(u16);
+    if (len == 0) return null;
+    const src: [*]const u16 = @ptrCast(@alignCast(p));
+    var n: usize = 0;
+    while (n < len and src[n] != 0) : (n += 1) {}
+    return std.unicode.utf16LeToUtf8Alloc(gpa, src[0..n]) catch null;
+}
+
 /// Mirror the kill ring onto the system clipboard (OSC 52), so a kill or
 /// copy in james is available to other applications — even over ssh, since
 /// the terminal forwards the sequence. Terminals without OSC 52 support
-/// simply ignore it.
+/// simply ignore it. On Windows the Win32 clipboard API is used instead,
+/// since the console's OSC 52 support is spotty.
 fn syncClipboard(vx: *vaxis.Vaxis, tty: *vaxis.Tty, gpa: std.mem.Allocator, kill_ring: []const u8) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = winClipboardSet(gpa, kill_ring);
+        return;
+    }
     vx.copyToSystemClipboard(tty.writer(), kill_ring, gpa) catch {};
 }
 
@@ -831,7 +917,11 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
     var i = dired.top;
     while (i < dired.entries.items.len and row < text_height) : (i += 1) {
         const e = dired.entries.items[i];
-        const style: vaxis.Style = .{};
+        // The selected entry's whole row is bold, like the cursor's line
+        // in a file buffer; an isearch match on it merges with the bold.
+        const current = i == dired.selected;
+        const style: vaxis.Style = if (current) .{ .bold = true } else .{};
+        const hl_style: vaxis.Style = if (current) .{ .reverse = true, .bold = true } else highlight_style;
         // Column 0 is the mark column, like Emacs: "*" for a marked
         // entry, a blank otherwise.
         _ = win.printSegment(.{ .text = if (e.marked) "*" else " ", .style = style }, .{ .row_offset = row_base + row });
@@ -853,7 +943,7 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
                 _ = win.printSegment(.{ .text = e.name[0..h.start], .style = style }, .{ .row_offset = row_base + row, .col_offset = col });
                 col += win.gwidth(e.name[0..h.start]);
             }
-            _ = win.printSegment(.{ .text = e.name[h.start..h.end], .style = highlight_style }, .{ .row_offset = row_base + row, .col_offset = col });
+            _ = win.printSegment(.{ .text = e.name[h.start..h.end], .style = hl_style }, .{ .row_offset = row_base + row, .col_offset = col });
             col += win.gwidth(e.name[h.start..h.end]);
             if (h.end < e.name.len) {
                 _ = win.printSegment(.{ .text = e.name[h.end..], .style = style }, .{ .row_offset = row_base + row, .col_offset = col });
@@ -2633,9 +2723,24 @@ pub fn main(init: std.process.Init) !void {
                                 // Nothing has been killed yet: yank the
                                 // system clipboard instead (Emacs consults
                                 // the interprogram clipboard when the kill
-                                // ring is empty). The terminal answers
-                                // asynchronously with a .paste event.
-                                vx.requestSystemClipboard(tty.writer()) catch {};
+                                // ring is empty). On Unix the terminal
+                                // answers an OSC 52 request asynchronously
+                                // with a .paste event; on Windows the
+                                // clipboard is read directly, since the
+                                // console's OSC 52 support is spotty.
+                                if (comptime builtin.os.tag == .windows) {
+                                    if (winClipboardGet(gpa)) |text| {
+                                        defer gpa.free(text);
+                                        buf.insertSlice(gpa, text) catch {};
+                                        // A clipboard paste is yankable
+                                        // too, and heads the kill ring like
+                                        // any fresh kill.
+                                        kill_ring.remember(gpa, text, false) catch {};
+                                        yank_state = null;
+                                    }
+                                } else {
+                                    vx.requestSystemClipboard(tty.writer()) catch {};
+                                }
                             }
                         }
                     } else if (key.matches('y', .{ .alt = true })) {
@@ -2769,9 +2874,9 @@ pub fn main(init: std.process.Init) !void {
         const buf: *Buffer = buffers.items[current];
         const win = vx.window();
         win.clear();
-        // The blinking block cursor is the position indicator: there are no
-        // reverse-video line highlights, so this is what marks the dired
-        // selection, the isearch match, and point.
+        // The blinking block cursor is the position indicator; the line it
+        // sits on is bold too (the dired selection the same), so where you
+        // are is obvious even when the block cursor is hard to see.
         win.setCursorShape(.block_blink);
 
         // The tab bar (only when more than one tab exists) takes the top
@@ -2896,7 +3001,7 @@ pub fn main(init: std.process.Init) !void {
         while (i < buf.lines.items.len and row < text_height) : (i += 1) {
             const h = highlightFor(buf, i, search_view != null, if (search_view) |s| (if (s.failed) null else s.match) else null, if (search_view) |s| s.query.len else 0);
             var seg_storage: [3]vaxis.Segment = undefined;
-            const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage);
+            const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage, i == buf.cursor_row);
             _ = body.print(segs, .{ .row_offset = row });
             row += 1;
         }

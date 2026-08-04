@@ -38,6 +38,11 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // The native Win32 clipboard API (the console's OSC 52 support is
+    // spotty), used only on Windows.
+    if (target.result.os.tag == .windows) {
+        exe.root_module.linkSystemLibrary("user32", .{});
+    }
 
     b.installArtifact(exe);
 
