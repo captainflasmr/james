@@ -127,6 +127,212 @@ fn highlightFor(
     return .{ .hl = .{ .start = s, .end = e }, .empty_marker = empty_marker };
 }
 
+// --- visual (soft-wrapped) lines ----------------------------------------
+//
+// Long logical lines wrap at the pane width, so the cursor can be on any
+// visual line of a wrapped paragraph. These helpers share one wrap math —
+// the same grapheme-accumulation rule vaxis uses to draw — so movement
+// (C-n / C-p / C-e), scrolling, recentering and the cursor position all
+// agree with what is on screen. They live here rather than in Buffer.zig
+// because they need the terminal's display width tables.
+
+/// The byte offsets at which `line`'s visual (wrapped) lines begin, for a
+/// pane `width` columns wide: offsets[0] = 0, each later entry a wrap
+/// point. Returns the segment count.
+fn wrapOffsets(line: []const u8, width: usize, method: vaxis.gwidth.Method, offsets: *[1024]usize) usize {
+    if (line.len == 0 or width == 0) {
+        offsets[0] = 0;
+        return 1;
+    }
+    var n: usize = 1;
+    offsets[0] = 0;
+    var vis_col: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(line);
+    while (it.next()) |g| {
+        const w = vaxis.gwidth.gwidth(g.bytes(line), method);
+        if (w == 0) continue;
+        if (vis_col >= width) {
+            if (n >= 1024) break;
+            offsets[n] = g.start;
+            n += 1;
+            vis_col = 0;
+        }
+        vis_col += w;
+    }
+    return n;
+}
+
+/// How many visual lines `line` occupies at `width`.
+fn wrapCount(line: []const u8, width: usize, method: vaxis.gwidth.Method) usize {
+    var offsets: [1024]usize = undefined;
+    return wrapOffsets(line, width, method, &offsets);
+}
+
+/// The display column of byte offset `col` within the visual segment of
+/// `line` starting at `start`.
+fn visualColAt(line: []const u8, start: usize, col: usize, method: vaxis.gwidth.Method) usize {
+    var v: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(line[start..col]);
+    while (it.next()) |g| {
+        v += vaxis.gwidth.gwidth(g.bytes(line[start..col]), method);
+    }
+    return v;
+}
+
+/// The byte offset in `line`, at or after segment start `start`, where the
+/// display column first reaches `target` — clamped to the segment's end,
+/// so it never crosses a wrap point.
+fn byteAtVisualCol(line: []const u8, start: usize, target: usize, width: usize, method: vaxis.gwidth.Method) usize {
+    var vis_col: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(line[start..]);
+    while (it.next()) |g| {
+        const s = g.bytes(line[start..]);
+        const w = vaxis.gwidth.gwidth(s, method);
+        if (w == 0) continue;
+        if (vis_col >= width) return start + g.start; // the segment's wrap point
+        if (vis_col + w > target) return start + g.start; // reached the target column
+        vis_col += w;
+    }
+    return line.len;
+}
+
+/// The visual segment of the cursor within its logical line, and its
+/// display column within that segment.
+const CursorVisual = struct { seg: usize, col: usize };
+
+fn cursorVisual(buf: *const Buffer, width: usize, method: vaxis.gwidth.Method) CursorVisual {
+    const line = buf.lines.items[buf.cursor_row].items;
+    var offsets: [1024]usize = undefined;
+    const n = wrapOffsets(line, width, method, &offsets);
+    var seg: usize = 0;
+    while (seg + 1 < n and offsets[seg + 1] <= buf.cursor_col) : (seg += 1) {}
+    return .{ .seg = seg, .col = visualColAt(line, offsets[seg], buf.cursor_col, method) };
+}
+
+/// C-n: move down one visual (soft-wrapped) line. Inside a wrapped
+/// paragraph the cursor steps to the next wrap segment, keeping its
+/// display column; past the last segment it moves to the next logical
+/// line's first visual line.
+fn moveDownVisual(buf: *Buffer, width: usize, method: vaxis.gwidth.Method) void {
+    if (width == 0) return buf.moveDown();
+    const line = buf.lines.items[buf.cursor_row].items;
+    var offsets: [1024]usize = undefined;
+    const n = wrapOffsets(line, width, method, &offsets);
+    var seg: usize = 0;
+    while (seg + 1 < n and offsets[seg + 1] <= buf.cursor_col) : (seg += 1) {}
+    const goal = visualColAt(line, offsets[seg], buf.cursor_col, method);
+    if (seg + 1 < n) {
+        buf.cursor_col = byteAtVisualCol(line, offsets[seg + 1], goal, width, method);
+    } else if (buf.cursor_row + 1 < buf.lines.items.len) {
+        buf.cursor_row += 1;
+        const nl = buf.lines.items[buf.cursor_row].items;
+        buf.cursor_col = byteAtVisualCol(nl, 0, goal, width, method);
+    }
+}
+
+/// C-p: move up one visual line, keeping the display column.
+fn moveUpVisual(buf: *Buffer, width: usize, method: vaxis.gwidth.Method) void {
+    if (width == 0) return buf.moveUp();
+    const line = buf.lines.items[buf.cursor_row].items;
+    var offsets: [1024]usize = undefined;
+    const n = wrapOffsets(line, width, method, &offsets);
+    var seg: usize = 0;
+    while (seg + 1 < n and offsets[seg + 1] <= buf.cursor_col) : (seg += 1) {}
+    const goal = visualColAt(line, offsets[seg], buf.cursor_col, method);
+    if (seg > 0) {
+        buf.cursor_col = byteAtVisualCol(line, offsets[seg - 1], goal, width, method);
+    } else if (buf.cursor_row > 0) {
+        buf.cursor_row -= 1;
+        const nl = buf.lines.items[buf.cursor_row].items;
+        var no: [1024]usize = undefined;
+        const nn = wrapOffsets(nl, width, method, &no);
+        buf.cursor_col = byteAtVisualCol(nl, no[nn - 1], goal, width, method);
+    }
+}
+
+/// C-e: move to the end of the current visual line. On a wrapped segment
+/// that means its last character — the wrap point itself displays at the
+/// start of the next visual line, so a cursor parked there would appear
+/// to have moved on. On the last visual line it is the true end of the
+/// logical line.
+fn moveEndVisual(buf: *Buffer, width: usize, method: vaxis.gwidth.Method) void {
+    if (width == 0) return buf.moveLineEnd();
+    const line = buf.lines.items[buf.cursor_row].items;
+    var offsets: [1024]usize = undefined;
+    const n = wrapOffsets(line, width, method, &offsets);
+    var seg: usize = 0;
+    while (seg + 1 < n and offsets[seg + 1] <= buf.cursor_col) : (seg += 1) {}
+    buf.cursor_col = if (seg + 1 < n)
+        lastGraphemeStart(line, offsets[seg], offsets[seg + 1])
+    else
+        line.len;
+}
+
+/// C-a: move to the start of the current visual line — the segment's
+/// wrap point, or the true start of the logical line on its first visual
+/// line.
+fn moveStartVisual(buf: *Buffer, width: usize, method: vaxis.gwidth.Method) void {
+    if (width == 0) return buf.moveLineStart();
+    const line = buf.lines.items[buf.cursor_row].items;
+    var offsets: [1024]usize = undefined;
+    const n = wrapOffsets(line, width, method, &offsets);
+    var seg: usize = 0;
+    while (seg + 1 < n and offsets[seg + 1] <= buf.cursor_col) : (seg += 1) {}
+    buf.cursor_col = offsets[seg];
+}
+
+/// The byte offset of the last grapheme within `line[start..end]`, or
+/// `end` itself when the range is empty.
+fn lastGraphemeStart(line: []const u8, start: usize, end: usize) usize {
+    var last = end;
+    var it = vaxis.unicode.graphemeIterator(line[start..end]);
+    while (it.next()) |g| {
+        last = start + g.start;
+    }
+    return last;
+}
+
+/// The cursor's visual row when the window's first logical line is `top`:
+/// the wrapped heights of the lines above the cursor's, plus the cursor's
+/// own segment.
+fn visualRowOfCursor(buf: *const Buffer, top: usize, width: usize, method: vaxis.gwidth.Method) usize {
+    var v: usize = 0;
+    var i = top;
+    while (i < buf.cursor_row) : (i += 1) {
+        v += wrapCount(buf.lines.items[i].items, width, method);
+    }
+    return v + cursorVisual(buf, width, method).seg;
+}
+
+/// Keep the cursor's visual row within [0, height): raise top_line while
+/// the cursor's wrapped line falls below the window's bottom.
+fn scrollToCursorVisual(buf: *Buffer, height: usize, width: usize, method: vaxis.gwidth.Method) void {
+    if (height == 0) return;
+    if (buf.cursor_row < buf.top_line) {
+        buf.top_line = buf.cursor_row;
+        return;
+    }
+    while (visualRowOfCursor(buf, buf.top_line, width, method) >= height and buf.top_line < buf.cursor_row) {
+        buf.top_line += 1;
+    }
+}
+
+/// C-l: recenter the window on the cursor's visual line, cycling middle →
+/// top → bottom like Emacs recenter-top-bottom.
+fn recenterVisual(buf: *Buffer, height: usize, width: usize, method: vaxis.gwidth.Method, cycling: bool) void {
+    if (height == 0) return;
+    const pos: u8 = if (cycling) (buf.recenter_pos + 1) % 3 else 0;
+    buf.recenter_pos = pos;
+    var tl = buf.cursor_row;
+    if (pos != 1) {
+        const target: usize = if (pos == 0) height / 2 else height - 1;
+        while (tl > 0 and visualRowOfCursor(buf, tl, width, method) < target) {
+            tl -= 1;
+        }
+    }
+    buf.top_line = tl;
+}
+
 /// Switch to the buffer visiting `path` if one is already open, otherwise
 /// load it fresh and open it as a new buffer. Returns its index.
 /// The isearch state, for rendering a search in whatever pane is being
@@ -156,7 +362,8 @@ const DiredPromptView = struct {
 /// the whole screen.
 fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, search: ?IsearchView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
-    buf.scrollToCursor(text_height);
+    const method = win.screen.width_method;
+    scrollToCursorVisual(buf, text_height, win.width, method);
 
     const searching = search != null;
     const match: ?Buffer.Pos = if (search) |s| (if (s.failed) null else s.match) else null;
@@ -168,8 +375,12 @@ fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, 
         const h = highlightFor(buf, i, searching, match, query_len);
         var seg_storage: [3]vaxis.Segment = undefined;
         const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage, is_focused and i == buf.cursor_row);
+        // Advance by the line's wrapped height, so a soft-wrapped line
+        // takes all of its visual rows instead of the next line
+        // clobbering its continuation.
+        const wraps = wrapCount(buf.lines.items[i].items, win.width, method);
         _ = win.print(segs, .{ .row_offset = row_base + row });
-        row += 1;
+        row += @intCast(wraps);
     }
 
     const modeline = if (search) |s| blk: {
@@ -202,7 +413,10 @@ fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, 
     _ = win.printSegment(.{ .text = modeline_buf[0 .. modeline.len + fill_n], .style = style }, .{ .row_offset = row_base + (height -| 1) });
 
     if (is_focused) {
-        win.showCursor(@intCast(buf.cursor_col), @intCast(row_base + buf.cursor_row - buf.top_line));
+        // The cursor sits on the cursor's visual line, at its display
+        // column within that wrapped segment.
+        const cv = cursorVisual(buf, win.width, method);
+        win.showCursor(@intCast(cv.col), @intCast(visualRowOfCursor(buf, buf.top_line, win.width, method)));
     }
 }
 
@@ -1028,11 +1242,16 @@ fn renderTree(
     dired_prompt: ?DiredPromptView,
     status: ?[]const u8,
     focused_h: *usize,
+    focused_w: *usize,
 ) void {
     if (pane.isLeaf()) {
-        // The focused pane's text area height, for C-l (recenter-top-
-        // bottom) and anything else that needs to know its window.
-        if (pane == focused) focused_h.* = if (height > 1) height - 1 else height;
+        // The focused pane's text area height and width, for C-l
+        // (recenter-top-bottom), the visual-line navigation and anything
+        // else that needs to know its window.
+        if (pane == focused) {
+            focused_h.* = if (height > 1) height - 1 else height;
+            focused_w.* = width;
+        }
         // Each leaf gets its own scratch slot, in render order — the
         // buffer must not be shared between panes, since vaxis stores
         // grapheme slices into it until the end of the frame.
@@ -1060,8 +1279,8 @@ fn renderTree(
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             // The one blank column between the panes gets the separator.
             drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
-            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h);
-            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h);
+            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h, focused_w);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
@@ -1069,8 +1288,8 @@ fn renderTree(
             // a blank row between the panes for the separator (mirroring
             // the one blank column of a vertical split).
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
-            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h);
-            renderTree(win, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h);
+            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h, focused_w);
         },
     }
 }
@@ -1728,6 +1947,9 @@ pub fn main(init: std.process.Init) !void {
     // Height of the focused pane's text area, tracked during rendering so
     // C-l (recenter-top-bottom) can center within the right window.
     var focused_text_height: usize = 0;
+    // Width of the focused pane's text area, tracked alongside the height
+    // for the visual-line navigation (wrapping happens at this width).
+    var focused_text_width: usize = 0;
     // True while consecutive C-l presses are cycling recenter positions
     // (center → top → bottom); any other key resets the next C-l to center.
     var last_was_recenter = false;
@@ -2710,35 +2932,51 @@ pub fn main(init: std.process.Init) !void {
                         kill_active = true;
                     } else if (key.matches('y', .{ .ctrl = true })) {
                         if (editing) {
-                            if (kill_ring.current()) |text| {
-                                const start: Buffer.Pos = .{ .row = buf.cursor_row, .col = buf.cursor_col };
-                                try buf.yank(gpa, text);
-                                yank_state = .{
-                                    .buf_idx = current,
-                                    .entry = kill_ring.head,
-                                    .start = start,
-                                    .end = .{ .row = buf.cursor_row, .col = buf.cursor_col },
-                                };
-                            } else {
-                                // Nothing has been killed yet: yank the
-                                // system clipboard instead (Emacs consults
-                                // the interprogram clipboard when the kill
-                                // ring is empty). On Unix the terminal
-                                // answers an OSC 52 request asynchronously
-                                // with a .paste event; on Windows the
-                                // clipboard is read directly, since the
-                                // console's OSC 52 support is spotty.
+                            yank_clip: {
+                                // Windows: consult the real clipboard on
+                                // every C-y, not just when the kill ring is
+                                // empty. An external copy made since the
+                                // last yank must win over the (now-stale)
+                                // kill-ring head — Emacs consults the
+                                // interprogram clipboard the same way. Only
+                                // content that merely repeats the current
+                                // kill-ring head falls through to a normal
+                                // yank; with no clipboard at all the empty
+                                // kill ring is handled below.
                                 if (comptime builtin.os.tag == .windows) {
-                                    if (winClipboardGet(gpa)) |text| {
-                                        defer gpa.free(text);
-                                        buf.insertSlice(gpa, text) catch {};
-                                        // A clipboard paste is yankable
-                                        // too, and heads the kill ring like
-                                        // any fresh kill.
-                                        kill_ring.remember(gpa, text, false) catch {};
-                                        yank_state = null;
+                                    if (winClipboardGet(gpa)) |clip| {
+                                        defer gpa.free(clip);
+                                        const repeats_kill_ring = if (kill_ring.current()) |k|
+                                            std.mem.eql(u8, k, clip)
+                                        else
+                                            false;
+                                        if (!repeats_kill_ring) {
+                                            buf.insertSlice(gpa, clip) catch {};
+                                            // A clipboard paste is yankable
+                                            // too, and heads the kill ring
+                                            // like any fresh kill.
+                                            kill_ring.remember(gpa, clip, false) catch {};
+                                            yank_state = null;
+                                            break :yank_clip;
+                                        }
                                     }
-                                } else {
+                                }
+                                if (kill_ring.current()) |text| {
+                                    const start: Buffer.Pos = .{ .row = buf.cursor_row, .col = buf.cursor_col };
+                                    try buf.yank(gpa, text);
+                                    yank_state = .{
+                                        .buf_idx = current,
+                                        .entry = kill_ring.head,
+                                        .start = start,
+                                        .end = .{ .row = buf.cursor_row, .col = buf.cursor_col },
+                                    };
+                                } else if (comptime builtin.os.tag != .windows) {
+                                    // Nothing has been killed yet: yank the
+                                    // system clipboard instead (Emacs
+                                    // consults the interprogram clipboard
+                                    // when the kill ring is empty). The
+                                    // terminal answers the OSC 52 request
+                                    // asynchronously with a .paste event.
                                     vx.requestSystemClipboard(tty.writer()) catch {};
                                 }
                             }
@@ -2766,17 +3004,25 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('b', .{ .ctrl = true }) or key.matches(vaxis.Key.left, .{})) {
                         buf.moveLeft();
                     } else if (key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
-                        buf.moveDown();
+                        // C-n: down one visual (soft-wrapped) line, so a
+                        // wrapped paragraph is stepped through line by
+                        // line (Emacs visual-line-mode).
+                        moveDownVisual(buf, focused_text_width, vx.screen.width_method);
                     } else if (key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
-                        buf.moveUp();
+                        moveUpVisual(buf, focused_text_width, vx.screen.width_method);
                     } else if (key.matches('a', .{ .ctrl = true })) {
-                        buf.moveLineStart();
+                        // C-a: the start of the visual line (the segment's
+                        // wrap point on a soft-wrapped line).
+                        moveStartVisual(buf, focused_text_width, vx.screen.width_method);
                     } else if (key.matches('e', .{ .ctrl = true })) {
-                        buf.moveLineEnd();
+                        // C-e: the end of the visual line — the wrap
+                        // point, not the logical line's end.
+                        moveEndVisual(buf, focused_text_width, vx.screen.width_method);
                     } else if (key.matches('l', .{ .ctrl = true })) {
-                        // C-l: recenter the window on the cursor line
-                        // (recenter-top-bottom), within the focused pane.
-                        buf.recenterTopBottom(focused_text_height, last_was_recenter);
+                        // C-l: recenter the window on the cursor's visual
+                        // line (recenter-top-bottom), within the focused
+                        // pane.
+                        recenterVisual(buf, focused_text_height, focused_text_width, vx.screen.width_method, last_was_recenter);
                         last_was_recenter = true;
                     } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.delete, .{})) {
                         try buf.deleteForward(gpa);
@@ -2889,8 +3135,10 @@ pub fn main(init: std.process.Init) !void {
 
         const text_height: usize = if (body.height > 1) body.height - 1 else body.height;
         // The focused pane's text area (the whole window when unsplit),
-        // remembered for C-l so it can recenter within the right window.
+        // remembered for C-l and the visual-line navigation so they
+        // recenter and wrap within the right window.
         focused_text_height = text_height;
+        focused_text_width = body.width;
         // Dired and isearch are not modal: they render inside whichever
         // pane they apply to, leaving the window layout untouched. Only the
         // prompt-style modes take over the whole screen.
@@ -2911,7 +3159,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(body, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, search_view, dired_prompt_view, status_msg, &focused_text_height);
+            renderTree(body, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, search_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
             try vx.render(tty.writer());
             continue;
         }
@@ -2995,15 +3243,17 @@ pub fn main(init: std.process.Init) !void {
         // lines mirror the listing, so the prompt modeline works exactly as
         // it does in a file buffer. isearch is handled natively above.
 
-        buf.scrollToCursor(text_height);
+        scrollToCursorVisual(buf, text_height, body.width, vx.screen.width_method);
         var row: u16 = 0;
         var i = buf.top_line;
         while (i < buf.lines.items.len and row < text_height) : (i += 1) {
             const h = highlightFor(buf, i, search_view != null, if (search_view) |s| (if (s.failed) null else s.match) else null, if (search_view) |s| s.query.len else 0);
             var seg_storage: [3]vaxis.Segment = undefined;
             const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage, i == buf.cursor_row);
+            // Advance by the line's wrapped height (see renderPane).
+            const wraps = wrapCount(buf.lines.items[i].items, body.width, vx.screen.width_method);
             _ = body.print(segs, .{ .row_offset = row });
-            row += 1;
+            row += @intCast(wraps);
         }
 
         // Fixed scratch space for the modeline text: it's redrawn every
@@ -3054,9 +3304,10 @@ pub fn main(init: std.process.Init) !void {
         if (fill_n > 0) @memset(modeline_buf[modeline.len .. modeline.len + fill_n], ' ');
         _ = body.printSegment(.{ .text = modeline_buf[0 .. modeline.len + fill_n], .style = style }, .{ .row_offset = body.height -| 1 });
 
+        const cv = cursorVisual(buf, body.width, vx.screen.width_method);
         body.showCursor(
-            @intCast(buf.cursor_col),
-            @intCast(buf.cursor_row - buf.top_line),
+            @intCast(cv.col),
+            @intCast(visualRowOfCursor(buf, buf.top_line, body.width, vx.screen.width_method)),
         );
 
         try vx.render(tty.writer());
