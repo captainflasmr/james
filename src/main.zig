@@ -346,7 +346,7 @@ const IsearchView = struct {
     backward: bool,
 };
 
-const DiredPromptKind = enum { copy, rename, delete, create_dir, create_file };
+const DiredPromptKind = enum { copy, rename, delete, create_dir, create_file, open };
 
 /// An in-pane dired prompt (copy / rename target, delete confirmation):
 /// the listing stays in its window and the prompt text appears in that
@@ -354,6 +354,9 @@ const DiredPromptKind = enum { copy, rename, delete, create_dir, create_file };
 const DiredPromptView = struct {
     kind: DiredPromptKind,
     query: []const u8 = &.{},
+    /// Extra detail for the prompt, e.g. the app the external-open
+    /// confirmation would run.
+    detail: []const u8 = &.{},
 };
 
 /// Render one buffer's text plus its own compact modeline into `win`, which
@@ -982,6 +985,46 @@ fn openExternal(io: std.Io, gpa: std.mem.Allocator, environ_map: *std.process.En
     };
 }
 
+/// Run `argv` and capture its stdout, trailing whitespace trimmed.
+/// Returns null if the command can't spawn or writes nothing.
+fn runCapture(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
+    var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .pipe, .stderr = .ignore }) catch return null;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    if (child.stdout) |f| {
+        defer f.close(io);
+        var buf: [256]u8 = undefined;
+        var r = f.reader(io, &buf);
+        var chunk: [256]u8 = undefined;
+        while (true) {
+            const n = r.interface.readSliceShort(&chunk) catch break;
+            if (n == 0) break;
+            out.appendSlice(gpa, chunk[0..n]) catch break;
+        }
+    }
+    _ = child.wait(io) catch null;
+    const trimmed = std.mem.trimEnd(u8, out.items, " \t\r\n");
+    return if (trimmed.len > 0) gpa.dupe(u8, trimmed) catch null else null;
+}
+
+/// The application the desktop would use to open `path` externally: on
+/// Linux the MIME default handler from xdg-mime (firefox.desktop →
+/// firefox), otherwise the generic opener that `openExternal` would run
+/// (open on macOS, start on Windows). Null when the handler can't be
+/// looked up.
+fn defaultOpenApp(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+    if (comptime builtin.os.tag == .linux) {
+        const ftype = runCapture(io, gpa, &.{ "xdg-mime", "query", "filetype", path }) orelse return null;
+        defer gpa.free(ftype);
+        const raw = runCapture(io, gpa, &.{ "xdg-mime", "query", "default", ftype }) orelse return null;
+        defer gpa.free(raw);
+        const app = std.fs.path.stem(raw);
+        return if (app.len > 0) gpa.dupe(u8, app) catch null else null;
+    }
+    const name: []const u8 = if (comptime builtin.os.tag == .macos) "open" else "start";
+    return gpa.dupe(u8, name) catch null;
+}
+
 // --- native Windows clipboard ------------------------------------------
 //
 // The Windows console's OSC 52 support is spotty (the legacy console
@@ -1197,6 +1240,7 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
                 std.fmt.bufPrint(modeline_buf, "Delete {d} entries? (y / n / C-g cancels)", .{diredMarkedCount(dired)}) catch "Delete?"
             else
                 std.fmt.bufPrint(modeline_buf, "{s}{s}? (y / n / C-g cancels)", .{ if (is_dir) "Recursively delete " else "Delete ", name }) catch "Delete?",
+            .open => std.fmt.bufPrint(modeline_buf, "Open {s} with {s}? (y / n / C-g cancels)", .{ name, p.detail }) catch "Open?",
         };
     } else if (status) |m|
         std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch "Save failed"
@@ -2065,6 +2109,17 @@ pub fn main(init: std.process.Init) !void {
     defer dired_copy_query.deinit(gpa);
     var confirming_delete = false;
 
+    // W in dired: confirm opening the selected entry externally. The
+    // joined path (and the looked-up handler name, if one was found) is
+    // held here until y / n settles the prompt.
+    var confirming_open = false;
+    var open_confirm_path: ?[]u8 = null;
+    var open_confirm_app: ?[]u8 = null;
+    defer {
+        if (open_confirm_path) |p| gpa.free(p);
+        if (open_confirm_app) |a| gpa.free(a);
+    }
+
     // Winner-mode style window history: layouts are recorded before each
     // change; C-c j / C-c k step back / forward.
     var window_undo: std.ArrayList(WindowSnapshot) = .empty;
@@ -2351,6 +2406,23 @@ pub fn main(init: std.process.Init) !void {
                         }
                     } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                         confirming_delete = false;
+                    }
+                    // Any other key is ignored while confirming.
+                } else if (confirming_open) {
+                    if (key.matches('y', .{}) or key.matches('Y', .{})) {
+                        const path = open_confirm_path orelse return;
+                        confirming_open = false;
+                        open_confirm_path = null;
+                        defer gpa.free(path);
+                        if (open_confirm_app) |a| gpa.free(a);
+                        open_confirm_app = null;
+                        if (!openExternal(io, gpa, init.environ_map, path)) status_msg = "Failed to open externally";
+                    } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        confirming_open = false;
+                        if (open_confirm_path) |p| gpa.free(p);
+                        open_confirm_path = null;
+                        if (open_confirm_app) |a| gpa.free(a);
+                        open_confirm_app = null;
                     }
                     // Any other key is ignored while confirming.
                 } else if (bookmark_list_active) {
@@ -2856,12 +2928,15 @@ pub fn main(init: std.process.Init) !void {
                             // on macOS, cmd's start on Windows — so a file
                             // opens in its default application and a
                             // directory in the file manager. ".." is skipped
-                            // like C and D.
+                            // like C and D. The handler the desktop would
+                            // use is looked up first and shown in the
+                            // modeline; y / n confirms before anything runs.
                             const e = d.entries.items[d.selected];
                             if (!std.mem.eql(u8, e.name, "..")) {
                                 if (std.fs.path.join(gpa, &.{ d.path.items, e.name }) catch null) |full| {
-                                    defer gpa.free(full);
-                                    if (!openExternal(io, gpa, init.environ_map, full)) status_msg = "Failed to open externally";
+                                    open_confirm_path = full;
+                                    open_confirm_app = defaultOpenApp(io, gpa, full);
+                                    confirming_open = true;
                                 }
                             }
                         } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('f', .{})) {
@@ -3155,6 +3230,8 @@ pub fn main(init: std.process.Init) !void {
             .{ .kind = dired_copy_kind, .query = dired_copy_query.items }
         else if (confirming_delete)
             .{ .kind = .delete }
+        else if (confirming_open)
+            .{ .kind = .open, .detail = open_confirm_app orelse "the system default" }
         else
             null;
 
