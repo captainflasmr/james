@@ -7,6 +7,10 @@ const Dired = @This();
 /// actual working directory) or absolute — both work fine as arguments to
 /// Dir.cwd().openDir, which is all this ever calls.
 path: std.ArrayList(u8) = .empty,
+/// The full directory path, for display (the dired header line and the
+/// modeline): `path` made absolute, with "." and ".." components
+/// resolved. Filesystem operations keep using the raw `path`.
+display_path: std.ArrayList(u8) = .empty,
 entries: std.ArrayList(Entry) = .empty,
 selected: usize = 0,
 top: usize = 0,
@@ -51,6 +55,7 @@ pub fn deinit(self: *Dired, gpa: std.mem.Allocator) void {
     self.freeEntries(gpa);
     self.entries.deinit(gpa);
     self.path.deinit(gpa);
+    self.display_path.deinit(gpa);
 }
 
 fn freeEntries(self: *Dired, gpa: std.mem.Allocator) void {
@@ -90,7 +95,27 @@ fn parentOf(gpa: std.mem.Allocator, current: []const u8) !?[]u8 {
 pub fn open(self: *Dired, gpa: std.mem.Allocator, io: std.Io, new_path: []const u8) !void {
     self.path.clearRetainingCapacity();
     try self.path.appendSlice(gpa, new_path);
+    // The absolute display path (best effort: keep the raw path if the
+    // working directory can't be read).
+    self.display_path.clearRetainingCapacity();
+    const abs = absPathOf(gpa, io, new_path) catch null;
+    if (abs) |a| {
+        defer gpa.free(a);
+        self.display_path.appendSlice(gpa, a) catch {};
+    }
+    if (self.display_path.items.len == 0) self.display_path.appendSlice(gpa, new_path) catch {};
     try self.reload(gpa, io);
+}
+
+/// `path` made absolute against the process's working directory, with "."
+/// and ".." components normalized out lexically (no filesystem access, so
+/// symlinks are not resolved) — the dired twin of Emacs's
+/// expand-file-name, for display only. Caller must free.
+fn absPathOf(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) return std.fs.path.resolve(gpa, &.{path});
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    return std.fs.path.resolve(gpa, &.{ cwd, path });
 }
 
 /// Re-read the directory listing, keeping the selection where it was.

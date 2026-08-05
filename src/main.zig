@@ -1160,7 +1160,11 @@ fn armSizeWatchdog(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event)) void {
 /// in the modeline; the match is the selected entry.
 fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, search: ?IsearchView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
-    dired.scrollToSelected(text_height);
+    // The full directory path heads the listing (the classic dired header
+    // line), taking one row unless the pane is too small to spare it.
+    const show_header = text_height >= 2;
+    const entry_rows = if (show_header) text_height - 1 else text_height;
+    dired.scrollToSelected(entry_rows);
     // Entries print their own heap-allocated metadata prefix and name
     // (plus a "/" segment for directories), never a stack-local copy —
     // vaxis stores grapheme slices, so a scratch buffer would be clobbered
@@ -1171,6 +1175,10 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
     const query_len: usize = if (search) |s| s.query.len else 0;
 
     var row: u16 = 0;
+    if (show_header) {
+        _ = win.printSegment(.{ .text = dired.display_path.items }, .{ .row_offset = row_base });
+        row = 1;
+    }
     var i = dired.top;
     while (i < dired.entries.items.len and row < text_height) : (i += 1) {
         const e = dired.entries.items[i];
@@ -1244,7 +1252,7 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
         };
     } else if (status) |m|
         std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch "Save failed"
-    else std.fmt.bufPrint(modeline_buf, "Dired: {s}", .{dired.path.items}) catch "Dired";
+    else std.fmt.bufPrint(modeline_buf, "Dired: {s}", .{dired.display_path.items}) catch "Dired";
     const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true };
     const text_w = win.gwidth(modeline);
     const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
@@ -1260,7 +1268,7 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
             1 + win.gwidth(dired.entries.items[sel].meta)
         else
             0;
-        win.showCursor(name_col, @intCast(sel - dired.top));
+        win.showCursor(name_col, @intCast(sel - dired.top + @as(usize, @intFromBool(show_header))));
     }
 }
 
@@ -2840,7 +2848,10 @@ pub fn main(init: std.process.Init) !void {
                             }
                         } else if (key.matches('l', .{ .ctrl = true })) {
                             // C-l: recenter the listing on the selection.
-                            d.recenterTopBottom(focused_text_height, last_was_recenter);
+                            // The header line (when shown) takes one of the
+                            // pane's rows, so the viewport matches
+                            // renderDiredPane's entry_rows.
+                            d.recenterTopBottom(if (focused_text_height >= 2) focused_text_height - 1 else focused_text_height, last_was_recenter);
                             last_was_recenter = true;
                         } else if (key.matches('s', .{})) {
                             // s: dired-sort-toggle-or-edit — toggle between

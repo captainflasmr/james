@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.15.0 — <2026-08-05>
+
+Dired shows the full directory path.
+
+- A dired listing now starts with the directory's full path on its first line (the classic dired header line), and the modeline shows the same absolute path (=Dired: <path>=) instead of the raw browse path. The path is made absolute against the working directory, with =.= and =..= components resolved lexically (the display twin of Emacs's =expand-file-name= — no filesystem access, so symlinks are not resolved), so a dired opened as =C-x d= on =.= reads as the real directory. The header row is skipped when a pane is too small to spare one, and scrolling (=scrollToSelected=, the =C-l= recenter) counts the header row, so the selection never hides under it.
+
 ** 0.14.0 — <2026-08-03>
 
 The my-jump keymap: =M-l= is now a prefix key, like the author's Emacs setup.
