@@ -359,11 +359,18 @@ const DiredPromptView = struct {
     detail: []const u8 = &.{},
 };
 
+/// An in-pane find-file prompt (C-x C-f): the current buffer stays in its
+/// window and the path prompt appears in that pane's modeline, so the
+/// layout never changes — the same shape as the isearch and dired prompts.
+const FindFileView = struct {
+    query: []const u8,
+};
+
 /// Render one buffer's text plus its own compact modeline into `win`, which
 /// may be the whole screen or one pane of a split. An active isearch shows
 /// its match highlight and prompt in this pane, exactly as if the pane were
 /// the whole screen.
-fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, search: ?IsearchView, status: ?[]const u8) void {
+fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, search: ?IsearchView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     const method = win.screen.width_method;
     scrollToCursorVisual(buf, text_height, win.width, method);
@@ -386,7 +393,9 @@ fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, 
         row += @intCast(wraps);
     }
 
-    const modeline = if (search) |s| blk: {
+    const modeline = if (find_file) |f|
+        std.fmt.bufPrint(modeline_buf, "Find file: {s}", .{f.query}) catch "Find file: ..."
+    else if (search) |s| blk: {
         const label = if (s.failed)
             (if (s.backward) "Failing I-search backward" else "Failing I-search")
         else
@@ -1158,7 +1167,7 @@ fn armSizeWatchdog(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event)) void {
 /// taking over the whole screen; when a file is chosen it's simply
 /// replaced by the newly opened buffer. An active isearch shows its prompt
 /// in the modeline; the match is the selected entry.
-fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, search: ?IsearchView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
+fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, search: ?IsearchView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     // The full directory path heads the listing (the classic dired header
     // line), taking one row unless the pane is too small to spare it.
@@ -1222,7 +1231,9 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
         row += 1;
     }
 
-    const modeline = if (search) |s| blk: {
+    const modeline = if (find_file) |f|
+        std.fmt.bufPrint(modeline_buf, "Find file: {s}", .{f.query}) catch "Find file: ..."
+    else if (search) |s| blk: {
         const label = if (s.failed)
             (if (s.backward) "Failing I-search backward" else "Failing I-search")
         else
@@ -1290,6 +1301,7 @@ fn renderTree(
     buffers: []*Buffer,
     direds: []?Dired,
     focused: *Pane,
+    find_file: ?FindFileView,
     search: ?IsearchView,
     dired_prompt: ?DiredPromptView,
     status: ?[]const u8,
@@ -1314,12 +1326,13 @@ fn renderTree(
         // past a shorter line in a neighbouring buffer.
         const pane_search: ?IsearchView = if (pane == focused) search else null;
         const pane_prompt: ?DiredPromptView = if (pane == focused) dired_prompt else null;
+        const pane_find_file: ?FindFileView = if (pane == focused) find_file else null;
         const pane_status: ?[]const u8 = if (pane == focused) status else null;
         const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
         if (direds[pane.buf_idx]) |*d| {
-            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_search, pane_prompt, pane_status);
+            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_search, pane_prompt, pane_status);
         } else {
-            renderPane(child, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_search, pane_status);
+            renderPane(child, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_search, pane_status);
         }
         return;
     }
@@ -1331,8 +1344,8 @@ fn renderTree(
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             // The one blank column between the panes gets the separator.
             drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
-            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
@@ -1340,8 +1353,8 @@ fn renderTree(
             // a blank row between the panes for the separator (mirroring
             // the one blank column of a vertical split).
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
-            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
         },
     }
 }
@@ -2567,10 +2580,26 @@ pub fn main(init: std.process.Init) !void {
                         buffer_list_selected = current;
                         buffer_list_top = 0;
                     } else if (key.matches('f', .{ .ctrl = true })) {
-                        // C-x C-f: open-or-switch by typing a path, the old
-                        // C-x b prompt.
+                        // C-x C-f: open-or-switch by typing a path, prefilled
+                        // with the current buffer's directory (a dired's own
+                        // while browsing), like Emacs default-directory —
+                        // always absolute and ending in a separator, so
+                        // typing a bare file name opens it right there. The
+                        // prefill is ordinary prompt text, so Backspace edits
+                        // the directory like any other part of the path.
                         switching_buffer = true;
                         switch_query.clearRetainingCapacity();
+                        const start = if (direds.items[current]) |d|
+                            try gpa.dupe(u8, d.path.items)
+                        else
+                            try Dired.startingDir(gpa, buf.filename orelse ".");
+                        defer gpa.free(start);
+                        const abs = Dired.absPathOf(gpa, io, start) catch try gpa.dupe(u8, start);
+                        defer gpa.free(abs);
+                        try switch_query.appendSlice(gpa, abs);
+                        if (switch_query.items.len == 0 or switch_query.items[switch_query.items.len - 1] != std.fs.path.sep) {
+                            try switch_query.append(gpa, std.fs.path.sep);
+                        }
                     } else if (key.matches('r', .{})) {
                         pending_ctrl_x_r = true;
                     } else if (key.matches('d', .{}) or key.matches('m', .{})) {
@@ -3230,10 +3259,15 @@ pub fn main(init: std.process.Init) !void {
         // Dired and isearch are not modal: they render inside whichever
         // pane they apply to, leaving the window layout untouched. Only the
         // prompt-style modes take over the whole screen.
-        const is_modal = confirming_quit or switching_buffer or bookmark_prompt != null or bookmark_list_active or buffer_list_active;
+        const is_modal = confirming_quit or bookmark_prompt != null or bookmark_list_active or buffer_list_active;
 
         const search_view: ?IsearchView = if (isearch_active)
             .{ .failed = isearch_failed, .match = isearch_match, .query = isearch_query.items, .backward = isearch_dir == .backward }
+        else
+            null;
+
+        const find_file_view: ?FindFileView = if (switching_buffer)
+            .{ .query = switch_query.items }
         else
             null;
 
@@ -3249,7 +3283,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(body, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, search_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+            renderTree(body, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, search_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
             try vx.render(tty.writer());
             continue;
         }
@@ -3323,7 +3357,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal) {
             if (direds.items[current]) |*d| {
                 var modeline_buf: [2048]u8 = undefined;
-                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, search_view, dired_prompt_view, status_msg);
+                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, search_view, dired_prompt_view, status_msg);
                 try vx.render(tty.writer());
                 continue;
             }
@@ -3357,7 +3391,7 @@ pub fn main(init: std.process.Init) !void {
         else if (status_msg) |m|
             std.fmt.bufPrint(&modeline_buf, "{s}", .{m}) catch "Save failed"
         else if (switching_buffer)
-            std.fmt.bufPrint(&modeline_buf, "Switch to buffer (open if new): {s}", .{switch_query.items}) catch "Switch to buffer: ..."
+            std.fmt.bufPrint(&modeline_buf, "Find file: {s}", .{switch_query.items}) catch "Find file: ..."
         else if (bookmark_prompt) |mode| blk: {
             break :blk if (mode == .set)
                 (std.fmt.bufPrint(&modeline_buf, "Bookmark name (C-g cancels): {s}", .{bookmark_query.items}) catch "Bookmark name")

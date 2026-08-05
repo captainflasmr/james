@@ -111,7 +111,7 @@ pub fn open(self: *Dired, gpa: std.mem.Allocator, io: std.Io, new_path: []const 
 /// and ".." components normalized out lexically (no filesystem access, so
 /// symlinks are not resolved) — the dired twin of Emacs's
 /// expand-file-name, for display only. Caller must free.
-fn absPathOf(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+pub fn absPathOf(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(path)) return std.fs.path.resolve(gpa, &.{path});
     const cwd = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd);
