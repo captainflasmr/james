@@ -3043,9 +3043,21 @@ pub fn main(init: std.process.Init) !void {
                             status_msg = "Save failed";
                         };
                     } else if (key.matches('w', .{ .alt = true })) {
-                        try buf.copyRegion(gpa, &kill_ring, was_kill);
+                        // M-w: copy the region (point to mark), or — with no
+                        // mark set — the current line, like Emacs's M-w on a
+                        // line with no active region. Either way the text heads
+                        // the kill ring (so C-y gets it back) and mirrors onto
+                        // the system clipboard; a following kill appends, like
+                        // C-k after M-w on a region. Direds are read-only, so
+                        // the copy-line fallback is editing-only; with a mark
+                        // the region copy still runs (same as before).
+                        if (buf.mark != null) {
+                            try buf.copyRegion(gpa, &kill_ring, was_kill);
+                            buf.mark = null; // copy drops the mark, like C-c w
+                        } else if (editing) {
+                            try buf.copyLine(gpa, &kill_ring, was_kill);
+                        }
                         syncClipboard(&vx, &tty, gpa, kill_ring.current() orelse "");
-                        buf.mark = null; // copy drops the mark, like C-c w
                         kill_active = true;
                     } else if (key.matches('y', .{ .ctrl = true })) {
                         if (editing) {
@@ -3120,6 +3132,16 @@ pub fn main(init: std.process.Init) !void {
                         buf.moveRight();
                     } else if (key.matches('b', .{ .ctrl = true }) or key.matches(vaxis.Key.left, .{})) {
                         buf.moveLeft();
+                    } else if (key.matches('f', .{ .alt = true })) {
+                        // M-f: forward word (Emacs forward-word) — skip a run
+                        // of non-word chars then a run of word chars, landing
+                        // at the end of the word. Editing-only: direds
+                        // navigate with n/p, not word motion.
+                        if (editing) buf.moveWordForward();
+                    } else if (key.matches('b', .{ .alt = true })) {
+                        // M-b: backward word (Emacs backward-word) — the
+                        // mirror of M-f, landing at the start of the word.
+                        if (editing) buf.moveWordBackward();
                     } else if (key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
                         // C-n: down one visual (soft-wrapped) line, so a
                         // wrapped paragraph is stepped through line by

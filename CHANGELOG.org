@@ -17,6 +17,8 @@ Find-file prompts in the current window's modeline.
 - =C-x C-f= no longer takes over the screen: the find-file prompt now appears in the focused window's own modeline (the prompt reads =Find file:=, matching Emacs), so a split window layout stays intact while you type the path. The prompt is ordinary modeline text — Backspace edits the path, Enter opens or switches to it (a directory path opens a dired), and =C-g= / Escape cancels — the same in-pane shape as the isearch and dired prompts.
 - =C-x C-f= now prefills with the current buffer's directory, like Emacs's =find-file=: a file buffer's directory, or the directory being browsed while in a dired — always absolute, ending in a separator, so typing a bare file name opens it right there. The prefill is ordinary prompt text, so Backspace edits the directory like any other part of the path.
 - Backspace now deletes the marked region when a mark is set (Emacs =delete-active-region=), saving it to the kill ring so =C-y= gets it back; with no mark it deletes one char backward as before.
+- =M-w= now copies the current line when no mark is set, instead of doing nothing; with a mark set it copies the region as before.
+- =M-f= / =M-b= move forward / backward by word (Emacs =forward-word= / =backward-word=): a word is a run of letters, digits, or underscore; punctuation and whitespace are skipped separately, so =M-f= from =foo.bar= lands on =.= then past =bar=. Word motion crosses line boundaries (a line break counts as non-word, like Emacs treating a newline as whitespace), but a word itself never spans a line break.
 
 ** 0.15.0 — <2026-08-05>
 

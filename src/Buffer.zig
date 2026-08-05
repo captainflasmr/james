@@ -406,6 +406,18 @@ pub fn copyRegion(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRing, a
     try rememberKill(gpa, kill_ring, text, append);
 }
 
+/// M-w with no mark: copy the current line (the whole logical line under
+/// point) to the kill ring, without deleting it. Like copyRegion, this
+/// doesn't touch the buffer or the mark. The line text is stored without
+/// a trailing newline, so C-y inserts it at point and a following kill
+/// appends cleanly (newline-joined, like consecutive C-k's).
+pub fn copyLine(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRing, append: bool) !void {
+    const line = self.lines.items[self.cursor_row].items;
+    const owned = try gpa.dupe(u8, line);
+    defer gpa.free(owned);
+    try rememberKill(gpa, kill_ring, owned, append);
+}
+
 /// C-c b: copy the whole buffer to the kill ring, leaving point where it
 /// is (and no mark set).
 pub fn copyWholeBuffer(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRing) !void {
@@ -491,6 +503,69 @@ pub fn moveRight(self: *Buffer) void {
     } else if (self.cursor_row + 1 < self.lines.items.len) {
         self.cursor_row += 1;
         self.cursor_col = 0;
+    }
+}
+
+/// A word char for M-f / M-b (Emacs word syntax): a letter, digit, or
+/// underscore. Everything else — whitespace, punctuation — is non-word,
+/// and a run of non-word chars is skipped separately from a run of word
+/// chars (so M-f from "foo.bar" lands on ".", then past "bar").
+fn isWordChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// M-f: move forward one word (Emacs forward-word). A "word" is a maximal
+/// run of word chars (letters, digits, underscore); everything else
+/// (whitespace, punctuation) is non-word. forward-word skips any leading
+/// non-word chars, then the word, landing at the end of the word run. A
+/// line break counts as non-word (like Emacs treating a newline as
+/// whitespace), so the non-word skip crosses line boundaries — but a word
+/// itself never spans a line break, so the word-skip stops at end of line.
+pub fn moveWordForward(self: *Buffer) void {
+    // Step 1: skip non-word chars forward, crossing line breaks.
+    while (true) {
+        const line = self.lines.items[self.cursor_row];
+        if (self.cursor_col < line.items.len) {
+            if (isWordChar(line.items[self.cursor_col])) break;
+            self.cursor_col += 1;
+        } else if (self.cursor_row + 1 < self.lines.items.len) {
+            self.cursor_row += 1;
+            self.cursor_col = 0;
+        } else break;
+    }
+    // Step 2: skip word chars forward, stopping at a line break.
+    while (true) {
+        const line = self.lines.items[self.cursor_row];
+        if (self.cursor_col < line.items.len) {
+            if (!isWordChar(line.items[self.cursor_col])) break;
+            self.cursor_col += 1;
+        } else break;
+    }
+}
+
+/// M-b: move backward one word (Emacs backward-word). Skips non-word chars
+/// backward (crossing line breaks), then the word, landing at the start of
+/// the word run. The word-skip stops at a line break, so a word never
+/// spans one.
+pub fn moveWordBackward(self: *Buffer) void {
+    // Step 1: skip non-word chars backward, crossing line breaks.
+    while (self.cursor_row > 0 or self.cursor_col > 0) {
+        if (self.cursor_col > 0) {
+            const line = self.lines.items[self.cursor_row];
+            if (isWordChar(line.items[self.cursor_col - 1])) break;
+            self.cursor_col -= 1;
+        } else {
+            self.cursor_row -= 1;
+            self.cursor_col = self.lines.items[self.cursor_row].items.len;
+        }
+    }
+    // Step 2: skip word chars backward, stopping at a line break.
+    while (self.cursor_row > 0 or self.cursor_col > 0) {
+        if (self.cursor_col > 0) {
+            const line = self.lines.items[self.cursor_row];
+            if (!isWordChar(line.items[self.cursor_col - 1])) break;
+            self.cursor_col -= 1;
+        } else break;
     }
 }
 
