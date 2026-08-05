@@ -4,6 +4,7 @@ const vaxis = @import("vaxis");
 const windows = std.os.windows;
 const Buffer = @import("Buffer.zig");
 const Dired = @import("Dired.zig");
+const build_options = @import("build_options");
 
 /// Suppress vaxis's std.log output: stderr shares the terminal, so its
 /// startup chatter ("kitty keyboard capability", resize notices, ...)
@@ -1361,8 +1362,11 @@ fn renderTree(
 
 /// The home screen shown when james starts without any file arguments.
 /// It's a plain buffer (so movement, search and every C-x command work on
-/// it) with no backing file; C-x d / C-x C-f lead somewhere real.
-const welcome_text =
+/// it) with no backing file; C-x d / C-x C-f lead somewhere real. The
+/// version line is inserted between `welcome_head` and `welcome_tail` at
+/// startup (see openWelcome), right under the welcome message so it's
+/// visible however short the terminal is.
+const welcome_head =
     \\          _   _    __  __ _____ ____
     \\         | | / \  |  \/  | ____/ ___|
     \\      _  | |/ _ \ | |\/| |  _| \___ \
@@ -1370,6 +1374,10 @@ const welcome_text =
     \\      \___/_/   \_\_|  |_|_____|____/
     \\
     \\  Welcome to james, a minimal Emacs-inspired editor for the terminal.
+;
+
+const welcome_tail =
+    \\
     \\
     \\  No file was given, so this is the home screen. Get to work with:
     \\
@@ -1390,12 +1398,29 @@ const welcome_text =
     \\    C-x C-c       quit
 ;
 
-/// Add a fresh buffer containing `welcome_text` to `buffers`. Used only at
-/// startup when no files were given.
+/// Add a fresh buffer containing the home screen to `buffers`. Used only
+/// at startup when no files were given. The version line under the
+/// welcome message — version, date, and the last change, baked in at
+/// build time from CHANGELOG.org (see build.zig) — follows the welcome
+/// line.
 fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer)) !void {
     const new_buf = try gpa.create(Buffer);
     errdefer gpa.destroy(new_buf);
-    new_buf.* = try Buffer.fromText(gpa, welcome_text);
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    try text.appendSlice(gpa, welcome_head);
+    if (build_options.version.len > 0) {
+        try text.appendSlice(gpa, "\n  james ");
+        try text.appendSlice(gpa, build_options.version);
+        try text.appendSlice(gpa, " (");
+        try text.appendSlice(gpa, build_options.date);
+        try text.appendSlice(gpa, ") — ");
+        try text.appendSlice(gpa, build_options.theme);
+    }
+    try text.appendSlice(gpa, welcome_tail);
+
+    new_buf.* = try Buffer.fromText(gpa, text.items);
     new_buf.display_name = try gpa.dupe(u8, "*welcome*");
     try buffers.append(gpa, new_buf);
 }

@@ -44,6 +44,18 @@ pub fn build(b: *std.Build) void {
         exe.root_module.linkSystemLibrary("user32", .{});
     }
 
+    // The welcome screen's version line: the newest CHANGELOG.org entry
+    // (version, date, and the change line under the heading), parsed once
+    // at build time and baked into the binary — so it shows however james
+    // is launched (the .desktop launcher starts it from $HOME, where
+    // CHANGELOG.org isn't).
+    const release = latestRelease(b);
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", release.version);
+    build_options.addOption([]const u8, "date", release.date);
+    build_options.addOption([]const u8, "theme", release.theme);
+    exe.root_module.addOptions("build_options", build_options);
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -52,4 +64,50 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the editor");
     run_step.dependOn(&run_cmd.step);
+}
+
+const ReleaseInfo = struct { version: []const u8, date: []const u8, theme: []const u8 };
+
+/// The newest entry of CHANGELOG.org — version number, release date, and
+/// the theme line under the heading — for the welcome screen. Parsed once
+/// at build time and baked into the binary, so it shows however james is
+/// launched (a .desktop launcher starts it from $HOME, where the
+/// changelog isn't). Empty strings when the changelog can't be read or
+/// parsed.
+fn latestRelease(b: *std.Build) ReleaseInfo {
+    const empty: ReleaseInfo = .{ .version = "", .date = "", .theme = "" };
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const src = std.Io.Dir.cwd().readFileAlloc(io, "CHANGELOG.org", b.allocator, .limited(1 << 20)) catch return empty;
+    defer b.allocator.free(src);
+
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "** ")) continue;
+        // The heading is "** 0.21.0 — <2026-08-05>"; the version sits
+        // before the "<date>", and the theme is the first non-blank line
+        // under the heading.
+        const rest = std.mem.trim(u8, line["** ".len..], " ");
+        const lt = std.mem.indexOfScalar(u8, rest, '<') orelse continue;
+        const gt = std.mem.indexOfScalarPos(u8, rest, lt + 1, '>') orelse continue;
+        const version = std.mem.trim(u8, rest[0..lt], " ");
+        const date = rest[lt + 1 .. gt];
+        if (version.len == 0 or date.len == 0) continue;
+        while (lines.next()) |theme_line| {
+            const theme = std.mem.trim(u8, theme_line, " \t");
+            if (theme.len == 0) continue;
+            // Strip the org =...= markup the changelog uses for keys.
+            var plain: std.ArrayList(u8) = .empty;
+            defer plain.deinit(b.allocator);
+            for (theme) |c| {
+                if (c != '=') plain.append(b.allocator, c) catch return empty;
+            }
+            return .{
+                .version = b.allocator.dupe(u8, version) catch return empty,
+                .date = b.allocator.dupe(u8, date) catch return empty,
+                .theme = plain.toOwnedSlice(b.allocator) catch return empty,
+            };
+        }
+        return empty;
+    }
+    return empty;
 }

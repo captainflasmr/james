@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.21.0 — <2026-08-05>
+
+The welcome screen shows the latest release.
+
+- The home screen now shows a version line right under the welcome message, naming the latest version, its release date, and the most recent change — =james 0.21.0 (2026-08-05) — The welcome screen shows the latest release.=, say. The line is baked into the binary at build time from =CHANGELOG.org= — the version, date, and the change line under the top heading, with the org =...= markup stripped — so it appears however james is launched: from a terminal in the source tree or from the =james.desktop= launcher, whose working directory is =$HOME= rather than the source tree (the first cut read the file at startup, so the desktop launch silently skipped the line). It sits near the top of the screen, visible however short the terminal is.
+
 ** 0.20.0 — <2026-08-05>
 
 isearch in the pickers.
