@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.18.0 — <2026-08-05>
+
+=C-x k= kills the current buffer.
+
+- =C-x k= now kills (closes) the current buffer, like Emacs =kill-buffer= — a file buffer, a dired (the same close as =q= / =C-g= there), or the home screen. A modified file buffer asks first: the modeline reads =Save file <name> before killing?=, with =y= saving and killing, =n= killing without saving, and =C-g= / Escape cancelling (a save that fails keeps the buffer and reports =Save failed= on the modeline). The last buffer is never killed — the editor always keeps something on screen — and every window that showed the killed buffer falls back to the next one, the same fix-up the dired close already used. =C-x k= closes a dired directly, since dired buffers are never dirty.
+
 ** 0.17.0 — <2026-08-05>
 
 =g= refreshes a dired.

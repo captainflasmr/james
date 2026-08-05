@@ -1463,11 +1463,12 @@ fn openBufferOrDired(
     return buffers.items.len - 1;
 }
 
-/// q / C-g / C-c C-k on a dired buffer: close it (like Emacs's
-/// dired-kill-buffer) and leave the focused window showing whatever buffer
-/// took its place. Every window's buffer index is fixed up, since the
-/// indices of all later buffers shift down by one.
-fn closeDiredBuffer(
+/// C-x k: kill the current buffer (Emacs kill-buffer) and leave the
+/// focused window showing whatever buffer took its place. Every window's
+/// buffer index is fixed up, since the indices of all later buffers shift
+/// down by one. The last buffer is never killed — the editor never runs
+/// with zero buffers.
+fn closeBuffer(
     gpa: std.mem.Allocator,
     buffers: *std.ArrayList(*Buffer),
     direds: *std.ArrayList(?Dired),
@@ -1476,16 +1477,18 @@ fn closeDiredBuffer(
     current: usize,
 ) usize {
     if (buffers.items.len <= 1) return current; // never leave zero buffers
-    if (current >= direds.items.len or direds.items[current] == null) return current;
+    if (current >= buffers.items.len) return current;
 
-    var d = direds.orderedRemove(current).?;
-    d.deinit(gpa);
+    if (direds.orderedRemove(current)) |d| {
+        var dd = d;
+        dd.deinit(gpa);
+    }
     var b = buffers.orderedRemove(current);
     b.deinit(gpa);
     gpa.destroy(b);
 
     // Rebase every window's buffer index onto the shrunken list; a pane
-    // that showed the closed dired now shows the buffer that took its slot.
+    // that showed the killed buffer now shows the buffer that took its slot.
     fixupBufIndices(root, current, buffers.items.len);
     const next = @min(current, buffers.items.len - 1);
     focused.buf_idx = next;
@@ -2035,6 +2038,7 @@ pub fn main(init: std.process.Init) !void {
     // jump to a well-known directory is two keys, like every Emacs prefix.
     var pending_alt_l = false;
     var confirming_quit = false;
+    var confirming_kill = false;
 
     // Directory-browser state: one slot per buffer. A buffer with a non-null
     // slot is a dired buffer (its `filename` is the directory being
@@ -2213,6 +2217,29 @@ pub fn main(init: std.process.Init) !void {
                     }
                     // Any other key is ignored — stay in the prompt rather
                     // than risk a stray keystroke saving or discarding work.
+                } else if (confirming_kill) {
+                    if (key.matches('y', .{}) or key.matches('Y', .{})) {
+                        // y: save the buffer, then kill it. A failed save
+                        // keeps the buffer — killing would lose the
+                        // changes for good.
+                        confirming_kill = false;
+                        kill: {
+                            buf.save(gpa, io) catch {
+                                status_msg = "Save failed";
+                                break :kill;
+                            };
+                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current);
+                        }
+                    } else if (key.matches('n', .{}) or key.matches('N', .{})) {
+                        confirming_kill = false;
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                        current = closeBuffer(gpa, &buffers, &direds, root, focused, current);
+                    } else if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        confirming_kill = false;
+                    }
+                    // Any other key is ignored — stay in the prompt rather
+                    // than risk a stray keystroke killing the wrong buffer.
                 } else if (pending_ctrl_c) {
                     pending_ctrl_c = false;
                     if (key.matches('b', .{})) {
@@ -2230,7 +2257,7 @@ pub fn main(init: std.process.Init) !void {
                         // Jasspa setup).
                         if (direds.items[current] != null) {
                             recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                            current = closeDiredBuffer(gpa, &buffers, &direds, root, focused, current);
+                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current);
                         }
                     } else if (key.matches('o', .{})) {
                         // C-c o: open the bookmark picker (the "favorites"
@@ -2579,6 +2606,20 @@ pub fn main(init: std.process.Init) !void {
                         buffer_list_active = true;
                         buffer_list_selected = current;
                         buffer_list_top = 0;
+                    } else if (key.matches('k', .{})) {
+                        // C-x k: kill the current buffer (Emacs kill-buffer).
+                        // A modified file buffer asks first (y saves and
+                        // kills, n kills without saving, C-g cancels); a
+                        // dired closes like q / C-g; the last buffer is
+                        // never killed.
+                        if (buf.dirty and buf.filename != null) {
+                            confirming_kill = true;
+                        } else {
+                            const before = buffers.items.len;
+                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current);
+                            if (buffers.items.len == before) status_msg = "Can't kill the last buffer";
+                        }
                     } else if (key.matches('f', .{ .ctrl = true })) {
                         // C-x C-f: open-or-switch by typing a path, prefilled
                         // with the current buffer's directory (a dired's own
@@ -2849,7 +2890,7 @@ pub fn main(init: std.process.Init) !void {
                     if (direds.items[current]) |*d| {
                         if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
                             recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                            current = closeDiredBuffer(gpa, &buffers, &direds, root, focused, current);
+                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current);
                         } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
                             d.moveDown();
                         } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
@@ -3321,7 +3362,7 @@ pub fn main(init: std.process.Init) !void {
         // Dired and isearch are not modal: they render inside whichever
         // pane they apply to, leaving the window layout untouched. Only the
         // prompt-style modes take over the whole screen.
-        const is_modal = confirming_quit or bookmark_prompt != null or bookmark_list_active or buffer_list_active;
+        const is_modal = confirming_quit or confirming_kill or bookmark_prompt != null or bookmark_list_active or buffer_list_active;
 
         const search_view: ?IsearchView = if (isearch_active)
             .{ .failed = isearch_failed, .match = isearch_match, .query = isearch_query.items, .backward = isearch_dir == .backward }
@@ -3450,6 +3491,8 @@ pub fn main(init: std.process.Init) !void {
 
         const modeline = if (confirming_quit)
             std.fmt.bufPrint(&modeline_buf, "Save file {s} before exiting? (y / n / C-g cancels)", .{buf.filename orelse "?"}) catch "Save before exiting? (y/n)"
+        else if (confirming_kill)
+            std.fmt.bufPrint(&modeline_buf, "Save file {s} before killing? (y / n / C-g cancels)", .{buf.filename orelse "?"}) catch "Save before killing? (y/n)"
         else if (status_msg) |m|
             std.fmt.bufPrint(&modeline_buf, "{s}", .{m}) catch "Save failed"
         else if (switching_buffer)
