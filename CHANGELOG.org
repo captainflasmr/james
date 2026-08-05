@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.17.0 — <2026-08-05>
+
+=g= refreshes a dired.
+
+- =g= in a dired buffer re-reads the directory listing (Emacs =revert-buffer= / =dired-revert=), keeping the selection where it was: the same =refresh= path the copy, delete, rename and create commands already use, now on its own key, so a listing changed outside james (a file added or removed in another terminal) is pulled back in without reopening the buffer. Marks are cleared by the refresh, as the post-copy/delete refresh already does.
+
 ** 0.16.0 — <2026-08-05>
 
 Find-file prompts in the current window's modeline.
@@ -19,6 +25,8 @@ Find-file prompts in the current window's modeline.
 - Backspace now deletes the marked region when a mark is set (Emacs =delete-active-region=), saving it to the kill ring so =C-y= gets it back; with no mark it deletes one char backward as before.
 - =M-w= now copies the current line when no mark is set, instead of doing nothing; with a mark set it copies the region as before.
 - =M-f= / =M-b= move forward / backward by word (Emacs =forward-word= / =backward-word=): a word is a run of letters, digits, or underscore; punctuation and whitespace are skipped separately, so =M-f= from =foo.bar= lands on =.= then past =bar=. Word motion crosses line boundaries (a line break counts as non-word, like Emacs treating a newline as whitespace), but a word itself never spans a line break.
+- =M-d= (and =C-delete=) kills one word forward (Emacs =kill-word=): kills from point to the end of the word run forward, saving the text to the kill ring so =C-y= gets it back; a following kill appends, like =C-k=. The mark is left untouched. (Emacs's numeric prefix argument is not supported — james has no prefix-arg system.)
+- =M-Backspace= kills one word backward (Emacs =backward-kill-word=): the mirror of =M-d=, killing from point back to the start of the word run, saving the text to the kill ring so =C-y= gets it back; a following kill appends, like =C-k=. The mark is left untouched.
 
 ** 0.15.0 — <2026-08-05>
 

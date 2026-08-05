@@ -2901,6 +2901,11 @@ pub fn main(init: std.process.Init) !void {
                             });
                             mirrorDiredLines(gpa, buffers.items[current], d);
                             buffers.items[current].cursor_row = d.selected;
+                        } else if (key.matches('g', .{})) {
+                            // g: re-read the directory listing (Emacs
+                            // revert-buffer in dired), keeping the
+                            // selection where it was.
+                            refreshDired(gpa, io, &buffers, &direds, current);
                         } else if (key.matches('e', .{ .alt = true }) or key.matches('^', .{})) {
                             if (try d.upPath(gpa)) |parent| {
                                 defer gpa.free(parent);
@@ -3165,6 +3170,29 @@ pub fn main(init: std.process.Init) !void {
                         last_was_recenter = true;
                     } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.delete, .{})) {
                         try buf.deleteForward(gpa);
+                    } else if (key.matches('d', .{ .alt = true }) or key.matches(vaxis.Key.delete, .{ .ctrl = true })) {
+                        // M-d / C-Delete: kill one word forward (Emacs
+                        // kill-word) — kill from point to the end of the
+                        // word run forward, saving it to the kill ring (so
+                        // C-y gets it back). Editing-only: direds are
+                        // read-only. A following kill appends, like C-k.
+                        if (editing) {
+                            try buf.killWord(gpa, &kill_ring, was_kill);
+                            syncClipboard(&vx, &tty, gpa, kill_ring.current() orelse "");
+                            kill_active = true;
+                        }
+                    } else if (key.matches(vaxis.Key.backspace, .{ .alt = true })) {
+                        // M-Backspace: kill one word backward (Emacs
+                        // backward-kill-word) — the mirror of M-d, killing
+                        // from point back to the start of the word run,
+                        // saving it to the kill ring (so C-y gets it back).
+                        // Editing-only: direds are read-only. A following
+                        // kill appends, like C-k.
+                        if (editing) {
+                            try buf.killWordBackward(gpa, &kill_ring, was_kill);
+                            syncClipboard(&vx, &tty, gpa, kill_ring.current() orelse "");
+                            kill_active = true;
+                        }
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
                         // With a mark set, Backspace deletes the whole
                         // region (Emacs delete-active-region) — killRegion

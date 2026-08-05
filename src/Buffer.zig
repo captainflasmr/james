@@ -398,6 +398,50 @@ pub fn killRegion(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRing, a
     self.dirty = true;
 }
 
+/// M-d: kill one word forward (Emacs kill-word). Kills from point to the
+/// end of the word run forward — moveWordForward skips any leading non-word
+/// chars then the word, so this kills "foo" from "foo| bar" and " bar"
+/// from "foo |bar" (the leading space goes with the word, like Emacs). The
+/// killed text heads the kill ring (so C-y gets it back); the mark is left
+/// untouched (a stale mark after a kill is the same caveat as C-x C-k). At
+/// end of buffer there's nothing to kill, so it's a no-op.
+pub fn killWord(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRing, append: bool) !void {
+    const start = Pos{ .row = self.cursor_row, .col = self.cursor_col };
+    self.moveWordForward();
+    const end = Pos{ .row = self.cursor_row, .col = self.cursor_col };
+    if (start.row == end.row and start.col == end.col) return; // nothing to kill
+    try self.recordUndo(gpa, .kill);
+    const text = try self.extractRange(gpa, start, end);
+    defer gpa.free(text);
+    try self.deleteRange(gpa, start, end);
+    self.cursor_row = start.row;
+    self.cursor_col = start.col;
+    try rememberKill(gpa, kill_ring, text, append);
+    self.dirty = true;
+}
+
+/// M-Backspace: kill one word backward (Emacs backward-kill-word). Kills
+/// from point back to the start of the word run — moveWordBackward skips
+/// any trailing non-word chars then the word, so this kills "foo" from
+/// "foo |bar" (the trailing space goes with the word, like Emacs) and
+/// "bar" from "foo bar|". The killed text heads the kill ring (so C-y gets
+/// it back); the mark is left untouched (same caveat as M-d). At beginning
+/// of buffer there's nothing to kill, so it's a no-op.
+pub fn killWordBackward(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRing, append: bool) !void {
+    const end = Pos{ .row = self.cursor_row, .col = self.cursor_col };
+    self.moveWordBackward();
+    const start = Pos{ .row = self.cursor_row, .col = self.cursor_col };
+    if (start.row == end.row and start.col == end.col) return; // nothing to kill
+    try self.recordUndo(gpa, .kill);
+    const text = try self.extractRange(gpa, start, end);
+    defer gpa.free(text);
+    try self.deleteRange(gpa, start, end);
+    self.cursor_row = start.row;
+    self.cursor_col = start.col;
+    try rememberKill(gpa, kill_ring, text, append);
+    self.dirty = true;
+}
+
 /// M-w: copy the region between point and mark without deleting it.
 pub fn copyRegion(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRing, append: bool) !void {
     const region = self.orderedRegion() orelse return;
