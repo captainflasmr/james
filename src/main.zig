@@ -1538,6 +1538,33 @@ fn syncDiredSelection(direds: []?Dired, current: usize, buf: *Buffer) void {
     if (direds[current]) |*d| d.selected = buf.cursor_row;
 }
 
+/// List-isearch find: search the buffer-picker or bookmark-picker rows
+/// for `query`, starting at `from_row` (inclusive) and wrapping around
+/// the list — the row-granular twin of Buffer.findNext. Returns the
+/// matched row and the byte offset of the match in that row's text.
+fn pickerFindNext(
+    buffers: []*Buffer,
+    bookmarks: []const Bookmark,
+    in_bookmarks: bool,
+    query: []const u8,
+    from_row: usize,
+    forward: bool,
+) ?Buffer.Pos {
+    const count = if (in_bookmarks) bookmarks.len else buffers.len;
+    if (count == 0 or query.len == 0) return null;
+    var i = from_row % count;
+    var n: usize = 0;
+    while (n < count) : (n += 1) {
+        const row_text = if (in_bookmarks)
+            bookmarks[i].name
+        else
+            (buffers[i].display_name orelse buffers[i].filename orelse "?");
+        if (std.ascii.indexOfIgnoreCase(row_text, query)) |col| return .{ .row = i, .col = col };
+        i = if (forward) (i + 1) % count else (i + count - 1) % count;
+    }
+    return null;
+}
+
 /// Winner-mode style window history (C-c j / C-c k): the window layout is
 /// snapshotted before each layout change, so you can step back and forward
 /// through them. A snapshot is the pane tree serialized in pre-order.
@@ -2473,6 +2500,147 @@ pub fn main(init: std.process.Init) !void {
                         open_confirm_app = null;
                     }
                     // Any other key is ignored while confirming.
+                } else if (isearch_active) {
+                    if (bookmark_list_active or buffer_list_active) {
+                        // List isearch — the buffer and bookmark pickers:
+                        // the selection stands in for the cursor, and the
+                        // search runs over the rows (row-granular, like
+                        // isearch in a dired). Confirming leaves the match
+                        // selected, so the picker's Enter then opens it.
+                        if (key.matches('g', .{ .ctrl = true })) {
+                            if (bookmark_list_active) bookmark_list_selected = isearch_origin.row else buffer_list_selected = isearch_origin.row;
+                            isearch_active = false;
+                            isearch_match = null;
+                            isearch_query.clearRetainingCapacity();
+                        } else if (key.matches('s', .{ .ctrl = true })) {
+                            isearch_dir = .forward;
+                            if (isearch_query.items.len > 0) {
+                                const from = if (isearch_match) |m| m.row + 1 else isearch_origin.row;
+                                if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, isearch_query.items, from, true)) |m| {
+                                    isearch_match = m;
+                                    isearch_failed = false;
+                                    if (bookmark_list_active) bookmark_list_selected = m.row else buffer_list_selected = m.row;
+                                } else {
+                                    isearch_failed = true;
+                                }
+                            }
+                        } else if (key.matches('r', .{ .ctrl = true })) {
+                            isearch_dir = .backward;
+                            if (isearch_query.items.len > 0) {
+                                const count = if (bookmark_list_active) bookmarks.items.len else buffers.items.len;
+                                const from = if (isearch_match) |m| (m.row + count - 1) % count else isearch_origin.row;
+                                if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, isearch_query.items, from, false)) |m| {
+                                    isearch_match = m;
+                                    isearch_failed = false;
+                                    if (bookmark_list_active) bookmark_list_selected = m.row else buffer_list_selected = m.row;
+                                } else {
+                                    isearch_failed = true;
+                                }
+                            }
+                        } else if (key.matches(vaxis.Key.backspace, .{})) {
+                            if (isearch_query.items.len > 0) _ = isearch_query.pop();
+                            if (isearch_query.items.len == 0) {
+                                if (bookmark_list_active) bookmark_list_selected = isearch_origin.row else buffer_list_selected = isearch_origin.row;
+                                isearch_match = null;
+                                isearch_failed = false;
+                            } else if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
+                                isearch_match = m;
+                                isearch_failed = false;
+                                if (bookmark_list_active) bookmark_list_selected = m.row else buffer_list_selected = m.row;
+                            } else {
+                                isearch_failed = true;
+                            }
+                        } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                            // Confirm the search: the match stays selected,
+                            // and the picker's Enter opens it.
+                            isearch_active = false;
+                        } else if (key.text) |t| {
+                            try isearch_query.appendSlice(gpa, t);
+                            if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
+                                isearch_match = m;
+                                isearch_failed = false;
+                                if (bookmark_list_active) bookmark_list_selected = m.row else buffer_list_selected = m.row;
+                            } else {
+                                isearch_failed = true;
+                            }
+                        } else {
+                            isearch_active = false;
+                        }
+                    } else {
+                        if (key.matches('g', .{ .ctrl = true })) {
+                            buf.cursor_row = isearch_origin.row;
+                            buf.cursor_col = isearch_origin.col;
+                            syncDiredSelection(direds.items, current, buf);
+                            isearch_active = false;
+                            isearch_match = null;
+                            isearch_query.clearRetainingCapacity();
+                        } else if (key.matches('s', .{ .ctrl = true })) {
+                            isearch_dir = .forward;
+                            if (isearch_query.items.len > 0) {
+                                const from: Buffer.Pos = if (isearch_match) |m|
+                                    .{ .row = m.row, .col = m.col + 1 }
+                                else
+                                    isearch_origin;
+                                if (buf.findNext(isearch_query.items, from, .forward)) |m| {
+                                    buf.cursor_row = m.row;
+                                    buf.cursor_col = m.col;
+                                    syncDiredSelection(direds.items, current, buf);
+                                    isearch_match = m;
+                                    isearch_failed = false;
+                                } else {
+                                    isearch_failed = true;
+                                }
+                            }
+                        } else if (key.matches('r', .{ .ctrl = true })) {
+                            isearch_dir = .backward;
+                            if (isearch_query.items.len > 0) {
+                                const from: Buffer.Pos = isearch_match orelse isearch_origin;
+                                if (buf.findNext(isearch_query.items, from, .backward)) |m| {
+                                    buf.cursor_row = m.row;
+                                    buf.cursor_col = m.col;
+                                    syncDiredSelection(direds.items, current, buf);
+                                    isearch_match = m;
+                                    isearch_failed = false;
+                                } else {
+                                    isearch_failed = true;
+                                }
+                            }
+                        } else if (key.matches(vaxis.Key.backspace, .{})) {
+                            if (isearch_query.items.len > 0) _ = isearch_query.pop();
+                            if (isearch_query.items.len == 0) {
+                                buf.cursor_row = isearch_origin.row;
+                                buf.cursor_col = isearch_origin.col;
+                                syncDiredSelection(direds.items, current, buf);
+                                isearch_match = null;
+                                isearch_failed = false;
+                            } else if (buf.findNext(isearch_query.items, isearch_origin, isearch_dir)) |m| {
+                                buf.cursor_row = m.row;
+                                buf.cursor_col = m.col;
+                                syncDiredSelection(direds.items, current, buf);
+                                isearch_match = m;
+                                isearch_failed = false;
+                            } else {
+                                isearch_failed = true;
+                            }
+                        } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                            // Confirm the search: the match stays selected.
+                            syncDiredSelection(direds.items, current, buf);
+                            isearch_active = false;
+                        } else if (key.text) |t| {
+                            try isearch_query.appendSlice(gpa, t);
+                            if (buf.findNext(isearch_query.items, isearch_origin, isearch_dir)) |m| {
+                                buf.cursor_row = m.row;
+                                buf.cursor_col = m.col;
+                                syncDiredSelection(direds.items, current, buf);
+                                isearch_match = m;
+                                isearch_failed = false;
+                            } else {
+                                isearch_failed = true;
+                            }
+                        } else {
+                            isearch_active = false;
+                        }
+                    }
                 } else if (bookmark_list_active) {
                     if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
                         bookmark_list_active = false;
@@ -2480,6 +2648,23 @@ pub fn main(init: std.process.Init) !void {
                         if (bookmark_list_selected + 1 < bookmarks.items.len) bookmark_list_selected += 1;
                     } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
                         if (bookmark_list_selected > 0) bookmark_list_selected -= 1;
+                    } else if (key.matches('s', .{ .ctrl = true })) {
+                        // C-s / C-r: incremental search over the rows (the
+                        // selection follows the match), like isearch in a
+                        // dired.
+                        isearch_active = true;
+                        isearch_dir = .forward;
+                        isearch_origin = .{ .row = bookmark_list_selected, .col = 0 };
+                        isearch_match = null;
+                        isearch_failed = false;
+                        isearch_query.clearRetainingCapacity();
+                    } else if (key.matches('r', .{ .ctrl = true })) {
+                        isearch_active = true;
+                        isearch_dir = .backward;
+                        isearch_origin = .{ .row = bookmark_list_selected, .col = 0 };
+                        isearch_match = null;
+                        isearch_failed = false;
+                        isearch_query.clearRetainingCapacity();
                     } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches('f', .{})) {
                         // Enter / C-j, or "f" (the dirlst-find-file key from
                         // the Jasspa setup): open the selected bookmark.
@@ -2500,6 +2685,23 @@ pub fn main(init: std.process.Init) !void {
                         if (buffer_list_selected + 1 < buffers.items.len) buffer_list_selected += 1;
                     } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
                         if (buffer_list_selected > 0) buffer_list_selected -= 1;
+                    } else if (key.matches('s', .{ .ctrl = true })) {
+                        // C-s / C-r: incremental search over the rows (the
+                        // selection follows the match), like isearch in a
+                        // dired.
+                        isearch_active = true;
+                        isearch_dir = .forward;
+                        isearch_origin = .{ .row = buffer_list_selected, .col = 0 };
+                        isearch_match = null;
+                        isearch_failed = false;
+                        isearch_query.clearRetainingCapacity();
+                    } else if (key.matches('r', .{ .ctrl = true })) {
+                        isearch_active = true;
+                        isearch_dir = .backward;
+                        isearch_origin = .{ .row = buffer_list_selected, .col = 0 };
+                        isearch_match = null;
+                        isearch_failed = false;
+                        isearch_query.clearRetainingCapacity();
                     } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches('f', .{})) {
                         if (buffer_list_selected < buffers.items.len) {
                             buffer_list_active = false;
@@ -2508,80 +2710,6 @@ pub fn main(init: std.process.Init) !void {
                             focused.buf_idx = current;
                             kill_active = false;
                         }
-                    }
-                } else if (isearch_active) {
-                    if (key.matches('g', .{ .ctrl = true })) {
-                        buf.cursor_row = isearch_origin.row;
-                        buf.cursor_col = isearch_origin.col;
-                        syncDiredSelection(direds.items, current, buf);
-                        isearch_active = false;
-                        isearch_match = null;
-                        isearch_query.clearRetainingCapacity();
-                    } else if (key.matches('s', .{ .ctrl = true })) {
-                        isearch_dir = .forward;
-                        if (isearch_query.items.len > 0) {
-                            const from: Buffer.Pos = if (isearch_match) |m|
-                                .{ .row = m.row, .col = m.col + 1 }
-                            else
-                                isearch_origin;
-                            if (buf.findNext(isearch_query.items, from, .forward)) |m| {
-                                buf.cursor_row = m.row;
-                                buf.cursor_col = m.col;
-                                syncDiredSelection(direds.items, current, buf);
-                                isearch_match = m;
-                                isearch_failed = false;
-                            } else {
-                                isearch_failed = true;
-                            }
-                        }
-                    } else if (key.matches('r', .{ .ctrl = true })) {
-                        isearch_dir = .backward;
-                        if (isearch_query.items.len > 0) {
-                            const from: Buffer.Pos = isearch_match orelse isearch_origin;
-                            if (buf.findNext(isearch_query.items, from, .backward)) |m| {
-                                buf.cursor_row = m.row;
-                                buf.cursor_col = m.col;
-                                syncDiredSelection(direds.items, current, buf);
-                                isearch_match = m;
-                                isearch_failed = false;
-                            } else {
-                                isearch_failed = true;
-                            }
-                        }
-                    } else if (key.matches(vaxis.Key.backspace, .{})) {
-                        if (isearch_query.items.len > 0) _ = isearch_query.pop();
-                        if (isearch_query.items.len == 0) {
-                            buf.cursor_row = isearch_origin.row;
-                            buf.cursor_col = isearch_origin.col;
-                            syncDiredSelection(direds.items, current, buf);
-                            isearch_match = null;
-                            isearch_failed = false;
-                        } else if (buf.findNext(isearch_query.items, isearch_origin, isearch_dir)) |m| {
-                            buf.cursor_row = m.row;
-                            buf.cursor_col = m.col;
-                            syncDiredSelection(direds.items, current, buf);
-                            isearch_match = m;
-                            isearch_failed = false;
-                        } else {
-                            isearch_failed = true;
-                        }
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
-                        // Confirm the search: the match stays selected.
-                        syncDiredSelection(direds.items, current, buf);
-                        isearch_active = false;
-                    } else if (key.text) |t| {
-                        try isearch_query.appendSlice(gpa, t);
-                        if (buf.findNext(isearch_query.items, isearch_origin, isearch_dir)) |m| {
-                            buf.cursor_row = m.row;
-                            buf.cursor_col = m.col;
-                            syncDiredSelection(direds.items, current, buf);
-                            isearch_match = m;
-                            isearch_failed = false;
-                        } else {
-                            isearch_failed = true;
-                        }
-                    } else {
-                        isearch_active = false;
                     }
                 } else if (pending_ctrl_x) {
                     pending_ctrl_x = false;
@@ -3408,7 +3536,32 @@ pub fn main(init: std.process.Init) !void {
                 // it. For a dired bookmark the path is a directory, so it
                 // shows itself; for a file bookmark, its parent directory.
                 const b = bookmarks.items[i];
-                _ = body.printSegment(.{ .text = b.name, .style = .{} }, .{ .row_offset = list_row });
+                // An active isearch highlights the matched part of the
+                // name, like the dired and file-buffer match highlights.
+                const hl: ?Highlight = if (isearch_active and !isearch_failed) blk: {
+                    if (isearch_match) |m| {
+                        if (i == m.row) {
+                            const start = @min(m.col, b.name.len);
+                            const end = @min(m.col + isearch_query.items.len, b.name.len);
+                            if (end > start) break :blk .{ .start = start, .end = end };
+                        }
+                    }
+                    break :blk null;
+                } else null;
+                if (hl) |h| {
+                    var col: u16 = 0;
+                    if (h.start > 0) {
+                        _ = body.printSegment(.{ .text = b.name[0..h.start], .style = .{} }, .{ .row_offset = list_row });
+                        col += body.gwidth(b.name[0..h.start]);
+                    }
+                    _ = body.printSegment(.{ .text = b.name[h.start..h.end], .style = highlight_style }, .{ .row_offset = list_row, .col_offset = col });
+                    col += body.gwidth(b.name[h.start..h.end]);
+                    if (h.end < b.name.len) {
+                        _ = body.printSegment(.{ .text = b.name[h.end..], .style = .{} }, .{ .row_offset = list_row, .col_offset = col });
+                    }
+                } else {
+                    _ = body.printSegment(.{ .text = b.name, .style = .{} }, .{ .row_offset = list_row });
+                }
                 const dir: ?[]const u8 = if (isDirectory(io, b.path))
                     b.path
                 else
@@ -3419,7 +3572,13 @@ pub fn main(init: std.process.Init) !void {
                 list_row += 1;
             }
             var list_ml_buf: [2048]u8 = undefined;
-            const list_ml = std.fmt.bufPrint(&list_ml_buf, "Bookmarks ({d}/{d})   (Enter/f jumps, n/p move, q closes)", .{
+            const list_ml = if (isearch_active) blk: {
+                const label = if (isearch_failed)
+                    (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")
+                else
+                    (if (isearch_dir == .backward) "I-search backward" else "I-search");
+                break :blk std.fmt.bufPrint(&list_ml_buf, "{s}: {s}", .{ label, isearch_query.items }) catch label;
+            } else std.fmt.bufPrint(&list_ml_buf, "Bookmarks ({d}/{d})   (C-s searches, Enter/f jumps, n/p move, q closes)", .{
                 bookmark_list_selected + 1,
                 bookmarks.items.len,
             }) catch "Bookmarks";
@@ -3443,11 +3602,43 @@ pub fn main(init: std.process.Init) !void {
             var i = buffer_list_top;
             while (i < buffers.items.len and list_row < text_height) : (i += 1) {
                 const b: *Buffer = buffers.items[i];
-                _ = body.printSegment(.{ .text = b.display_name orelse b.filename orelse "?", .style = .{} }, .{ .row_offset = list_row });
+                const name = b.display_name orelse b.filename orelse "?";
+                // An active isearch highlights the matched part of the
+                // name, like the dired and file-buffer match highlights.
+                const hl: ?Highlight = if (isearch_active and !isearch_failed) blk: {
+                    if (isearch_match) |m| {
+                        if (i == m.row) {
+                            const start = @min(m.col, name.len);
+                            const end = @min(m.col + isearch_query.items.len, name.len);
+                            if (end > start) break :blk .{ .start = start, .end = end };
+                        }
+                    }
+                    break :blk null;
+                } else null;
+                if (hl) |h| {
+                    var col: u16 = 0;
+                    if (h.start > 0) {
+                        _ = body.printSegment(.{ .text = name[0..h.start], .style = .{} }, .{ .row_offset = list_row });
+                        col += body.gwidth(name[0..h.start]);
+                    }
+                    _ = body.printSegment(.{ .text = name[h.start..h.end], .style = highlight_style }, .{ .row_offset = list_row, .col_offset = col });
+                    col += body.gwidth(name[h.start..h.end]);
+                    if (h.end < name.len) {
+                        _ = body.printSegment(.{ .text = name[h.end..], .style = .{} }, .{ .row_offset = list_row, .col_offset = col });
+                    }
+                } else {
+                    _ = body.printSegment(.{ .text = name, .style = .{} }, .{ .row_offset = list_row });
+                }
                 list_row += 1;
             }
             var list_ml_buf: [2048]u8 = undefined;
-            const list_ml = std.fmt.bufPrint(&list_ml_buf, "Buffers ({d}/{d})   (Enter/f switches, n/p move, q closes)", .{
+            const list_ml = if (isearch_active) blk: {
+                const label = if (isearch_failed)
+                    (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")
+                else
+                    (if (isearch_dir == .backward) "I-search backward" else "I-search");
+                break :blk std.fmt.bufPrint(&list_ml_buf, "{s}: {s}", .{ label, isearch_query.items }) catch label;
+            } else std.fmt.bufPrint(&list_ml_buf, "Buffers ({d}/{d})   (C-s searches, Enter/f switches, n/p move, q closes)", .{
                 buffer_list_selected + 1,
                 buffers.items.len,
             }) catch "Buffers";

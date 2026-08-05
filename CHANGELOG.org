@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.20.0 — <2026-08-05>
+
+isearch in the pickers.
+
+- The buffer picker (=C-x b=) and the bookmark picker (=C-x r l= / =C-c o=) now support incremental search, like isearch in a dired: =C-s= / =C-r= starts it, typing extends the query and the selection jumps to the first match, =C-s= / =C-r= step through the matches (wrapping around the list), Backspace shrinks the query (restoring the original selection when it empties), Enter / =C-j= / =C-m= / Escape confirms with the match still selected — so the picker's own Enter then jumps or switches to it — and =C-g= cancels back to where the search started. The matched part of the row is highlighted in reverse video, the modeline shows the same =I-search: ...= / =Failing I-search= prompt as a buffer search, and the search runs over a bookmark's name or a buffer's display name (falling back to its file path).
+
 ** 0.19.0 — <2026-08-05>
 
 =C-m= opens a dired entry.
