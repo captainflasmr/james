@@ -40,7 +40,7 @@ Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes 
 | =C-a= / =C-e= | start / end of line |
 | =C-l= | recenter the window on the cursor line (middle, then top, then bottom, cycling) |
 | =C-d= / Delete | delete forward |
-| Backspace | delete backward |
+| Backspace | delete backward (or the region, when the mark is set) |
 | Enter / =C-j= | new line |
 | =C-space= | set mark |
 | =C-k= | kill to end of line (or kill the newline, at end of line) |

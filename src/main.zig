@@ -3144,7 +3144,19 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.delete, .{})) {
                         try buf.deleteForward(gpa);
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
-                        try buf.deleteBackward(gpa);
+                        // With a mark set, Backspace deletes the whole
+                        // region (Emacs delete-active-region) — killRegion
+                        // saves it to the kill ring (so C-y gets it back)
+                        // and clears the mark, like C-x C-k. Without a mark
+                        // it deletes one char backward as before. Direds are
+                        // read-only, so the region path is editing-only.
+                        if (editing and buf.mark != null) {
+                            try buf.killRegion(gpa, &kill_ring, was_kill);
+                            syncClipboard(&vx, &tty, gpa, kill_ring.current() orelse "");
+                            kill_active = true;
+                        } else {
+                            try buf.deleteBackward(gpa);
+                        }
                     } else if (key.matches(';', .{ .alt = true }) or key.matches('m', .{ .alt = true })) {
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         if (root.leafCount() < MAX_PANES) {
