@@ -3025,9 +3025,10 @@ pub fn main(init: std.process.Init) !void {
                                     confirming_open = true;
                                 }
                             }
-                        } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('f', .{})) {
-                            // Enter / C-j, or "f" (the dirlst-find-file key from
-                            // the Jasspa setup): open the selected entry.
+                        } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches('f', .{})) {
+                            // Enter / C-j / C-m, or "f" (the dirlst-find-file
+                            // key from the Jasspa setup): open the selected
+                            // entry.
                             const choice = d.choose(gpa) catch Dired.Choice.none;
                             switch (choice) {
                                 .none => {},

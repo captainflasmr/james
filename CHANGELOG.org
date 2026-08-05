@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.19.0 — <2026-08-05>
+
+=C-m= opens a dired entry.
+
+- =C-m= now opens the selected dired entry (or descends into a directory), like Enter — the dired branch of the key dispatch was the one confirm spot that still lacked the =C-m= alias, so terminals that report Return as =C-m= through the kitty keyboard protocol (and the Windows console, which always sends =C-m= for Enter) could not open a file in dired. =C-m= now confirms everywhere Enter does, as the 0.13.0 release notes already claimed.
+
 ** 0.18.0 — <2026-08-05>
 
 =C-x k= kills the current buffer.
