@@ -1,10 +1,10 @@
-* TODO james roadmap [18/23]
+* TODO james roadmap [19/23]
+** DONE directory listing in windows dired can be a bit slow to load
+** TODO add balance-windows and bind to C-x +
 ** TODO word should wrap over line
-** DONE show line numbers
-** TODO see the full mark including cursor
 ** TODO show current keybindings in a new buffer
-** TODO directory listing in windows dired can be a bit slow to load
 ** TODO C-c j/k a bit flaky, maybe losing the cursor
+** DONE M-g to goto line
 ** DONE resize windows with C-M-h/j/k/l
 ** DONE soft wrap on and off
 ** DONE toggle dired details on and off

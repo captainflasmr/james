@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.36.0 — <2026-08-05>
+
+Faster dired listings on Windows.
+
+- Opening a directory on Windows no longer opens a file handle for every entry: the directory enumeration's own records carry the size, modification time, and attributes, but the standard library's iterator discards them — so the per-entry stat went through a =CreateFileW= / =CloseHandle= pair, which made large listings (and network drives) noticeably slow to appear. Dired now enumerates with the Win32 =FindFirstFileW= / =FindNextFileW= API directly on Windows and builds each entry from the record, with the metadata formatted exactly as before (the read-only attribute still drives the =r/w= permission column). POSIX listings are unchanged, since =readdir= carries no stat data.
+
 ** 0.35.0 — <2026-08-05>
 
 =M-g= goes to a line.

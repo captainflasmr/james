@@ -137,21 +137,101 @@ fn reload(self: *Dired, gpa: std.mem.Allocator, io: std.Io) !void {
     var dir = try std.Io.Dir.cwd().openDir(io, self.path.items, .{ .iterate = true });
     defer dir.close(io);
 
+    if (comptime builtin.os.tag == .windows) {
+        // The Windows iterator's records already carry the size, the
+        // modification time and the attributes — but std discards them,
+        // so a per-entry stat would open a handle for every file (a
+        // CreateFileW per entry, which makes large listings noticeably
+        // slow). Enumerate with the Win32 Find* API instead.
+        try self.loadWindowsEntries(gpa, io, dir);
+    } else {
+        if (try parentOf(gpa, self.path.items)) |parent| {
+            gpa.free(parent);
+            try self.entries.append(gpa, try makeEntry(gpa, io, dir, "..", .directory));
+        }
+
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            switch (entry.kind) {
+                .directory, .file, .sym_link => {},
+                else => continue,
+            }
+            try self.entries.append(gpa, try makeEntry(gpa, io, dir, entry.name, entry.kind));
+        }
+    }
+
+    std.mem.sort(Entry, self.entries.items, self.sort_mode, lessThan);
+}
+
+const win = std.os.windows;
+
+/// The Win32 directory-enumeration record, mirroring WIN32_FIND_DATAW.
+const Win32FindData = extern struct {
+    dwFileAttributes: win.DWORD,
+    ftCreationTime: win.FILETIME,
+    ftLastAccessTime: win.FILETIME,
+    ftLastWriteTime: win.FILETIME,
+    nFileSizeHigh: win.DWORD,
+    nFileSizeLow: win.DWORD,
+    dwReserved0: win.DWORD,
+    dwReserved1: win.DWORD,
+    cFileName: [260]u16,
+    cAlternateFileName: [14]u16,
+};
+
+extern "kernel32" fn FindFirstFileW(lpFileName: [*:0]const u16, lpFindFileData: *Win32FindData) callconv(.winapi) win.HANDLE;
+extern "kernel32" fn FindNextFileW(hFindFile: win.HANDLE, lpFindFileData: *Win32FindData) callconv(.winapi) win.BOOL;
+extern "kernel32" fn FindClose(hFindFile: win.HANDLE) callconv(.winapi) win.BOOL;
+
+/// A FILETIME (100ns ticks since 1601-01-01) as Unix nanoseconds.
+fn filetimeNanos(ft: win.FILETIME) i64 {
+    const raw: u64 = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    return (@as(i64, @intCast(raw)) - 116444736000000000) * 100;
+}
+
+/// Windows listing: the ".." entry like reload, then the Find* sweep —
+/// each record's size, mtime and attributes build the entry directly,
+/// no per-file handle opens.
+fn loadWindowsEntries(self: *Dired, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !void {
     if (try parentOf(gpa, self.path.items)) |parent| {
         gpa.free(parent);
         try self.entries.append(gpa, try makeEntry(gpa, io, dir, "..", .directory));
     }
 
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        switch (entry.kind) {
-            .directory, .file, .sym_link => {},
-            else => continue,
-        }
-        try self.entries.append(gpa, try makeEntry(gpa, io, dir, entry.name, entry.kind));
-    }
+    var wild: std.ArrayList(u16) = .empty;
+    defer wild.deinit(gpa);
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(gpa, self.path.items) catch return;
+    defer gpa.free(wide);
+    try wild.appendSlice(gpa, wide[0 .. wide.len - 1]);
+    try wild.appendSlice(gpa, &[_]u16{ '\\', '*' });
+    try wild.append(gpa, 0);
 
-    std.mem.sort(Entry, self.entries.items, self.sort_mode, lessThan);
+    var data: Win32FindData = undefined;
+    const wild_z: [:0]const u16 = wild.items[0 .. wild.items.len - 1 :0];
+    const h = FindFirstFileW(wild_z.ptr, &data);
+    if (h == win.INVALID_HANDLE_VALUE) return;
+    defer _ = FindClose(h);
+    while (true) {
+        try self.entries.append(gpa, try makeEntryFromFindData(gpa, &data));
+        if (FindNextFileW(h, &data) == .FALSE) return;
+    }
+}
+
+fn makeEntryFromFindData(gpa: std.mem.Allocator, data: *const Win32FindData) !Entry {
+    const name_len = std.mem.indexOfScalar(u16, &data.cFileName, 0) orelse data.cFileName.len;
+    const name = std.unicode.utf16LeToUtf8Alloc(gpa, data.cFileName[0..name_len]) catch return error.OutOfMemory;
+    const attrs: win.FILE.ATTRIBUTE = @bitCast(data.dwFileAttributes);
+    var e: Entry = .{
+        .name = name,
+        .is_dir = attrs.DIRECTORY,
+        .is_link = attrs.REPARSE_POINT,
+        .size = (@as(u64, data.nFileSizeHigh) << 32) | data.nFileSizeLow,
+        .mtime = filetimeNanos(data.ftLastWriteTime),
+    };
+    errdefer gpa.free(e.name);
+    errdefer gpa.free(e.meta);
+    e.meta = try formatMeta(gpa, e, @enumFromInt(data.dwFileAttributes), e.size, .{ .nanoseconds = e.mtime });
+    return e;
 }
 
 /// Build one entry: the name plus an ls -al style metadata prefix. A file
@@ -179,19 +259,19 @@ fn makeEntry(
     };
     e.size = stat.size;
     e.mtime = @intCast(stat.mtime.nanoseconds);
-    e.meta = try formatMeta(gpa, e, stat);
+    e.meta = try formatMeta(gpa, e, stat.permissions, stat.size, stat.mtime);
     return e;
 }
 
 /// "drwxr-xr-x  1234 2026-08-02 14:30 " for a POSIX stat; on Windows the
 /// permission bits don't exist, so the nine permission characters become
 /// "r/w" for writability and "-" elsewhere.
-fn formatMeta(gpa: std.mem.Allocator, e: Entry, stat: std.Io.File.Stat) ![]u8 {
+fn formatMeta(gpa: std.mem.Allocator, e: Entry, perms: std.Io.File.Permissions, size: u64, mtime: std.Io.Timestamp) ![]u8 {
     var perms_buf: [10]u8 = undefined;
-    permString(&perms_buf, e, stat.permissions);
+    permString(&perms_buf, e, perms);
     var date_buf: [19]u8 = undefined;
-    dateString(&date_buf, stat.mtime);
-    return std.fmt.allocPrint(gpa, "{s} {d:>8} {s} ", .{ perms_buf, stat.size, date_buf });
+    dateString(&date_buf, mtime);
+    return std.fmt.allocPrint(gpa, "{s} {d:>8} {s} ", .{ perms_buf, size, date_buf });
 }
 
 fn permString(buf: *[10]u8, e: Entry, perms: std.Io.File.Permissions) void {
