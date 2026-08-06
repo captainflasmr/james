@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.39.0 — <2026-08-06>
+
+=M-l l= picks a recently opened file.
+
+- The files opened in james are remembered, newest first, in =~/.james-recent= (forty at most, =%USERPROFILE%\.james-recent= on Windows) — the same shape as the author's Emacs =my/fido-recentf= — and =M-l l= opens the fuzzy picker over them: type to narrow, arrows / =C-n= / =C-p= move, Enter opens, Backspace shortens the filter, =C-g= clears then closes, =q= closes. A repeat open of the same file doesn't duplicate it; directories are not remembered. The picker machinery behind it is now shared: the buffer list (=C-x b=), the bookmark list (=C-x r l= / =C-c o= / =M-l o=) and the recent files are one picker over three row sources, so the three lists behave identically (filtering, isearch over the filtered rows, and the =Buffers / Bookmarks / Recent files= modelines).
+
 ** 0.38.0 — <2026-08-06>
 
 The pickers filter as you type.

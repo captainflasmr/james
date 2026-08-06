@@ -1663,9 +1663,10 @@ const welcome_tail =
     \\    M-l g               the config directory
     \\    M-l i               the Emacs-vanilla config
     \\    M-l y               the Emacs-DIYer config
-    \\    M-l r               the scratch buffer
-    \\    M-l o               the bookmark list
-    \\    M-l = / M-l -       new / close tab
+    \\    M-l r             the scratch buffer
+    \\    M-l o             the bookmark list
+    \\    M-l l             pick a recently opened file
+    \\    M-l = / M-l -     new / close tab
     \\
     \\  Tabs and windows:
     \\
@@ -1738,7 +1739,7 @@ const welcome_tail =
     \\    W                   open externally
     \\    q / C-g             close the dired
     \\
-    \\  Pickers (buffers and bookmarks):
+    \\  Pickers (buffers, bookmarks and recent files):
     \\
     \\    type              filter the list (fuzzy, as you type)
     \\    arrows / C-n/C-p  move the selection
@@ -1812,6 +1813,7 @@ fn openBufferOrDired(
     io: std.Io,
     buffers: *std.ArrayList(*Buffer),
     direds: *std.ArrayList(?Dired),
+    recent: *std.ArrayList([]u8),
     path: []const u8,
 ) !usize {
     for (buffers.items, 0..) |b, idx| {
@@ -1855,6 +1857,9 @@ fn openBufferOrDired(
     new_buf.* = try Buffer.loadFile(gpa, io, path);
     try buffers.append(gpa, new_buf);
     try direds.append(gpa, null);
+    // A freshly opened file joins the recent-files list (M-l l), like
+    // Emacs recentf — directories are not remembered.
+    recordRecent(gpa, recent, path);
     return buffers.items.len - 1;
 }
 
@@ -1940,6 +1945,28 @@ fn syncDiredSelection(direds: []?Dired, current: usize, buf: *Buffer) void {
     if (direds[current]) |*d| d.selected = buf.cursor_row;
 }
 
+/// The row source of the modal picker: the open buffers (C-x b), the
+/// bookmark list (C-x r l / C-c o / M-l o), or the recent files (M-l l).
+const PickerKind = enum { buffers, bookmarks, recent };
+
+/// The number of rows in a picker of `kind`.
+fn pickerRowCount(kind: PickerKind, buffers: []*Buffer, bookmarks: []const Bookmark, recent: []const []const u8) usize {
+    return switch (kind) {
+        .buffers => buffers.len,
+        .bookmarks => bookmarks.len,
+        .recent => recent.len,
+    };
+}
+
+/// The display name of picker row `idx` (a full-list index).
+fn pickerRowName(kind: PickerKind, buffers: []*Buffer, bookmarks: []const Bookmark, recent: []const []const u8, idx: usize) []const u8 {
+    return switch (kind) {
+        .buffers => buffers[idx].display_name orelse buffers[idx].filename orelse "?",
+        .bookmarks => bookmarks[idx].name,
+        .recent => std.fs.path.basename(recent[idx]),
+    };
+}
+
 /// List-isearch find: search the buffer-picker or bookmark-picker rows
 /// for `query`, starting at `from_row` (inclusive) and wrapping around
 /// the list — the row-granular twin of Buffer.findNext. `visible` maps
@@ -1948,24 +1975,22 @@ fn syncDiredSelection(direds: []?Dired, current: usize, buf: *Buffer) void {
 /// Returns the matched row and the byte offset of the match in that row's
 /// text.
 fn pickerFindNext(
+    kind: PickerKind,
     buffers: []*Buffer,
     bookmarks: []const Bookmark,
-    in_bookmarks: bool,
+    recent: []const []const u8,
     visible: ?[]const usize,
     query: []const u8,
     from_row: usize,
     forward: bool,
 ) ?Buffer.Pos {
-    const count = if (visible) |v| v.len else (if (in_bookmarks) bookmarks.len else buffers.len);
+    const count = if (visible) |v| v.len else pickerRowCount(kind, buffers, bookmarks, recent);
     if (count == 0 or query.len == 0) return null;
     var i = from_row % count;
     var n: usize = 0;
     while (n < count) : (n += 1) {
         const full = if (visible) |v| v[i] else i;
-        const row_text = if (in_bookmarks)
-            bookmarks[full].name
-        else
-            (buffers[full].display_name orelse buffers[full].filename orelse "?");
+        const row_text = pickerRowName(kind, buffers, bookmarks, recent, full);
         if (std.ascii.indexOfIgnoreCase(row_text, query)) |col| return .{ .row = full, .col = col };
         i = if (forward) (i + 1) % count else (i + count - 1) % count;
     }
@@ -2017,9 +2042,9 @@ const PickerMatch = struct {
 /// Rebuild the picker's visible rows for `query`: the full-list indices
 /// of every entry whose name fuzzy-matches, best matches first; the whole
 /// list in its original order for an empty query.
-fn pickerFilter(gpa: std.mem.Allocator, buffers: []*Buffer, bookmarks: []const Bookmark, in_bookmarks: bool, query: []const u8, visible: *std.ArrayList(usize)) void {
+fn pickerFilter(gpa: std.mem.Allocator, kind: PickerKind, buffers: []*Buffer, bookmarks: []const Bookmark, recent: []const []const u8, query: []const u8, visible: *std.ArrayList(usize)) void {
     visible.clearRetainingCapacity();
-    const count = if (in_bookmarks) bookmarks.len else buffers.len;
+    const count = pickerRowCount(kind, buffers, bookmarks, recent);
     if (query.len == 0) {
         visible.ensureTotalCapacity(gpa, count) catch return;
         var i: usize = 0;
@@ -2030,10 +2055,7 @@ fn pickerFilter(gpa: std.mem.Allocator, buffers: []*Buffer, bookmarks: []const B
     defer matches.deinit(gpa);
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        const name = if (in_bookmarks)
-            bookmarks[i].name
-        else
-            (buffers[i].display_name orelse buffers[i].filename orelse "?");
+        const name = pickerRowName(kind, buffers, bookmarks, recent, i);
         if (fuzzyScore(query, name)) |s| matches.append(gpa, .{ .idx = i, .score = s }) catch return;
     }
     std.mem.sort(PickerMatch, matches.items, {}, PickerMatch.lessThan);
@@ -2043,9 +2065,9 @@ fn pickerFilter(gpa: std.mem.Allocator, buffers: []*Buffer, bookmarks: []const B
 /// Refilter a picker, keeping `selected` on its entry when it still
 /// shows; with no rows left it stays put (nothing opens), otherwise the
 /// top match is selected.
-fn filterPicker(gpa: std.mem.Allocator, buffers: []*Buffer, bookmarks: []const Bookmark, in_bookmarks: bool, query: []const u8, visible: *std.ArrayList(usize), selected: *usize) void {
+fn filterPicker(gpa: std.mem.Allocator, kind: PickerKind, buffers: []*Buffer, bookmarks: []const Bookmark, recent: []const []const u8, query: []const u8, visible: *std.ArrayList(usize), selected: *usize) void {
     const before = selected.*;
-    pickerFilter(gpa, buffers, bookmarks, in_bookmarks, query, visible);
+    pickerFilter(gpa, kind, buffers, bookmarks, recent, query, visible);
     if (visible.items.len == 0) return;
     if (std.mem.indexOfScalar(usize, visible.items, before) == null) selected.* = visible.items[0];
 }
@@ -2278,12 +2300,13 @@ fn bookmarkJump(
     io: std.Io,
     buffers: *std.ArrayList(*Buffer),
     direds: *std.ArrayList(?Dired),
+    recent: *std.ArrayList([]u8),
     bookmarks: []const Bookmark,
     name: []const u8,
 ) ?usize {
     for (bookmarks) |b| {
         if (std.mem.eql(u8, b.name, name)) {
-            const idx = openBufferOrDired(gpa, io, buffers, direds, b.path) catch return null;
+            const idx = openBufferOrDired(gpa, io, buffers, direds, recent, b.path) catch return null;
             const tgt = buffers.items[idx];
             if (direds.items[idx]) |*d| {
                 d.selected = @min(b.row, d.entries.items.len -| 1);
@@ -2371,6 +2394,79 @@ fn loadBookmarks(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Envir
     }
 }
 
+/// The recent-files list (M-l l, mirroring the author's Emacs
+/// my/fido-recentf): the paths of files opened in james, newest first,
+/// capped at RECENT_MAX. Persisted one path per line to
+/// <home>/.james-recent.
+const RECENT_MAX = 40;
+
+/// <home>/.james-recent (see bookmarksFilePath for the home lookup).
+/// Caller frees the returned path.
+fn recentFilePath(gpa: std.mem.Allocator, env_map: *std.process.Environ.Map) ?[]u8 {
+    const home_raw = jumpHome(env_map) orelse return null;
+    return std.fs.path.join(gpa, &.{ home_raw, ".james-recent" }) catch null;
+}
+
+/// Record `path` as a recently opened file: moved to the front (a repeat
+/// open doesn't add a duplicate) and capped at RECENT_MAX. The list is
+/// persisted on quit (see saveRecent).
+fn recordRecent(gpa: std.mem.Allocator, recent: *std.ArrayList([]u8), path: []const u8) void {
+    if (path.len == 0) return;
+    for (recent.items, 0..) |r, i| {
+        if (std.mem.eql(u8, r, path)) {
+            gpa.free(recent.orderedRemove(i));
+            break;
+        }
+    }
+    const copy = gpa.dupe(u8, path) catch return;
+    recent.insert(gpa, 0, copy) catch {
+        gpa.free(copy);
+        return;
+    };
+    while (recent.items.len > RECENT_MAX) {
+        gpa.free(recent.pop().?);
+    }
+}
+
+/// Persist the recent-files list to the recent file (see recentFilePath).
+fn saveRecent(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map, recent: *const std.ArrayList([]u8)) void {
+    const path = recentFilePath(gpa, env_map) orelse return;
+    defer gpa.free(path);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    for (recent.items) |r| {
+        out.appendSlice(gpa, r) catch return;
+        out.append(gpa, '\n') catch return;
+    }
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items }) catch {};
+}
+
+/// Load the recent-files list from the recent file, if it exists (see
+/// recentFilePath). Duplicates in a hand-edited file are dropped.
+fn loadRecent(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map, recent: *std.ArrayList([]u8)) void {
+    const path = recentFilePath(gpa, env_map) orelse return;
+    defer gpa.free(path);
+
+    const contents = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch return;
+    defer gpa.free(contents);
+
+    var it = std.mem.splitScalar(u8, contents, '\n');
+    while (it.next()) |line| {
+        const p = std.mem.trim(u8, line, " \t\r");
+        if (p.len == 0 or recent.items.len >= RECENT_MAX) continue;
+        var seen = false;
+        for (recent.items) |r| {
+            if (std.mem.eql(u8, r, p)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        recent.append(gpa, gpa.dupe(u8, p) catch continue) catch continue;
+    }
+}
+
 /// The user's home directory the way the my-jump-keymap elisp sees it:
 /// $USERPROFILE on Windows (the elisp's `~` expands there; its explicit
 /// `(getenv "USERPROFILE")` check is the same lookup), $HOME elsewhere.
@@ -2404,6 +2500,7 @@ fn jumpOpen(
     path: []const u8,
     buffers: *std.ArrayList(*Buffer),
     direds: *std.ArrayList(?Dired),
+    recent: *std.ArrayList([]u8),
     root: *Pane,
     focused: *Pane,
     current: usize,
@@ -2412,7 +2509,7 @@ fn jumpOpen(
     status_msg: *?[]const u8,
 ) usize {
     recordWindow(gpa, root, focused, current, undo, redo);
-    const idx = openBufferOrDired(gpa, io, buffers, direds, path) catch {
+    const idx = openBufferOrDired(gpa, io, buffers, direds, recent, path) catch {
         status_msg.* = "No such file or directory";
         return current;
     };
@@ -2469,8 +2566,19 @@ pub fn main(init: std.process.Init) !void {
         }
         direds.deinit(gpa);
     }
+
+    // Recent files (M-l l, my/fido-recentf): the paths of files opened in
+    // james, newest first, persisted to <home>/.james-recent on quit.
+    var recent: std.ArrayList([]u8) = .empty;
+    defer {
+        for (recent.items) |r| gpa.free(r);
+        recent.deinit(gpa);
+    }
+    defer saveRecent(gpa, io, init.environ_map, &recent);
+    loadRecent(gpa, io, init.environ_map, &recent);
+
     while (args_it.next()) |arg| {
-        _ = try openBufferOrDired(gpa, io, &buffers, &direds, arg);
+        _ = try openBufferOrDired(gpa, io, &buffers, &direds, &recent, arg);
     }
     var current: usize = 0;
     // Index of the cwd dired in the default no-files layout; null when
@@ -2490,8 +2598,8 @@ pub fn main(init: std.process.Init) !void {
         // prompts like any other file.
         if (std.Io.Dir.cwd().createFile(io, "scratch.txt", .{ .truncate = false })) |f| {
             f.close(io);
-            const scratch_idx = try openBufferOrDired(gpa, io, &buffers, &direds, "scratch.txt");
-            default_dired_idx = try openBufferOrDired(gpa, io, &buffers, &direds, ".");
+            const scratch_idx = try openBufferOrDired(gpa, io, &buffers, &direds, &recent, "scratch.txt");
+            default_dired_idx = try openBufferOrDired(gpa, io, &buffers, &direds, &recent, ".");
             current = scratch_idx;
         } else |_| {
             // A read-only cwd falls back to the plain single-window home
@@ -2680,22 +2788,15 @@ pub fn main(init: std.process.Init) !void {
     var goto_prompt = false;
     var goto_query: std.ArrayList(u8) = .empty;
     defer goto_query.deinit(gpa);
-    var bookmark_list_active = false;
-    var bookmark_list_selected: usize = 0;
-    var bookmark_list_top: usize = 0;
-
-    // Buffer-list picker (C-x b): a modal list of every open buffer, the
-    // same shape as the bookmark picker — n/p move, Enter switches, q
-    // closes. C-x C-f keeps the type-a-name prompt instead.
-    var buffer_list_active = false;
-    var buffer_list_selected: usize = 0;
-    var buffer_list_top: usize = 0;
-
-    // Type-to-filter for both pickers: the typed text narrows the list
-    // (fuzzy match, best rows first) instead of just moving the selection.
-    // `picker_visible` holds the full-list indices of the rows shown, and
-    // the *_selected vars stay full-list indices into it. C-g clears the
-    // filter before closing the picker.
+    // The modal picker (C-x b buffers, C-x r l / C-c o / M-l o bookmarks,
+    // M-l l recent files): one at a time, over rows that filter as you
+    // type (see pickerFilter). `picker_kind` selects the row source;
+    // `picker_selected` is the full-list index of the selection and
+    // `picker_top` the first visible row, both positions in the filtered
+    // `picker_visible` list. C-g clears the filter before closing.
+    var picker_kind: ?PickerKind = null;
+    var picker_selected: usize = 0;
+    var picker_top: usize = 0;
     var picker_query: std.ArrayList(u8) = .empty;
     defer picker_query.deinit(gpa);
     var picker_visible: std.ArrayList(usize) = .empty;
@@ -2850,11 +2951,11 @@ pub fn main(init: std.process.Init) !void {
                         // C-c o: open the bookmark picker (the "favorites"
                         // key from the Jasspa setup — bookmarks are this
                         // editor's favourites).
-                        bookmark_list_active = true;
-                        bookmark_list_selected = 0;
-                        bookmark_list_top = 0;
+                        picker_kind = .bookmarks;
+                        picker_selected = 0;
+                        picker_top = 0;
                         picker_query.clearRetainingCapacity();
-                        pickerFilter(gpa, buffers.items, bookmarks.items, true, "", &picker_visible);
+                        pickerFilter(gpa, .bookmarks, buffers.items, bookmarks.items, recent.items, "", &picker_visible);
                     } else if (key.matches('j', .{})) {
                         // C-c j: step back through window layouts
                         // (winner-mode undo).
@@ -2881,7 +2982,7 @@ pub fn main(init: std.process.Init) !void {
                         const name = std.mem.trim(u8, switch_query.items, " ");
                         if (name.len > 0) {
                             recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                            current = openBufferOrDired(gpa, io, &buffers, &direds, name) catch current;
+                            current = openBufferOrDired(gpa, io, &buffers, &direds, &recent, name) catch current;
                             focused.buf_idx = current;
                             kill_active = false;
                         }
@@ -2903,7 +3004,7 @@ pub fn main(init: std.process.Init) !void {
                                 bookmarkSet(gpa, &bookmarks, name, buf);
                                 saveBookmarks(gpa, io, init.environ_map, &bookmarks);
                             },
-                            .jump => if (bookmarkJump(gpa, io, &buffers, &direds, bookmarks.items, name)) |idx| {
+                            .jump => if (bookmarkJump(gpa, io, &buffers, &direds, &recent, bookmarks.items, name)) |idx| {
                                 recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                                 current = idx;
                                 focused.buf_idx = idx;
@@ -3087,18 +3188,16 @@ pub fn main(init: std.process.Init) !void {
                     }
                     // Any other key is ignored while confirming.
                 } else if (isearch_active) {
-                    if (bookmark_list_active or buffer_list_active) {
-                        // List isearch — the buffer and bookmark pickers:
-                        // the selection stands in for the cursor, and the
-                        // search runs over the rows (row-granular, like
-                        // isearch in a dired) — the visible rows when a
-                        // filter is active. Confirming leaves the match
+                    if (picker_kind) |kind| {
+                        // List isearch — the buffer, bookmark and recent
+                        // pickers: the selection stands in for the cursor,
+                        // and the search runs over the rows (row-granular,
+                        // like isearch in a dired) — the visible rows when
+                        // a filter is active. Confirming leaves the match
                         // selected, so the picker's Enter then opens it.
                         const vis = picker_visible.items;
                         if (key.matches('g', .{ .ctrl = true })) {
-                            if (vis.len > 0) {
-                                if (bookmark_list_active) bookmark_list_selected = vis[isearch_origin.row % vis.len] else buffer_list_selected = vis[isearch_origin.row % vis.len];
-                            }
+                            if (vis.len > 0) picker_selected = vis[isearch_origin.row % vis.len];
                             isearch_active = false;
                             isearch_match = null;
                             isearch_query.clearRetainingCapacity();
@@ -3106,10 +3205,10 @@ pub fn main(init: std.process.Init) !void {
                             isearch_dir = .forward;
                             if (isearch_query.items.len > 0) {
                                 const from = if (isearch_match) |m| pickerSelectionPos(vis, m.row) + 1 else isearch_origin.row;
-                                if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, vis, isearch_query.items, from, true)) |m| {
+                                if (pickerFindNext(kind, buffers.items, bookmarks.items, recent.items, vis, isearch_query.items, from, true)) |m| {
                                     isearch_match = m;
                                     isearch_failed = false;
-                                    if (bookmark_list_active) bookmark_list_selected = m.row else buffer_list_selected = m.row;
+                                    picker_selected = m.row;
                                 } else {
                                     isearch_failed = true;
                                 }
@@ -3118,10 +3217,10 @@ pub fn main(init: std.process.Init) !void {
                             isearch_dir = .backward;
                             if (isearch_query.items.len > 0 and vis.len > 0) {
                                 const from = if (isearch_match) |m| (pickerSelectionPos(vis, m.row) + vis.len - 1) % vis.len else isearch_origin.row;
-                                if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, vis, isearch_query.items, from, false)) |m| {
+                                if (pickerFindNext(kind, buffers.items, bookmarks.items, recent.items, vis, isearch_query.items, from, false)) |m| {
                                     isearch_match = m;
                                     isearch_failed = false;
-                                    if (bookmark_list_active) bookmark_list_selected = m.row else buffer_list_selected = m.row;
+                                    picker_selected = m.row;
                                 } else {
                                     isearch_failed = true;
                                 }
@@ -3129,15 +3228,13 @@ pub fn main(init: std.process.Init) !void {
                         } else if (key.matches(vaxis.Key.backspace, .{})) {
                             if (isearch_query.items.len > 0) _ = isearch_query.pop();
                             if (isearch_query.items.len == 0) {
-                                if (vis.len > 0) {
-                                    if (bookmark_list_active) bookmark_list_selected = vis[isearch_origin.row % vis.len] else buffer_list_selected = vis[isearch_origin.row % vis.len];
-                                }
+                                if (vis.len > 0) picker_selected = vis[isearch_origin.row % vis.len];
                                 isearch_match = null;
                                 isearch_failed = false;
-                            } else if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, vis, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
+                            } else if (pickerFindNext(kind, buffers.items, bookmarks.items, recent.items, vis, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
                                 isearch_match = m;
                                 isearch_failed = false;
-                                if (bookmark_list_active) bookmark_list_selected = m.row else buffer_list_selected = m.row;
+                                picker_selected = m.row;
                             } else {
                                 isearch_failed = true;
                             }
@@ -3147,10 +3244,10 @@ pub fn main(init: std.process.Init) !void {
                             isearch_active = false;
                         } else if (key.text) |t| {
                             try isearch_query.appendSlice(gpa, t);
-                            if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, vis, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
+                            if (pickerFindNext(kind, buffers.items, bookmarks.items, recent.items, vis, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
                                 isearch_match = m;
                                 isearch_failed = false;
-                                if (bookmark_list_active) bookmark_list_selected = m.row else buffer_list_selected = m.row;
+                                picker_selected = m.row;
                             } else {
                                 isearch_failed = true;
                             }
@@ -3232,58 +3329,77 @@ pub fn main(init: std.process.Init) !void {
                             isearch_active = false;
                         }
                     }
-                } else if (bookmark_list_active) {
+                } else if (picker_kind) |kind| {
                     if (key.matches('g', .{ .ctrl = true })) {
                         // C-g: clear the filter first; a second C-g (or q)
                         // closes the picker.
                         if (picker_query.items.len > 0) {
                             picker_query.clearRetainingCapacity();
-                            filterPicker(gpa, buffers.items, bookmarks.items, true, picker_query.items, &picker_visible, &bookmark_list_selected);
+                            filterPicker(gpa, kind, buffers.items, bookmarks.items, recent.items, picker_query.items, &picker_visible, &picker_selected);
                         } else {
-                            bookmark_list_active = false;
+                            picker_kind = null;
                         }
                     } else if (key.matches('q', .{})) {
-                        bookmark_list_active = false;
+                        picker_kind = null;
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
                         // Backspace shortens the filter; at the empty query
                         // it's a no-op (C-g closes).
                         if (picker_query.items.len > 0) {
                             _ = picker_query.pop();
-                            filterPicker(gpa, buffers.items, bookmarks.items, true, picker_query.items, &picker_visible, &bookmark_list_selected);
+                            filterPicker(gpa, kind, buffers.items, bookmarks.items, recent.items, picker_query.items, &picker_visible, &picker_selected);
                         }
                     } else if (key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
-                        const pos = pickerSelectionPos(picker_visible.items, bookmark_list_selected);
-                        if (pos + 1 < picker_visible.items.len) bookmark_list_selected = picker_visible.items[pos + 1];
+                        const pos = pickerSelectionPos(picker_visible.items, picker_selected);
+                        if (pos + 1 < picker_visible.items.len) picker_selected = picker_visible.items[pos + 1];
                     } else if (key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
-                        const pos = pickerSelectionPos(picker_visible.items, bookmark_list_selected);
-                        if (pos > 0) bookmark_list_selected = picker_visible.items[pos - 1];
+                        const pos = pickerSelectionPos(picker_visible.items, picker_selected);
+                        if (pos > 0) picker_selected = picker_visible.items[pos - 1];
                     } else if (key.matches('s', .{ .ctrl = true })) {
                         // C-s / C-r: incremental search over the rows (the
                         // selection follows the match), like isearch in a
                         // dired — over the filtered rows when one is active.
                         isearch_active = true;
                         isearch_dir = .forward;
-                        isearch_origin = .{ .row = pickerSelectionPos(picker_visible.items, bookmark_list_selected), .col = 0 };
+                        isearch_origin = .{ .row = pickerSelectionPos(picker_visible.items, picker_selected), .col = 0 };
                         isearch_match = null;
                         isearch_failed = false;
                         isearch_query.clearRetainingCapacity();
                     } else if (key.matches('r', .{ .ctrl = true })) {
                         isearch_active = true;
                         isearch_dir = .backward;
-                        isearch_origin = .{ .row = pickerSelectionPos(picker_visible.items, bookmark_list_selected), .col = 0 };
+                        isearch_origin = .{ .row = pickerSelectionPos(picker_visible.items, picker_selected), .col = 0 };
                         isearch_match = null;
                         isearch_failed = false;
                         isearch_query.clearRetainingCapacity();
                     } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
-                        // Enter / C-j: open the selected bookmark, jumping
-                        // to the recorded position.
-                        if (picker_visible.items.len > 0 and bookmark_list_selected < bookmarks.items.len) {
-                            const name = bookmarks.items[bookmark_list_selected].name;
-                            bookmark_list_active = false;
-                            if (bookmarkJump(gpa, io, &buffers, &direds, bookmarks.items, name)) |idx| {
-                                recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                                current = idx;
-                                focused.buf_idx = idx;
+                        // Enter / C-j: open the selection — switch to the
+                        // buffer, jump to the bookmark, or open the recent
+                        // file.
+                        const count = pickerRowCount(kind, buffers.items, bookmarks.items, recent.items);
+                        if (picker_visible.items.len > 0 and picker_selected < count) {
+                            picker_kind = null;
+                            switch (kind) {
+                                .buffers => {
+                                    recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                                    current = picker_selected;
+                                    focused.buf_idx = current;
+                                    kill_active = false;
+                                },
+                                .bookmarks => {
+                                    const name = bookmarks.items[picker_selected].name;
+                                    if (bookmarkJump(gpa, io, &buffers, &direds, &recent, bookmarks.items, name)) |idx| {
+                                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                                        current = idx;
+                                        focused.buf_idx = idx;
+                                    }
+                                },
+                                .recent => {
+                                    const path = recent.items[picker_selected];
+                                    recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                                    current = openBufferOrDired(gpa, io, &buffers, &direds, &recent, path) catch current;
+                                    focused.buf_idx = current;
+                                    kill_active = false;
+                                },
                             }
                         }
                     } else if (key.text) |t| {
@@ -3291,64 +3407,7 @@ pub fn main(init: std.process.Init) !void {
                         // the list (fuzzy, best rows first); arrows and C-n /
                         // C-p move the selection.
                         try picker_query.appendSlice(gpa, t);
-                        filterPicker(gpa, buffers.items, bookmarks.items, true, picker_query.items, &picker_visible, &bookmark_list_selected);
-                    }
-                } else if (buffer_list_active) {
-                    if (key.matches('g', .{ .ctrl = true })) {
-                        // C-g: clear the filter first; a second C-g (or q)
-                        // closes the picker.
-                        if (picker_query.items.len > 0) {
-                            picker_query.clearRetainingCapacity();
-                            filterPicker(gpa, buffers.items, bookmarks.items, false, picker_query.items, &picker_visible, &buffer_list_selected);
-                        } else {
-                            buffer_list_active = false;
-                        }
-                    } else if (key.matches('q', .{})) {
-                        buffer_list_active = false;
-                    } else if (key.matches(vaxis.Key.backspace, .{})) {
-                        // Backspace shortens the filter; at the empty query
-                        // it's a no-op (C-g closes).
-                        if (picker_query.items.len > 0) {
-                            _ = picker_query.pop();
-                            filterPicker(gpa, buffers.items, bookmarks.items, false, picker_query.items, &picker_visible, &buffer_list_selected);
-                        }
-                    } else if (key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
-                        const pos = pickerSelectionPos(picker_visible.items, buffer_list_selected);
-                        if (pos + 1 < picker_visible.items.len) buffer_list_selected = picker_visible.items[pos + 1];
-                    } else if (key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
-                        const pos = pickerSelectionPos(picker_visible.items, buffer_list_selected);
-                        if (pos > 0) buffer_list_selected = picker_visible.items[pos - 1];
-                    } else if (key.matches('s', .{ .ctrl = true })) {
-                        // C-s / C-r: incremental search over the rows (the
-                        // selection follows the match), like isearch in a
-                        // dired — over the filtered rows when one is active.
-                        isearch_active = true;
-                        isearch_dir = .forward;
-                        isearch_origin = .{ .row = pickerSelectionPos(picker_visible.items, buffer_list_selected), .col = 0 };
-                        isearch_match = null;
-                        isearch_failed = false;
-                        isearch_query.clearRetainingCapacity();
-                    } else if (key.matches('r', .{ .ctrl = true })) {
-                        isearch_active = true;
-                        isearch_dir = .backward;
-                        isearch_origin = .{ .row = pickerSelectionPos(picker_visible.items, buffer_list_selected), .col = 0 };
-                        isearch_match = null;
-                        isearch_failed = false;
-                        isearch_query.clearRetainingCapacity();
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
-                        if (picker_visible.items.len > 0 and buffer_list_selected < buffers.items.len) {
-                            buffer_list_active = false;
-                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                            current = buffer_list_selected;
-                            focused.buf_idx = current;
-                            kill_active = false;
-                        }
-                    } else if (key.text) |t| {
-                        // Type to filter: every letter (n/p included) narrows
-                        // the list (fuzzy, best rows first); arrows and C-n /
-                        // C-p move the selection.
-                        try picker_query.appendSlice(gpa, t);
-                        filterPicker(gpa, buffers.items, bookmarks.items, false, picker_query.items, &picker_visible, &buffer_list_selected);
+                        filterPicker(gpa, kind, buffers.items, bookmarks.items, recent.items, picker_query.items, &picker_visible, &picker_selected);
                     }
                 } else if (pending_ctrl_x) {
                     pending_ctrl_x = false;
@@ -3371,11 +3430,11 @@ pub fn main(init: std.process.Init) !void {
                         // C-x b: pick from a list of every open buffer, like
                         // the bookmark picker (real Emacs splits C-x b from
                         // C-x C-f too).
-                        buffer_list_active = true;
-                        buffer_list_selected = current;
-                        buffer_list_top = 0;
+                        picker_kind = .buffers;
+                        picker_selected = current;
+                        picker_top = 0;
                         picker_query.clearRetainingCapacity();
-                        pickerFilter(gpa, buffers.items, bookmarks.items, false, "", &picker_visible);
+                        pickerFilter(gpa, .buffers, buffers.items, bookmarks.items, recent.items, "", &picker_visible);
                     } else if (key.matches('k', .{})) {
                         // C-x k: kill the current buffer (Emacs kill-buffer).
                         // A modified file buffer asks first (y saves and
@@ -3418,7 +3477,7 @@ pub fn main(init: std.process.Init) !void {
                         // for the current file's directory.
                         const start = try Dired.startingDir(gpa, buf.filename orelse ".");
                         defer gpa.free(start);
-                        current = try openBufferOrDired(gpa, io, &buffers, &direds, start);
+                        current = try openBufferOrDired(gpa, io, &buffers, &direds, &recent, start);
                         focused.buf_idx = current;
                     } else if (key.matches('g', .{})) {
                         buf.reread(gpa, io) catch {};
@@ -3482,11 +3541,11 @@ pub fn main(init: std.process.Init) !void {
                         bookmark_prompt = .jump;
                         bookmark_query.clearRetainingCapacity();
                     } else if (key.matches('l', .{})) {
-                        bookmark_list_active = true;
-                        bookmark_list_selected = 0;
-                        bookmark_list_top = 0;
+                        picker_kind = .bookmarks;
+                        picker_selected = 0;
+                        picker_top = 0;
                         picker_query.clearRetainingCapacity();
-                        pickerFilter(gpa, buffers.items, bookmarks.items, true, "", &picker_visible);
+                        pickerFilter(gpa, .bookmarks, buffers.items, bookmarks.items, recent.items, "", &picker_visible);
                     }
                 } else if (pending_alt_l) {
                     // M-l: the my-jump keymap from the author's Emacs
@@ -3502,11 +3561,23 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('o', .{})) {
                         // M-l o: bookmark-jump — the bookmark picker
                         // (the C-x r l / C-c o favorites list).
-                        bookmark_list_active = true;
-                        bookmark_list_selected = 0;
-                        bookmark_list_top = 0;
+                        picker_kind = .bookmarks;
+                        picker_selected = 0;
+                        picker_top = 0;
                         picker_query.clearRetainingCapacity();
-                        pickerFilter(gpa, buffers.items, bookmarks.items, true, "", &picker_visible);
+                        pickerFilter(gpa, .bookmarks, buffers.items, bookmarks.items, recent.items, "", &picker_visible);
+                    } else if (key.matches('l', .{})) {
+                        // M-l l: pick a recently opened file (the
+                        // my/fido-recentf key from the author's Emacs).
+                        if (recent.items.len > 0) {
+                            picker_kind = .recent;
+                            picker_selected = 0;
+                            picker_top = 0;
+                            picker_query.clearRetainingCapacity();
+                            pickerFilter(gpa, .recent, buffers.items, bookmarks.items, recent.items, "", &picker_visible);
+                        } else {
+                            status_msg = "No recent files";
+                        }
                     } else if (key.matches('r', .{})) {
                         // M-l r: switch to the *scratch* buffer — the
                         // scratch.txt file the home-screen layout also
@@ -3526,7 +3597,7 @@ pub fn main(init: std.process.Init) !void {
                             focused.buf_idx = idx;
                         } else if (std.Io.Dir.cwd().createFile(io, "scratch.txt", .{ .truncate = false })) |f| {
                             f.close(io);
-                            if (openBufferOrDired(gpa, io, &buffers, &direds, "scratch.txt")) |idx| {
+                            if (openBufferOrDired(gpa, io, &buffers, &direds, &recent, "scratch.txt")) |idx| {
                                 recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                                 current = idx;
                                 focused.buf_idx = idx;
@@ -3541,13 +3612,13 @@ pub fn main(init: std.process.Init) !void {
                         // M-l h: the home directory (the elisp's `~`,
                         // USERPROFILE on Windows).
                         if (jumpHome(init.environ_map)) |home| {
-                            current = jumpOpen(gpa, io, home, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                            current = jumpOpen(gpa, io, home, &buffers, &direds, &recent, root, focused, current, &window_undo, &window_redo, &status_msg);
                         }
                     } else if (key.matches('b', .{})) {
                         // M-l b: ~/bin.
                         if (jumpHomePath(gpa, init.environ_map, &.{"bin"})) |p| {
                             defer gpa.free(p);
-                            current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                            current = jumpOpen(gpa, io, p, &buffers, &direds, &recent, root, focused, current, &window_undo, &window_redo, &status_msg);
                         }
                     } else if (key.matches('d', .{})) {
                         // M-l d: Downloads — %USERPROFILE%\Downloads on
@@ -3555,7 +3626,7 @@ pub fn main(init: std.process.Init) !void {
                         // exactly the elisp's system-type branch.
                         if (jumpHomePath(gpa, init.environ_map, &.{"Downloads"})) |p| {
                             defer gpa.free(p);
-                            current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                            current = jumpOpen(gpa, io, p, &buffers, &direds, &recent, root, focused, current, &window_undo, &window_redo, &status_msg);
                         }
                     } else if (key.matches('g', .{})) {
                         // M-l g: the config directory — %APPDATA% on
@@ -3563,32 +3634,32 @@ pub fn main(init: std.process.Init) !void {
                         // fallback), ~/.config elsewhere.
                         if (comptime builtin.os.tag == .windows) {
                             if (init.environ_map.get("APPDATA")) |appdata| {
-                                current = jumpOpen(gpa, io, appdata, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                                current = jumpOpen(gpa, io, appdata, &buffers, &direds, &recent, root, focused, current, &window_undo, &window_redo, &status_msg);
                             } else if (jumpHomePath(gpa, init.environ_map, &.{ "AppData", "Roaming" })) |p| {
                                 defer gpa.free(p);
-                                current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                                current = jumpOpen(gpa, io, p, &buffers, &direds, &recent, root, focused, current, &window_undo, &window_redo, &status_msg);
                             }
                         } else if (jumpHomePath(gpa, init.environ_map, &.{".config"})) |p| {
                             defer gpa.free(p);
-                            current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                            current = jumpOpen(gpa, io, p, &buffers, &direds, &recent, root, focused, current, &window_undo, &window_redo, &status_msg);
                         }
                     } else if (key.matches('i', .{})) {
                         // M-l i: the Emacs-vanilla config directory.
                         if (jumpHomePath(gpa, init.environ_map, &.{ ".emacs.d", "Emacs-vanilla" })) |p| {
                             defer gpa.free(p);
-                            current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                            current = jumpOpen(gpa, io, p, &buffers, &direds, &recent, root, focused, current, &window_undo, &window_redo, &status_msg);
                         }
                     } else if (key.matches('y', .{})) {
                         // M-l y: the Emacs-DIYer config directory.
                         if (jumpHomePath(gpa, init.environ_map, &.{ ".emacs.d", "Emacs-DIYer" })) |p| {
                             defer gpa.free(p);
-                            current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                            current = jumpOpen(gpa, io, p, &buffers, &direds, &recent, root, focused, current, &window_undo, &window_redo, &status_msg);
                         }
                     } else if (key.matches('s', .{})) {
                         // M-l s: the ~/source tree.
                         if (jumpHomePath(gpa, init.environ_map, &.{"source"})) |p| {
                             defer gpa.free(p);
-                            current = jumpOpen(gpa, io, p, &buffers, &direds, root, focused, current, &window_undo, &window_redo, &status_msg);
+                            current = jumpOpen(gpa, io, p, &buffers, &direds, &recent, root, focused, current, &window_undo, &window_redo, &status_msg);
                         }
                     } else if (key.matches('=', .{})) {
                         // M-l =: open a new tab at the right end of the
@@ -3732,7 +3803,7 @@ pub fn main(init: std.process.Init) !void {
                             if (try d.upPath(gpa)) |parent| {
                                 defer gpa.free(parent);
                                 recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                                current = try openBufferOrDired(gpa, io, &buffers, &direds, parent);
+                                current = try openBufferOrDired(gpa, io, &buffers, &direds, &recent, parent);
                                 focused.buf_idx = current;
                             }
                         } else if (key.matches('<', .{ .alt = true })) {
@@ -3824,7 +3895,7 @@ pub fn main(init: std.process.Init) !void {
                                 .open_file, .open_dir => |path| {
                                     defer gpa.free(path);
                                     recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                                    current = try openBufferOrDired(gpa, io, &buffers, &direds, path);
+                                    current = try openBufferOrDired(gpa, io, &buffers, &direds, &recent, path);
                                     focused.buf_idx = current;
                                 },
                             }
@@ -4080,7 +4151,7 @@ pub fn main(init: std.process.Init) !void {
                         const start = try Dired.startingDir(gpa, buf.filename orelse ".");
                         defer gpa.free(start);
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                        current = try openBufferOrDired(gpa, io, &buffers, &direds, start);
+                        current = try openBufferOrDired(gpa, io, &buffers, &direds, &recent, start);
                         focused.buf_idx = current;
                     } else if (key.matches('n', .{ .alt = true })) {
                         if (moveFocus(root, focused, 1)) |nf| {
@@ -4201,7 +4272,7 @@ pub fn main(init: std.process.Init) !void {
         // Dired and isearch are not modal: they render inside whichever
         // pane they apply to, leaving the window layout untouched. Only the
         // prompt-style modes take over the whole screen.
-        const is_modal = confirming_quit or confirming_kill or bookmark_list_active or buffer_list_active;
+        const is_modal = confirming_quit or confirming_kill or picker_kind != null;
 
         const search_view: ?IsearchView = if (isearch_active)
             .{ .failed = isearch_failed, .match = isearch_match, .query = isearch_query.items, .backward = isearch_dir == .backward }
@@ -4241,115 +4312,45 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
 
-        if (bookmark_list_active) {
-            // The bookmark picker: one name per row, Enter jumps. Typing
-            // filters the rows (see pickerFilter) — the block cursor marks
-            // the selected bookmark among the visible ones.
-            const sel_pos = pickerSelectionPos(picker_visible.items, bookmark_list_selected);
+        if (picker_kind) |kind| {
+            // The picker (buffers / bookmarks / recent files): one row per
+            // entry, Enter opens the selection. Typing filters the rows
+            // (see pickerFilter) — the block cursor marks the selection
+            // among the visible ones.
+            const sel_pos = pickerSelectionPos(picker_visible.items, picker_selected);
             if (text_height > 0) {
-                if (sel_pos < bookmark_list_top) {
-                    bookmark_list_top = sel_pos;
-                } else if (sel_pos >= bookmark_list_top + text_height) {
-                    bookmark_list_top = sel_pos - text_height + 1;
+                if (sel_pos < picker_top) {
+                    picker_top = sel_pos;
+                } else if (sel_pos >= picker_top + text_height) {
+                    picker_top = sel_pos - text_height + 1;
                 }
             }
+            const label = switch (kind) {
+                .buffers => "Buffers",
+                .bookmarks => "Bookmarks",
+                .recent => "Recent files",
+            };
             var list_row: u16 = 0;
-            var i = bookmark_list_top;
+            var i = picker_top;
             while (i < picker_visible.items.len and list_row < text_height) : (i += 1) {
-                // The bookmark name, then its base directory dimmed after
-                // it. For a dired bookmark the path is a directory, so it
-                // shows itself; for a file bookmark, its parent directory.
-                const b = bookmarks.items[picker_visible.items[i]];
+                const full = picker_visible.items[i];
+                const name = pickerRowName(kind, buffers.items, bookmarks.items, recent.items, full);
+                // For bookmarks and recent files the base directory is
+                // dimmed after the name (a dired bookmark's path is a
+                // directory, so it shows itself; otherwise the parent).
+                const dir: ?[]const u8 = switch (kind) {
+                    .bookmarks => blk: {
+                        const b = bookmarks.items[full];
+                        break :blk if (isDirectory(io, b.path)) b.path else std.fs.path.dirname(b.path);
+                    },
+                    .recent => std.fs.path.dirname(recent.items[full]),
+                    .buffers => null,
+                };
                 // An active isearch highlights the matched part of the
                 // name, like the dired and file-buffer match highlights.
                 const hl: ?Highlight = if (isearch_active and !isearch_failed) blk: {
                     if (isearch_match) |m| {
-                        if (picker_visible.items[i] == m.row) {
-                            const start = @min(m.col, b.name.len);
-                            const end = @min(m.col + isearch_query.items.len, b.name.len);
-                            if (end > start) break :blk .{ .start = start, .end = end };
-                        }
-                    }
-                    break :blk null;
-                } else null;
-                if (hl) |h| {
-                    var col: u16 = 0;
-                    if (h.start > 0) {
-                        _ = body.printSegment(.{ .text = b.name[0..h.start], .style = .{} }, .{ .row_offset = list_row });
-                        col += body.gwidth(b.name[0..h.start]);
-                    }
-                    _ = body.printSegment(.{ .text = b.name[h.start..h.end], .style = highlight_style }, .{ .row_offset = list_row, .col_offset = col });
-                    col += body.gwidth(b.name[h.start..h.end]);
-                    if (h.end < b.name.len) {
-                        _ = body.printSegment(.{ .text = b.name[h.end..], .style = .{} }, .{ .row_offset = list_row, .col_offset = col });
-                    }
-                } else {
-                    _ = body.printSegment(.{ .text = b.name, .style = .{} }, .{ .row_offset = list_row });
-                }
-                const dir: ?[]const u8 = if (isDirectory(io, b.path))
-                    b.path
-                else
-                    std.fs.path.dirname(b.path);
-                if (dir) |d| {
-                    _ = body.printSegment(.{ .text = d, .style = .{ .dim = true } }, .{ .row_offset = list_row, .col_offset = body.gwidth(b.name) + 2 });
-                }
-                list_row += 1;
-            }
-            var list_ml_buf: [2048]u8 = undefined;
-            if (isearch_active) {
-                const label = if (isearch_failed)
-                    (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")
-                else
-                    (if (isearch_dir == .backward) "I-search backward" else "I-search");
-                const ml = fillPromptModeline(&list_ml_buf, "{s}: ", .{label}, isearch_query.items);
-                _ = body.printSegment(.{ .text = list_ml_buf[0..ml.label_len], .style = .{ .bold = true } }, .{ .row_offset = body.height -| 1 });
-                if (ml.label_len < ml.len) {
-                    _ = body.printSegment(.{ .text = list_ml_buf[ml.label_len..ml.len], .style = .{} }, .{ .row_offset = body.height -| 1, .col_offset = body.gwidth(list_ml_buf[0..ml.label_len]) });
-                }
-            } else if (picker_query.items.len > 0) {
-                const shown = if (picker_visible.items.len > 0) sel_pos + 1 else 0;
-                const list_ml = std.fmt.bufPrint(&list_ml_buf, "Bookmarks ({d}/{d})   filter: {s}   (C-g clears, Enter opens, arrows move, q closes)", .{
-                    shown,
-                    picker_visible.items.len,
-                    picker_query.items,
-                }) catch "Bookmarks";
-                _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
-            } else {
-                const list_ml = std.fmt.bufPrint(&list_ml_buf, "Bookmarks ({d}/{d})   (type to filter, C-s searches, Enter jumps, arrows move, q closes)", .{
-                    sel_pos + 1,
-                    bookmarks.items.len,
-                }) catch "Bookmarks";
-                _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
-            }
-            // No highlights: the block cursor marks the selected bookmark.
-            body.showCursor(0, @intCast(sel_pos - bookmark_list_top));
-            try vx.render(tty.writer());
-            frame_allocs.reset();
-            continue;
-        }
-
-        if (buffer_list_active) {
-            // The buffer picker: one buffer name per row, Enter switches.
-            // Typing filters the rows (see pickerFilter) — the block
-            // cursor marks the selected buffer among the visible ones.
-            const sel_pos = pickerSelectionPos(picker_visible.items, buffer_list_selected);
-            if (text_height > 0) {
-                if (sel_pos < buffer_list_top) {
-                    buffer_list_top = sel_pos;
-                } else if (sel_pos >= buffer_list_top + text_height) {
-                    buffer_list_top = sel_pos - text_height + 1;
-                }
-            }
-            var list_row: u16 = 0;
-            var i = buffer_list_top;
-            while (i < picker_visible.items.len and list_row < text_height) : (i += 1) {
-                const b: *Buffer = buffers.items[picker_visible.items[i]];
-                const name = b.display_name orelse b.filename orelse "?";
-                // An active isearch highlights the matched part of the
-                // name, like the dired and file-buffer match highlights.
-                const hl: ?Highlight = if (isearch_active and !isearch_failed) blk: {
-                    if (isearch_match) |m| {
-                        if (picker_visible.items[i] == m.row) {
+                        if (full == m.row) {
                             const start = @min(m.col, name.len);
                             const end = @min(m.col + isearch_query.items.len, name.len);
                             if (end > start) break :blk .{ .start = start, .end = end };
@@ -4371,36 +4372,42 @@ pub fn main(init: std.process.Init) !void {
                 } else {
                     _ = body.printSegment(.{ .text = name, .style = .{} }, .{ .row_offset = list_row });
                 }
+                if (dir) |d| {
+                    _ = body.printSegment(.{ .text = d, .style = .{ .dim = true } }, .{ .row_offset = list_row, .col_offset = body.gwidth(name) + 2 });
+                }
                 list_row += 1;
             }
             var list_ml_buf: [2048]u8 = undefined;
             if (isearch_active) {
-                const label = if (isearch_failed)
+                const search_label = if (isearch_failed)
                     (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")
                 else
                     (if (isearch_dir == .backward) "I-search backward" else "I-search");
-                const ml = fillPromptModeline(&list_ml_buf, "{s}: ", .{label}, isearch_query.items);
+                const ml = fillPromptModeline(&list_ml_buf, "{s}: ", .{search_label}, isearch_query.items);
                 _ = body.printSegment(.{ .text = list_ml_buf[0..ml.label_len], .style = .{ .bold = true } }, .{ .row_offset = body.height -| 1 });
                 if (ml.label_len < ml.len) {
                     _ = body.printSegment(.{ .text = list_ml_buf[ml.label_len..ml.len], .style = .{} }, .{ .row_offset = body.height -| 1, .col_offset = body.gwidth(list_ml_buf[0..ml.label_len]) });
                 }
             } else if (picker_query.items.len > 0) {
                 const shown = if (picker_visible.items.len > 0) sel_pos + 1 else 0;
-                const list_ml = std.fmt.bufPrint(&list_ml_buf, "Buffers ({d}/{d})   filter: {s}   (C-g clears, Enter opens, arrows move, q closes)", .{
+                const list_ml = std.fmt.bufPrint(&list_ml_buf, "{s} ({d}/{d})   filter: {s}   (C-g clears, Enter opens, arrows move, q closes)", .{
+                    label,
                     shown,
                     picker_visible.items.len,
                     picker_query.items,
-                }) catch "Buffers";
+                }) catch label;
                 _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
             } else {
-                const list_ml = std.fmt.bufPrint(&list_ml_buf, "Buffers ({d}/{d})   (type to filter, C-s searches, Enter switches, arrows move, q closes)", .{
+                const count = pickerRowCount(kind, buffers.items, bookmarks.items, recent.items);
+                const list_ml = std.fmt.bufPrint(&list_ml_buf, "{s} ({d}/{d})   (type to filter, C-s searches, Enter opens, arrows move, q closes)", .{
+                    label,
                     sel_pos + 1,
-                    buffers.items.len,
-                }) catch "Buffers";
+                    count,
+                }) catch label;
                 _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
             }
-            // No highlights: the block cursor marks the selected buffer.
-            body.showCursor(0, if (text_height > 0) @intCast(sel_pos - buffer_list_top) else 0);
+            // No highlights: the block cursor marks the selection.
+            body.showCursor(0, if (text_height > 0) @intCast(sel_pos - picker_top) else 0);
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;
