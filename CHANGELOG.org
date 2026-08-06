@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.48.0 — <2026-08-06>
+
+Find results live in a =*files*= buffer.
+
+- =C-c f= now lists the current directory's files into a persistent =*files*= buffer, exactly like the =*grep*= buffer: the list stays open — =C-x b= returns to it, window history (=C-c j= / =C-c k=) steps through its layouts, and it lives in any window like any other buffer. =n= / =p= (and arrows / =C-n= / =C-p=) step through the files, Enter opens the one under point in another window — a lone files window splits to the right, otherwise the window last used for a jump is reused — =F= toggles follow mode so stepping opens each file automatically, and =g= re-runs the find over the same directory. Typing filters the list (partial-completion, matched against the full path, the matched characters highlighting in each row as you type), Backspace shortens the filter, =C-s= / =C-r= search the rows, and =C-g= / Esc clear the filter first, then close. The modeline shows the position and keys (=*files* 3/21  filter: d z=).
+
 ** 0.47.0 — <2026-08-06>
 
 The pickers match Emacs partial-completion style.
