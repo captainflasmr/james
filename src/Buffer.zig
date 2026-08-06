@@ -20,9 +20,14 @@ mark: ?Pos = null,
 /// Kind of the most recent edit, so a run of the same kind (typing, or
 /// backspacing) coalesces into a single undo step instead of one per key.
 undo_group: UndoKind = .none,
-/// Next position for C-l (recenter-top-bottom): 0 = middle, 1 = top,
-/// 2 = bottom.
-recenter_pos: u8 = 0,
+    /// Next position for C-l (recenter-top-bottom): 0 = middle, 1 = top,
+    /// 2 = bottom.
+    recenter_pos: u8 = 0,
+    /// M-z toggles soft wrap: when on (the default), long lines wrap at
+    /// the window edge and movement steps visual lines (Emacs
+    /// visual-line-mode); when off they truncate and movement steps
+    /// logical lines (Emacs toggle-truncate-lines).
+    soft_wrap: bool = true,
 
 pub const Pos = struct { row: usize, col: usize };
 pub const Region = struct { start: Pos, end: Pos };

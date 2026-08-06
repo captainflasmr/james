@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.33.0 — <2026-08-05>
+
+=M-z= toggles soft wrap.
+
+- =M-z= toggles soft wrap for the current buffer (Emacs =toggle-truncate-lines=): with it on — the default — long lines wrap at the window edge and =C-n= / =C-p= / =C-a= / =C-e= step visual lines, as before; with it off, long lines truncate at the edge and movement steps logical lines (the wrap math degenerates to one visual line per line, so scrolling, recentering and the cursor all follow). The modeline shows =[truncate]= while soft wrap is off — like Emacs's =Truncate= mode-line marker; its absence means wrap is on. Each buffer remembers its own setting, and an isearch match or mark region beyond the truncation edge is simply off-screen, like Emacs.
+
 ** 0.32.0 — <2026-08-05>
 
 =(= hides dired details.

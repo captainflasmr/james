@@ -170,7 +170,12 @@ fn tabAwareWidth(line: []const u8, start: usize, end: usize, method: vaxis.gwidt
 /// The byte offsets at which `line`'s visual (wrapped) lines begin, for a
 /// pane `width` columns wide: offsets[0] = 0, each later entry a wrap
 /// point. Returns the segment count.
-fn wrapOffsets(line: []const u8, width: usize, method: vaxis.gwidth.Method, offsets: *[1024]usize) usize {
+fn wrapOffsets(line: []const u8, wrap: bool, width: usize, method: vaxis.gwidth.Method, offsets: *[1024]usize) usize {
+    if (!wrap) {
+        // Soft wrap off (M-z): every line is a single visual line.
+        offsets[0] = 0;
+        return 1;
+    }
     if (line.len == 0 or width == 0) {
         offsets[0] = 0;
         return 1;
@@ -199,9 +204,9 @@ fn wrapOffsets(line: []const u8, width: usize, method: vaxis.gwidth.Method, offs
 }
 
 /// How many visual lines `line` occupies at `width`.
-fn wrapCount(line: []const u8, width: usize, method: vaxis.gwidth.Method) usize {
+fn wrapCount(line: []const u8, wrap: bool, width: usize, method: vaxis.gwidth.Method) usize {
     var offsets: [1024]usize = undefined;
-    return wrapOffsets(line, width, method, &offsets);
+    return wrapOffsets(line, wrap, width, method, &offsets);
 }
 
 /// The display column of byte offset `col` within the visual segment of
@@ -285,6 +290,22 @@ fn expandTabs(frame: *FrameAllocs, line: []const u8, method: vaxis.gwidth.Method
     return owned;
 }
 
+/// The longest prefix of `text` that fits in `width` display columns —
+/// for truncated (soft-wrap-off) lines. `text` must already have its
+/// tabs expanded (the render path passes the expandTabs result).
+fn clipToWidth(text: []const u8, width: usize, method: vaxis.gwidth.Method) []const u8 {
+    if (width == 0) return "";
+    var col: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(text);
+    while (it.next()) |g| {
+        const s = g.bytes(text);
+        const w = vaxis.gwidth.gwidth(s, method);
+        if (col + w > width) return text[0..g.start];
+        col += w;
+    }
+    return text;
+}
+
 /// The visual segment of the cursor within its logical line, and its
 /// display column within that segment.
 const CursorVisual = struct { seg: usize, col: usize };
@@ -292,7 +313,7 @@ const CursorVisual = struct { seg: usize, col: usize };
 fn cursorVisual(buf: *const Buffer, width: usize, method: vaxis.gwidth.Method) CursorVisual {
     const line = buf.lines.items[buf.cursor_row].items;
     var offsets: [1024]usize = undefined;
-    const n = wrapOffsets(line, width, method, &offsets);
+    const n = wrapOffsets(line, buf.soft_wrap, width, method, &offsets);
     var seg: usize = 0;
     while (seg + 1 < n and offsets[seg + 1] <= buf.cursor_col) : (seg += 1) {}
     return .{ .seg = seg, .col = visualColAt(line, offsets[seg], buf.cursor_col, method) };
@@ -306,7 +327,7 @@ fn moveDownVisual(buf: *Buffer, width: usize, method: vaxis.gwidth.Method) void 
     if (width == 0) return buf.moveDown();
     const line = buf.lines.items[buf.cursor_row].items;
     var offsets: [1024]usize = undefined;
-    const n = wrapOffsets(line, width, method, &offsets);
+    const n = wrapOffsets(line, buf.soft_wrap, width, method, &offsets);
     var seg: usize = 0;
     while (seg + 1 < n and offsets[seg + 1] <= buf.cursor_col) : (seg += 1) {}
     const goal = visualColAt(line, offsets[seg], buf.cursor_col, method);
@@ -324,7 +345,7 @@ fn moveUpVisual(buf: *Buffer, width: usize, method: vaxis.gwidth.Method) void {
     if (width == 0) return buf.moveUp();
     const line = buf.lines.items[buf.cursor_row].items;
     var offsets: [1024]usize = undefined;
-    const n = wrapOffsets(line, width, method, &offsets);
+    const n = wrapOffsets(line, buf.soft_wrap, width, method, &offsets);
     var seg: usize = 0;
     while (seg + 1 < n and offsets[seg + 1] <= buf.cursor_col) : (seg += 1) {}
     const goal = visualColAt(line, offsets[seg], buf.cursor_col, method);
@@ -334,7 +355,7 @@ fn moveUpVisual(buf: *Buffer, width: usize, method: vaxis.gwidth.Method) void {
         buf.cursor_row -= 1;
         const nl = buf.lines.items[buf.cursor_row].items;
         var no: [1024]usize = undefined;
-        const nn = wrapOffsets(nl, width, method, &no);
+        const nn = wrapOffsets(nl, buf.soft_wrap, width, method, &no);
         buf.cursor_col = byteAtVisualCol(nl, no[nn - 1], goal, width, method);
     }
 }
@@ -348,7 +369,7 @@ fn moveEndVisual(buf: *Buffer, width: usize, method: vaxis.gwidth.Method) void {
     if (width == 0) return buf.moveLineEnd();
     const line = buf.lines.items[buf.cursor_row].items;
     var offsets: [1024]usize = undefined;
-    const n = wrapOffsets(line, width, method, &offsets);
+    const n = wrapOffsets(line, buf.soft_wrap, width, method, &offsets);
     var seg: usize = 0;
     while (seg + 1 < n and offsets[seg + 1] <= buf.cursor_col) : (seg += 1) {}
     buf.cursor_col = if (seg + 1 < n)
@@ -364,7 +385,7 @@ fn moveStartVisual(buf: *Buffer, width: usize, method: vaxis.gwidth.Method) void
     if (width == 0) return buf.moveLineStart();
     const line = buf.lines.items[buf.cursor_row].items;
     var offsets: [1024]usize = undefined;
-    const n = wrapOffsets(line, width, method, &offsets);
+    const n = wrapOffsets(line, buf.soft_wrap, width, method, &offsets);
     var seg: usize = 0;
     while (seg + 1 < n and offsets[seg + 1] <= buf.cursor_col) : (seg += 1) {}
     buf.cursor_col = offsets[seg];
@@ -388,7 +409,7 @@ fn visualRowOfCursor(buf: *const Buffer, top: usize, width: usize, method: vaxis
     var v: usize = 0;
     var i = top;
     while (i < buf.cursor_row) : (i += 1) {
-        v += wrapCount(buf.lines.items[i].items, width, method);
+        v += wrapCount(buf.lines.items[i].items, buf.soft_wrap, width, method);
     }
     return v + cursorVisual(buf, width, method).seg;
 }
@@ -496,8 +517,20 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
         // Advance by the line's wrapped height, so a soft-wrapped line
         // takes all of its visual rows instead of the next line
         // clobbering its continuation.
-        const wraps = wrapCount(raw, win.width, method);
-        _ = win.print(segs, .{ .row_offset = row_base + row });
+        const wraps = wrapCount(raw, buf.soft_wrap, win.width, method);
+        if (buf.soft_wrap) {
+            _ = win.print(segs, .{ .row_offset = row_base + row });
+        } else {
+            // Soft wrap off (M-z): the line truncates at the pane edge —
+            // each segment is clipped to the remaining width, one row.
+            var col: u16 = 0;
+            for (segs) |seg| {
+                if (col >= win.width) break;
+                const clipped = clipToWidth(seg.text, win.width - col, method);
+                _ = win.printSegment(.{ .text = clipped, .style = seg.style }, .{ .row_offset = row_base + row, .col_offset = col });
+                col += win.gwidth(clipped);
+            }
+        }
         row += @intCast(wraps);
     }
 
@@ -516,12 +549,15 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
         break :blk std.fmt.bufPrint(modeline_buf, "{s}: {s}", .{ label, s.query }) catch label;
     } else if (status) |m|
         std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch "Save failed"
-    else std.fmt.bufPrint(modeline_buf, "{s}{s}{s}  L{d}:C{d}", .{
+    else std.fmt.bufPrint(modeline_buf, "{s}{s}{s}{s}  L{d}:C{d}", .{
         // Emacs-style modified marker in the bottom-left corner of the
         // modeline.
         if (buf.dirty) "*" else "",
         buf.display_name orelse buf.filename orelse "?",
         if (buf.dirty) " [modified]" else "",
+        // M-z: soft wrap off (truncated lines) shows like Emacs's
+        // Truncate mode-line marker; its absence means wrap is on.
+        if (!buf.soft_wrap) " [truncate]" else "",
         buf.cursor_row + 1,
         buf.cursor_col + 1,
     }) catch "?";
@@ -3668,6 +3704,15 @@ pub fn main(init: std.process.Init) !void {
                         buf.moveBufStart();
                     } else if (key.matches('>', .{ .alt = true })) {
                         buf.moveBufEnd();
+                    } else if (key.matches('z', .{ .alt = true })) {
+                        // M-z: toggle soft wrap (Emacs
+                        // toggle-truncate-lines). On, long lines wrap at
+                        // the window edge and movement steps visual
+                        // lines; off, they truncate and movement steps
+                        // logical lines — the modeline's [truncate] shows
+                        // the state. The buffer remembers its own
+                        // setting.
+                        buf.soft_wrap = !buf.soft_wrap;
                     } else if (key.matches('h', .{ .alt = true, .ctrl = true })) {
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         root.resizeDivider(focused, .vertical, -8);
@@ -3929,8 +3974,20 @@ pub fn main(init: std.process.Init) !void {
             var seg_storage: [3]vaxis.Segment = undefined;
             const segs = lineSegments(line, h.hl, h.empty_marker, &seg_storage, i == buf.cursor_row);
             // Advance by the line's wrapped height (see renderPane).
-            const wraps = wrapCount(raw, body.width, vx.screen.width_method);
-            _ = body.print(segs, .{ .row_offset = row });
+            const wraps = wrapCount(raw, buf.soft_wrap, body.width, vx.screen.width_method);
+            if (buf.soft_wrap) {
+                _ = body.print(segs, .{ .row_offset = row });
+            } else {
+                // Soft wrap off (M-z): the line truncates at the window
+                // edge (see renderPane).
+                var col: u16 = 0;
+                for (segs) |seg| {
+                    if (col >= body.width) break;
+                    const clipped = clipToWidth(seg.text, body.width - col, vx.screen.width_method);
+                    _ = body.printSegment(.{ .text = clipped, .style = seg.style }, .{ .row_offset = row, .col_offset = col });
+                    col += body.gwidth(clipped);
+                }
+            }
             row += @intCast(wraps);
         }
 
@@ -3964,13 +4021,16 @@ pub fn main(init: std.process.Init) !void {
                 (std.fmt.bufPrint(&count_buf, "  ({d}/{d})", .{ current + 1, buffers.items.len }) catch "")
             else
                 "";
-            break :blk std.fmt.bufPrint(&modeline_buf, "{s}-- {s}{s}{s}{s}  L{d}:C{d} --", .{
+            break :blk std.fmt.bufPrint(&modeline_buf, "{s}-- {s}{s}{s}{s}{s}  L{d}:C{d} --", .{
                 // Emacs-style modified marker in the bottom-left corner of
                 // the modeline.
                 if (buf.dirty) "*" else "",
                 buf.display_name orelse buf.filename orelse "?",
                 if (buf.dirty) " [modified]" else "",
                 if (buf.mark != null) " [mark set]" else "",
+                // M-z: soft wrap off (truncated lines) shows like Emacs's
+                // Truncate mode-line marker; its absence means wrap is on.
+                if (!buf.soft_wrap) " [truncate]" else "",
                 buf_count,
                 buf.cursor_row + 1,
                 buf.cursor_col + 1,
