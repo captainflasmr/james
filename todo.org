@@ -1,4 +1,4 @@
-* DOING james roadmap [25/25]
+* DONE james roadmap [25/25]
 ** DONE fuzzy search in buffer and bookmark list
 ** DONE show current keybindings in the welcome screen
 ** DONE version/data/time/description better formatted on welcome page
