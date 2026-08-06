@@ -200,9 +200,12 @@ fn loadWindowsEntries(self: *Dired, gpa: std.mem.Allocator, io: std.Io, dir: std
 
     var wild: std.ArrayList(u16) = .empty;
     defer wild.deinit(gpa);
+    // utf8ToUtf16LeAllocZ returns a [:0] slice whose .len does not count
+    // the sentinel null — the whole string (including its final character)
+    // is wide[0..wide.len], and the terminator lives at wide[wide.len].
     const wide = std.unicode.utf8ToUtf16LeAllocZ(gpa, self.path.items) catch return;
     defer gpa.free(wide);
-    try wild.appendSlice(gpa, wide[0 .. wide.len - 1]);
+    try wild.appendSlice(gpa, wide);
     try wild.appendSlice(gpa, &[_]u16{ '\\', '*' });
     try wild.append(gpa, 0);
 
@@ -212,7 +215,16 @@ fn loadWindowsEntries(self: *Dired, gpa: std.mem.Allocator, io: std.Io, dir: std
     if (h == win.INVALID_HANDLE_VALUE) return;
     defer _ = FindClose(h);
     while (true) {
-        try self.entries.append(gpa, try makeEntryFromFindData(gpa, &data));
+        const e = try makeEntryFromFindData(gpa, &data);
+        // The sweep yields "." and ".." too; the ".." entry is already
+        // appended above, and dired never lists the directory itself, so
+        // drop both like the POSIX iterator path does.
+        if (!std.mem.eql(u8, e.name, ".") and !std.mem.eql(u8, e.name, "..")) {
+            try self.entries.append(gpa, e);
+        } else {
+            gpa.free(e.name);
+            gpa.free(e.meta);
+        }
         if (FindNextFileW(h, &data) == .FALSE) return;
     }
 }

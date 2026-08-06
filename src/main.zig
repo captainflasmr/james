@@ -933,16 +933,23 @@ fn resultsOpenMatch(
     const tgt = buffers.items[idx];
     if (line > 0 and tgt.lines.items.len > 0) {
         tgt.cursor_row = @min(line -| 1, tgt.lines.items.len - 1);
-        tgt.cursor_col = @min(col -| 1, tgt.lines.items[tgt.cursor_row].items.len);
+        const l = tgt.lines.items[tgt.cursor_row].items;
+        tgt.cursor_col = @min(col -| 1, l.len);
         // A transient highlight of the term at the match, so it's easy to
         // spot while stepping (see GrepHl).
         if (term) |t| {
-            const l = tgt.lines.items[tgt.cursor_row].items;
-            const c = tgt.cursor_col;
+            // The Windows fallback (findstr) prints no column, and plain
+            // grep is no better: locate the term in the line ourselves, so
+            // the cursor and highlight land on the match all the same.
+            const c = if (col == 0 and t.len > 0)
+                (std.ascii.findIgnoreCase(l, t) orelse tgt.cursor_col)
+            else
+                tgt.cursor_col;
             if (c < l.len) {
                 const hl_len = @min(t.len, l.len - c);
                 if (hl_len > 0 and std.ascii.eqlIgnoreCase(l[c .. c + hl_len], t[0..hl_len])) {
                     grep_hl.* = .{ .buf = tgt, .row = tgt.cursor_row, .col = c, .len = hl_len, .set_at = std.Io.Clock.now(.real, io).nanoseconds };
+                    tgt.cursor_col = c;
                 }
             }
         }
