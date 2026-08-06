@@ -92,6 +92,7 @@ Buffer keys:
 | =M-<= / =M->= | beginning / end of buffer |
 | =M-j= / =M-k= | 5 lines down / up |
 | =M-J= / =M-K= | page down / up (one screenful) |
+| =M-g= | go to a line number (prompt in the modeline) |
 | =M-z= | toggle soft wrap: long lines wrap at the window edge, or truncate (movement steps visual / logical lines) |
 | =C-x k= | kill (close) the current buffer (modified file buffers ask first) |
 | =C-x C-k= | kill region (point to mark) |

@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.35.0 — <2026-08-05>
+
+=M-g= goes to a line.
+
+- =M-g= prompts for a line number in the focused window's modeline (=Goto line (C-g cancels): ...=, the same in-pane shape as the find-file and bookmark prompts) and jumps the cursor to that line — 1-based, clamped to the buffer, with the view scrolling to follow. The modeline's existing =L{d}:C{d}= readout shows where you are, so a numbered jump is the natural complement; an earlier line-numbers display was tried and removed again after it proved finicky.
+
 ** 0.34.0 — <2026-08-05>
 
 Window resizing matches the author's Emacs.

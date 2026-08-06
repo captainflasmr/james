@@ -484,11 +484,18 @@ const BookmarkPromptView = struct {
     set: bool,
 };
 
+/// The M-g goto-line prompt rendered in the focused window's modeline,
+/// like the find-file prompt — the cursor jumps without disturbing the
+/// window layout.
+const GotoPromptView = struct {
+    query: []const u8,
+};
+
 /// Render one buffer's text plus its own compact modeline into `win`, which
 /// may be the whole screen or one pane of a split. An active isearch shows
 /// its match highlight and prompt in this pane, exactly as if the pane were
 /// the whole screen.
-fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, search: ?IsearchView, status: ?[]const u8) void {
+fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, search: ?IsearchView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     const method = win.screen.width_method;
     scrollToCursorVisual(buf, text_height, win.width, method);
@@ -541,7 +548,9 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
             (std.fmt.bufPrint(modeline_buf, "Bookmark name (C-g cancels): {s}", .{p.query}) catch "Bookmark name")
         else
             (std.fmt.bufPrint(modeline_buf, "Jump to bookmark (C-g cancels): {s}", .{p.query}) catch "Jump to bookmark");
-    } else if (search) |s| blk: {
+    } else if (goto_prompt) |g|
+        std.fmt.bufPrint(modeline_buf, "Goto line (C-g cancels): {s}", .{g.query}) catch "Goto line"
+    else if (search) |s| blk: {
         const label = if (s.failed)
             (if (s.backward) "Failing I-search backward" else "Failing I-search")
         else
@@ -575,7 +584,7 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
 
     if (is_focused) {
         // The cursor sits on the cursor's visual line, at its display
-        // column within that wrapped segment.
+        // column within that wrapped segment — past the number column.
         const cv = cursorVisual(buf, win.width, method);
         win.showCursor(@intCast(cv.col), @intCast(visualRowOfCursor(buf, buf.top_line, win.width, method)));
     }
@@ -1316,7 +1325,7 @@ fn armSizeWatchdog(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event)) void {
 /// taking over the whole screen; when a file is chosen it's simply
 /// replaced by the newly opened buffer. An active isearch shows its prompt
 /// in the modeline; the match is the selected entry.
-fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, search: ?IsearchView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
+fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, search: ?IsearchView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     // The full directory path heads the listing (the classic dired header
     // line), taking one row unless the pane is too small to spare it.
@@ -1396,7 +1405,9 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
             (std.fmt.bufPrint(modeline_buf, "Bookmark name (C-g cancels): {s}", .{p.query}) catch "Bookmark name")
         else
             (std.fmt.bufPrint(modeline_buf, "Jump to bookmark (C-g cancels): {s}", .{p.query}) catch "Jump to bookmark");
-    } else if (search) |s| blk: {
+    } else if (goto_prompt) |g|
+        std.fmt.bufPrint(modeline_buf, "Goto line (C-g cancels): {s}", .{g.query}) catch "Goto line"
+    else if (search) |s| blk: {
         const label = if (s.failed)
             (if (s.backward) "Failing I-search backward" else "Failing I-search")
         else
@@ -1467,6 +1478,7 @@ fn renderTree(
     focused: *Pane,
     find_file: ?FindFileView,
     bookmark_prompt: ?BookmarkPromptView,
+    goto_prompt: ?GotoPromptView,
     search: ?IsearchView,
     dired_prompt: ?DiredPromptView,
     status: ?[]const u8,
@@ -1493,12 +1505,13 @@ fn renderTree(
         const pane_prompt: ?DiredPromptView = if (pane == focused) dired_prompt else null;
         const pane_find_file: ?FindFileView = if (pane == focused) find_file else null;
         const pane_bookmark_prompt: ?BookmarkPromptView = if (pane == focused) bookmark_prompt else null;
+        const pane_goto_prompt: ?GotoPromptView = if (pane == focused) goto_prompt else null;
         const pane_status: ?[]const u8 = if (pane == focused) status else null;
         const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
         if (direds[pane.buf_idx]) |*d| {
-            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_search, pane_prompt, pane_status);
+            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_search, pane_prompt, pane_status);
         } else {
-            renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_search, pane_status);
+            renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_search, pane_status);
         }
         return;
     }
@@ -1510,8 +1523,8 @@ fn renderTree(
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             // The one blank column between the panes gets the separator.
             drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
-            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, search, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, search, dired_prompt, status, focused_h, focused_w);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
@@ -1519,8 +1532,8 @@ fn renderTree(
             // a blank row between the panes for the separator (mirroring
             // the one blank column of a vertical split).
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
-            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, search, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, search, dired_prompt, status, focused_h, focused_w);
         },
     }
 }
@@ -2362,6 +2375,10 @@ pub fn main(init: std.process.Init) !void {
     var bookmark_prompt: ?enum { set, jump } = null;
     var bookmark_query: std.ArrayList(u8) = .empty;
     defer bookmark_query.deinit(gpa);
+    // M-g: the goto-line prompt — type a line number, Enter jumps.
+    var goto_prompt = false;
+    var goto_query: std.ArrayList(u8) = .empty;
+    defer goto_query.deinit(gpa);
     var bookmark_list_active = false;
     var bookmark_list_selected: usize = 0;
     var bookmark_list_top: usize = 0;
@@ -2580,6 +2597,27 @@ pub fn main(init: std.process.Init) !void {
                         try bookmark_query.appendSlice(gpa, t);
                     } else {
                         bookmark_prompt = null;
+                    }
+                } else if (goto_prompt) {
+                    if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        goto_prompt = false;
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        if (goto_query.items.len > 0) _ = goto_query.pop();
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
+                        const n_str = std.mem.trim(u8, goto_query.items, " ");
+                        goto_prompt = false;
+                        // M-g: jump to the 1-based line, clamped to the
+                        // buffer; the view follows on the next render.
+                        if (std.fmt.parseUnsigned(usize, n_str, 10)) |n| {
+                            if (n > 0 and buf.lines.items.len > 0) {
+                                buf.cursor_row = @min(n - 1, buf.lines.items.len - 1);
+                                buf.cursor_col = @min(buf.cursor_col, buf.lines.items[buf.cursor_row].items.len);
+                            }
+                        } else |_| {}
+                    } else if (key.text) |t| {
+                        try goto_query.appendSlice(gpa, t);
+                    } else {
+                        goto_prompt = false;
                     }
                 } else if (dired_copy_prompt) {
                     if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
@@ -3704,6 +3742,12 @@ pub fn main(init: std.process.Init) !void {
                         buf.moveBufStart();
                     } else if (key.matches('>', .{ .alt = true })) {
                         buf.moveBufEnd();
+                    } else if (key.matches('g', .{ .alt = true })) {
+                        // M-g: goto line — the modeline already shows the
+                        // current line (L:C), so a numbered jump is the
+                        // natural complement.
+                        goto_prompt = true;
+                        goto_query.clearRetainingCapacity();
                     } else if (key.matches('z', .{ .alt = true })) {
                         // M-z: toggle soft wrap (Emacs
                         // toggle-truncate-lines). On, long lines wrap at
@@ -3808,6 +3852,11 @@ pub fn main(init: std.process.Init) !void {
         else
             null;
 
+        const goto_prompt_view: ?GotoPromptView = if (goto_prompt)
+            .{ .query = goto_query.items }
+        else
+            null;
+
         const dired_prompt_view: ?DiredPromptView = if (dired_copy_prompt)
             .{ .kind = dired_copy_kind, .query = dired_copy_query.items }
         else if (confirming_delete)
@@ -3820,7 +3869,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, bookmark_prompt_view, search_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, bookmark_prompt_view, goto_prompt_view, search_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;
@@ -3960,7 +4009,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal) {
             if (direds.items[current]) |*d| {
                 var modeline_buf: [2048]u8 = undefined;
-                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, bookmark_prompt_view, search_view, dired_prompt_view, status_msg);
+                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, bookmark_prompt_view, goto_prompt_view, search_view, dired_prompt_view, status_msg);
                 try vx.render(tty.writer());
                 frame_allocs.reset();
                 continue;
@@ -4025,6 +4074,8 @@ pub fn main(init: std.process.Init) !void {
                 (std.fmt.bufPrint(&modeline_buf, "Bookmark name (C-g cancels): {s}", .{bookmark_query.items}) catch "Bookmark name")
             else
                 (std.fmt.bufPrint(&modeline_buf, "Jump to bookmark (C-g cancels): {s}", .{bookmark_query.items}) catch "Jump to bookmark");
+        } else if (goto_prompt) blk: {
+            break :blk std.fmt.bufPrint(&modeline_buf, "Goto line (C-g cancels): {s}", .{goto_query.items}) catch "Goto line";
         } else if (isearch_active) blk: {
             const label = if (isearch_failed)
                 (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")
