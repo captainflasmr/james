@@ -10,6 +10,15 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.38.0 — <2026-08-06>
+
+The pickers filter as you type.
+
+- =C-x b= (the buffer picker) and the bookmark lists (=C-x r l= / =C-c o= / =M-l o=) filter as you type: every letter narrows the list by fuzzy match — a case-insensitive subsequence match, with word starts, camelCase boundaries and consecutive runs scoring higher, the best rows first — and the modeline shows the filter and the visible count (=Buffers (2/3) filter: sc=). The pickers are now fzf-style: any printable key filters (the =n= / =p= move keys and the =f= / =e= open / edit-file keys are gone from the pickers — Enter opens, arrows / =C-n= / =C-p= move, Backspace shortens the filter, =C-g= clears the filter before closing, =q= closes, and =C-s= / =C-r= search the filtered rows). Dired keeps its =f= open key.
+- The welcome screen is easier to read: the version block — version, release date, build time and the last change — now sits centered under the banner art with a blank line after it, and the keybinding reference below the greeting is complete and grouped by prefix (=C-x=, =C-c=, =M-l=) and context (movement, editing, kill ring, search, dired, pickers, prompts).
+- Prompt labels in the modeline — find file, bookmark, goto-line, isearch, and the dired copy / rename / create / delete prompts — render bold, so the prompt stands out from the typed text; the y/n confirmations are bold throughout.
+- =C-c j= / =C-c k= no longer go stale after a buffer is killed: the saved window layouts rebase their buffer indices exactly like the live windows do, so stepping back into an old layout can't land on the wrong buffer or crash on an out-of-range index (previously the app could die with the terminal left in raw mode, which looked like a lockup).
+
 ** 0.37.0 — <2026-08-05>
 
 =C-x += balances the windows.

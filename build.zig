@@ -92,7 +92,7 @@ fn latestRelease(b: *std.Build) ReleaseInfo {
         const gt = std.mem.indexOfScalarPos(u8, rest, lt + 1, '>') orelse continue;
         const raw_version = std.mem.trim(u8, rest[0..lt], " ");
         // The em-dash before "<date>" belongs to the heading, not the
-        // version number: "0.37.0 — <2026-08-05>" names the release 0.37.0.
+        // version number: "0.38.0 — <2026-08-06>" names the release 0.38.0.
         const version = if (std.mem.endsWith(u8, raw_version, " —"))
             raw_version[0 .. raw_version.len - " —".len]
         else

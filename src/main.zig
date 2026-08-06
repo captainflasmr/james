@@ -1740,11 +1740,12 @@ const welcome_tail =
     \\
     \\  Pickers (buffers and bookmarks):
     \\
-    \\    n / p               move the selection (arrows too)
-    \\    Enter / f           open the selection
-    \\    e                   edit the bookmarks file
-    \\    C-s / C-r           search the list
-    \\    q / C-g             close
+    \\    type              filter the list (fuzzy, as you type)
+    \\    arrows / C-n/C-p  move the selection
+    \\    Enter             open the selection
+    \\    C-s / C-r         search the list
+    \\    Backspace         shorten the filter
+    \\    q                 close (C-g clears the filter first)
     \\
     \\  Prompts and confirmations:
     \\
@@ -1941,29 +1942,121 @@ fn syncDiredSelection(direds: []?Dired, current: usize, buf: *Buffer) void {
 
 /// List-isearch find: search the buffer-picker or bookmark-picker rows
 /// for `query`, starting at `from_row` (inclusive) and wrapping around
-/// the list — the row-granular twin of Buffer.findNext. Returns the
-/// matched row and the byte offset of the match in that row's text.
+/// the list — the row-granular twin of Buffer.findNext. `visible` maps
+/// the search over a filtered subset (see pickerFilter): rows are
+/// positions in `visible`, and the returned row is the full-list index.
+/// Returns the matched row and the byte offset of the match in that row's
+/// text.
 fn pickerFindNext(
     buffers: []*Buffer,
     bookmarks: []const Bookmark,
     in_bookmarks: bool,
+    visible: ?[]const usize,
     query: []const u8,
     from_row: usize,
     forward: bool,
 ) ?Buffer.Pos {
-    const count = if (in_bookmarks) bookmarks.len else buffers.len;
+    const count = if (visible) |v| v.len else (if (in_bookmarks) bookmarks.len else buffers.len);
     if (count == 0 or query.len == 0) return null;
     var i = from_row % count;
     var n: usize = 0;
     while (n < count) : (n += 1) {
+        const full = if (visible) |v| v[i] else i;
         const row_text = if (in_bookmarks)
-            bookmarks[i].name
+            bookmarks[full].name
         else
-            (buffers[i].display_name orelse buffers[i].filename orelse "?");
-        if (std.ascii.indexOfIgnoreCase(row_text, query)) |col| return .{ .row = i, .col = col };
+            (buffers[full].display_name orelse buffers[full].filename orelse "?");
+        if (std.ascii.indexOfIgnoreCase(row_text, query)) |col| return .{ .row = full, .col = col };
         i = if (forward) (i + 1) % count else (i + count - 1) % count;
     }
     return null;
+}
+
+/// Fuzzy-match `query` against `text`: a case-insensitive subsequence
+/// match, scored so that word starts, camelCase boundaries, and
+/// consecutive runs rank higher than scattered hits (an fzf-style filter
+/// for the pickers). Null when `query` isn't a subsequence; higher scores
+/// are better.
+fn fuzzyScore(query: []const u8, text: []const u8) ?i64 {
+    var score: i64 = 0;
+    var qi: usize = 0;
+    var streak: usize = 0;
+    for (text, 0..) |c, ti| {
+        if (qi < query.len and std.ascii.toLower(c) == std.ascii.toLower(query[qi])) {
+            qi += 1;
+            score += if (ti == 0)
+                3
+            else if (!std.ascii.isAlphanumeric(text[ti - 1]))
+                3
+            else if (std.ascii.isUpper(c) and std.ascii.isLower(text[ti - 1]))
+                2
+            else if (streak > 0)
+                2
+            else
+                1;
+            streak += 1;
+            if (qi == query.len) return score;
+        } else {
+            streak = 0;
+        }
+    }
+    return null;
+}
+
+/// One picker row that matched the filter, with its fuzzy score.
+const PickerMatch = struct {
+    idx: usize,
+    score: i64,
+
+    /// Higher scores first; ties keep the original order.
+    fn lessThan(_: void, a: PickerMatch, b: PickerMatch) bool {
+        return if (a.score != b.score) a.score > b.score else a.idx < b.idx;
+    }
+};
+
+/// Rebuild the picker's visible rows for `query`: the full-list indices
+/// of every entry whose name fuzzy-matches, best matches first; the whole
+/// list in its original order for an empty query.
+fn pickerFilter(gpa: std.mem.Allocator, buffers: []*Buffer, bookmarks: []const Bookmark, in_bookmarks: bool, query: []const u8, visible: *std.ArrayList(usize)) void {
+    visible.clearRetainingCapacity();
+    const count = if (in_bookmarks) bookmarks.len else buffers.len;
+    if (query.len == 0) {
+        visible.ensureTotalCapacity(gpa, count) catch return;
+        var i: usize = 0;
+        while (i < count) : (i += 1) visible.appendAssumeCapacity(i);
+        return;
+    }
+    var matches: std.ArrayList(PickerMatch) = .empty;
+    defer matches.deinit(gpa);
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const name = if (in_bookmarks)
+            bookmarks[i].name
+        else
+            (buffers[i].display_name orelse buffers[i].filename orelse "?");
+        if (fuzzyScore(query, name)) |s| matches.append(gpa, .{ .idx = i, .score = s }) catch return;
+    }
+    std.mem.sort(PickerMatch, matches.items, {}, PickerMatch.lessThan);
+    for (matches.items) |m| visible.append(gpa, m.idx) catch return;
+}
+
+/// Refilter a picker, keeping `selected` on its entry when it still
+/// shows; with no rows left it stays put (nothing opens), otherwise the
+/// top match is selected.
+fn filterPicker(gpa: std.mem.Allocator, buffers: []*Buffer, bookmarks: []const Bookmark, in_bookmarks: bool, query: []const u8, visible: *std.ArrayList(usize), selected: *usize) void {
+    const before = selected.*;
+    pickerFilter(gpa, buffers, bookmarks, in_bookmarks, query, visible);
+    if (visible.items.len == 0) return;
+    if (std.mem.indexOfScalar(usize, visible.items, before) == null) selected.* = visible.items[0];
+}
+
+/// The position of full-list index `full` among the visible rows — where
+/// the selection highlight sits. Zero when it's not visible.
+fn pickerSelectionPos(visible: []const usize, full: usize) usize {
+    for (visible, 0..) |v, i| {
+        if (v == full) return i;
+    }
+    return 0;
 }
 
 /// Winner-mode style window history (C-c j / C-c k): the window layout is
@@ -2598,6 +2691,16 @@ pub fn main(init: std.process.Init) !void {
     var buffer_list_selected: usize = 0;
     var buffer_list_top: usize = 0;
 
+    // Type-to-filter for both pickers: the typed text narrows the list
+    // (fuzzy match, best rows first) instead of just moving the selection.
+    // `picker_visible` holds the full-list indices of the rows shown, and
+    // the *_selected vars stay full-list indices into it. C-g clears the
+    // filter before closing the picker.
+    var picker_query: std.ArrayList(u8) = .empty;
+    defer picker_query.deinit(gpa);
+    var picker_visible: std.ArrayList(usize) = .empty;
+    defer picker_visible.deinit(gpa);
+
     // C-x j shell: the pid of a shell suspended with C-z (null while one
     // is merely running, or none). On quit, a stopped shell would be
     // orphaned forever, so kill it.
@@ -2750,6 +2853,8 @@ pub fn main(init: std.process.Init) !void {
                         bookmark_list_active = true;
                         bookmark_list_selected = 0;
                         bookmark_list_top = 0;
+                        picker_query.clearRetainingCapacity();
+                        pickerFilter(gpa, buffers.items, bookmarks.items, true, "", &picker_visible);
                     } else if (key.matches('j', .{})) {
                         // C-c j: step back through window layouts
                         // (winner-mode undo).
@@ -2986,18 +3091,22 @@ pub fn main(init: std.process.Init) !void {
                         // List isearch — the buffer and bookmark pickers:
                         // the selection stands in for the cursor, and the
                         // search runs over the rows (row-granular, like
-                        // isearch in a dired). Confirming leaves the match
+                        // isearch in a dired) — the visible rows when a
+                        // filter is active. Confirming leaves the match
                         // selected, so the picker's Enter then opens it.
+                        const vis = picker_visible.items;
                         if (key.matches('g', .{ .ctrl = true })) {
-                            if (bookmark_list_active) bookmark_list_selected = isearch_origin.row else buffer_list_selected = isearch_origin.row;
+                            if (vis.len > 0) {
+                                if (bookmark_list_active) bookmark_list_selected = vis[isearch_origin.row % vis.len] else buffer_list_selected = vis[isearch_origin.row % vis.len];
+                            }
                             isearch_active = false;
                             isearch_match = null;
                             isearch_query.clearRetainingCapacity();
                         } else if (key.matches('s', .{ .ctrl = true })) {
                             isearch_dir = .forward;
                             if (isearch_query.items.len > 0) {
-                                const from = if (isearch_match) |m| m.row + 1 else isearch_origin.row;
-                                if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, isearch_query.items, from, true)) |m| {
+                                const from = if (isearch_match) |m| pickerSelectionPos(vis, m.row) + 1 else isearch_origin.row;
+                                if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, vis, isearch_query.items, from, true)) |m| {
                                     isearch_match = m;
                                     isearch_failed = false;
                                     if (bookmark_list_active) bookmark_list_selected = m.row else buffer_list_selected = m.row;
@@ -3007,10 +3116,9 @@ pub fn main(init: std.process.Init) !void {
                             }
                         } else if (key.matches('r', .{ .ctrl = true })) {
                             isearch_dir = .backward;
-                            if (isearch_query.items.len > 0) {
-                                const count = if (bookmark_list_active) bookmarks.items.len else buffers.items.len;
-                                const from = if (isearch_match) |m| (m.row + count - 1) % count else isearch_origin.row;
-                                if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, isearch_query.items, from, false)) |m| {
+                            if (isearch_query.items.len > 0 and vis.len > 0) {
+                                const from = if (isearch_match) |m| (pickerSelectionPos(vis, m.row) + vis.len - 1) % vis.len else isearch_origin.row;
+                                if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, vis, isearch_query.items, from, false)) |m| {
                                     isearch_match = m;
                                     isearch_failed = false;
                                     if (bookmark_list_active) bookmark_list_selected = m.row else buffer_list_selected = m.row;
@@ -3021,10 +3129,12 @@ pub fn main(init: std.process.Init) !void {
                         } else if (key.matches(vaxis.Key.backspace, .{})) {
                             if (isearch_query.items.len > 0) _ = isearch_query.pop();
                             if (isearch_query.items.len == 0) {
-                                if (bookmark_list_active) bookmark_list_selected = isearch_origin.row else buffer_list_selected = isearch_origin.row;
+                                if (vis.len > 0) {
+                                    if (bookmark_list_active) bookmark_list_selected = vis[isearch_origin.row % vis.len] else buffer_list_selected = vis[isearch_origin.row % vis.len];
+                                }
                                 isearch_match = null;
                                 isearch_failed = false;
-                            } else if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
+                            } else if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, vis, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
                                 isearch_match = m;
                                 isearch_failed = false;
                                 if (bookmark_list_active) bookmark_list_selected = m.row else buffer_list_selected = m.row;
@@ -3037,7 +3147,7 @@ pub fn main(init: std.process.Init) !void {
                             isearch_active = false;
                         } else if (key.text) |t| {
                             try isearch_query.appendSlice(gpa, t);
-                            if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
+                            if (pickerFindNext(buffers.items, bookmarks.items, bookmark_list_active, vis, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
                                 isearch_match = m;
                                 isearch_failed = false;
                                 if (bookmark_list_active) bookmark_list_selected = m.row else buffer_list_selected = m.row;
@@ -3123,48 +3233,51 @@ pub fn main(init: std.process.Init) !void {
                         }
                     }
                 } else if (bookmark_list_active) {
-                    if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
+                    if (key.matches('g', .{ .ctrl = true })) {
+                        // C-g: clear the filter first; a second C-g (or q)
+                        // closes the picker.
+                        if (picker_query.items.len > 0) {
+                            picker_query.clearRetainingCapacity();
+                            filterPicker(gpa, buffers.items, bookmarks.items, true, picker_query.items, &picker_visible, &bookmark_list_selected);
+                        } else {
+                            bookmark_list_active = false;
+                        }
+                    } else if (key.matches('q', .{})) {
                         bookmark_list_active = false;
-                    } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
-                        if (bookmark_list_selected + 1 < bookmarks.items.len) bookmark_list_selected += 1;
-                    } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
-                        if (bookmark_list_selected > 0) bookmark_list_selected -= 1;
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        // Backspace shortens the filter; at the empty query
+                        // it's a no-op (C-g closes).
+                        if (picker_query.items.len > 0) {
+                            _ = picker_query.pop();
+                            filterPicker(gpa, buffers.items, bookmarks.items, true, picker_query.items, &picker_visible, &bookmark_list_selected);
+                        }
+                    } else if (key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
+                        const pos = pickerSelectionPos(picker_visible.items, bookmark_list_selected);
+                        if (pos + 1 < picker_visible.items.len) bookmark_list_selected = picker_visible.items[pos + 1];
+                    } else if (key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
+                        const pos = pickerSelectionPos(picker_visible.items, bookmark_list_selected);
+                        if (pos > 0) bookmark_list_selected = picker_visible.items[pos - 1];
                     } else if (key.matches('s', .{ .ctrl = true })) {
                         // C-s / C-r: incremental search over the rows (the
                         // selection follows the match), like isearch in a
-                        // dired.
+                        // dired — over the filtered rows when one is active.
                         isearch_active = true;
                         isearch_dir = .forward;
-                        isearch_origin = .{ .row = bookmark_list_selected, .col = 0 };
+                        isearch_origin = .{ .row = pickerSelectionPos(picker_visible.items, bookmark_list_selected), .col = 0 };
                         isearch_match = null;
                         isearch_failed = false;
                         isearch_query.clearRetainingCapacity();
                     } else if (key.matches('r', .{ .ctrl = true })) {
                         isearch_active = true;
                         isearch_dir = .backward;
-                        isearch_origin = .{ .row = bookmark_list_selected, .col = 0 };
+                        isearch_origin = .{ .row = pickerSelectionPos(picker_visible.items, bookmark_list_selected), .col = 0 };
                         isearch_match = null;
                         isearch_failed = false;
                         isearch_query.clearRetainingCapacity();
-                    } else if (key.matches('e', .{})) {
-                        // e: open the bookmarks file itself for editing —
-                        // the plain text file james keeps the bookmark
-                        // list in (name<TAB>path<TAB>row<TAB>col per
-                        // line), so the list can be reviewed or hand-
-                        // edited directly. Saving it reloads the in-memory
-                        // list (see refreshBookmarksAfterSave).
-                        if (bookmarksFilePath(gpa, init.environ_map)) |path| {
-                            defer gpa.free(path);
-                            bookmark_list_active = false;
-                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                            current = try openBufferOrDired(gpa, io, &buffers, &direds, path);
-                            focused.buf_idx = current;
-                        }
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches('f', .{})) {
-                        // Enter / C-j, or "f" (the dirlst-find-file key from
-                        // the Jasspa setup): open the selected bookmark,
-                        // jumping to the recorded position.
-                        if (bookmark_list_selected < bookmarks.items.len) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
+                        // Enter / C-j: open the selected bookmark, jumping
+                        // to the recorded position.
+                        if (picker_visible.items.len > 0 and bookmark_list_selected < bookmarks.items.len) {
                             const name = bookmarks.items[bookmark_list_selected].name;
                             bookmark_list_active = false;
                             if (bookmarkJump(gpa, io, &buffers, &direds, bookmarks.items, name)) |idx| {
@@ -3173,39 +3286,69 @@ pub fn main(init: std.process.Init) !void {
                                 focused.buf_idx = idx;
                             }
                         }
+                    } else if (key.text) |t| {
+                        // Type to filter: every letter (n/p included) narrows
+                        // the list (fuzzy, best rows first); arrows and C-n /
+                        // C-p move the selection.
+                        try picker_query.appendSlice(gpa, t);
+                        filterPicker(gpa, buffers.items, bookmarks.items, true, picker_query.items, &picker_visible, &bookmark_list_selected);
                     }
                 } else if (buffer_list_active) {
-                    if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
+                    if (key.matches('g', .{ .ctrl = true })) {
+                        // C-g: clear the filter first; a second C-g (or q)
+                        // closes the picker.
+                        if (picker_query.items.len > 0) {
+                            picker_query.clearRetainingCapacity();
+                            filterPicker(gpa, buffers.items, bookmarks.items, false, picker_query.items, &picker_visible, &buffer_list_selected);
+                        } else {
+                            buffer_list_active = false;
+                        }
+                    } else if (key.matches('q', .{})) {
                         buffer_list_active = false;
-                    } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
-                        if (buffer_list_selected + 1 < buffers.items.len) buffer_list_selected += 1;
-                    } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
-                        if (buffer_list_selected > 0) buffer_list_selected -= 1;
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        // Backspace shortens the filter; at the empty query
+                        // it's a no-op (C-g closes).
+                        if (picker_query.items.len > 0) {
+                            _ = picker_query.pop();
+                            filterPicker(gpa, buffers.items, bookmarks.items, false, picker_query.items, &picker_visible, &buffer_list_selected);
+                        }
+                    } else if (key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
+                        const pos = pickerSelectionPos(picker_visible.items, buffer_list_selected);
+                        if (pos + 1 < picker_visible.items.len) buffer_list_selected = picker_visible.items[pos + 1];
+                    } else if (key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
+                        const pos = pickerSelectionPos(picker_visible.items, buffer_list_selected);
+                        if (pos > 0) buffer_list_selected = picker_visible.items[pos - 1];
                     } else if (key.matches('s', .{ .ctrl = true })) {
                         // C-s / C-r: incremental search over the rows (the
                         // selection follows the match), like isearch in a
-                        // dired.
+                        // dired — over the filtered rows when one is active.
                         isearch_active = true;
                         isearch_dir = .forward;
-                        isearch_origin = .{ .row = buffer_list_selected, .col = 0 };
+                        isearch_origin = .{ .row = pickerSelectionPos(picker_visible.items, buffer_list_selected), .col = 0 };
                         isearch_match = null;
                         isearch_failed = false;
                         isearch_query.clearRetainingCapacity();
                     } else if (key.matches('r', .{ .ctrl = true })) {
                         isearch_active = true;
                         isearch_dir = .backward;
-                        isearch_origin = .{ .row = buffer_list_selected, .col = 0 };
+                        isearch_origin = .{ .row = pickerSelectionPos(picker_visible.items, buffer_list_selected), .col = 0 };
                         isearch_match = null;
                         isearch_failed = false;
                         isearch_query.clearRetainingCapacity();
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches('f', .{})) {
-                        if (buffer_list_selected < buffers.items.len) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
+                        if (picker_visible.items.len > 0 and buffer_list_selected < buffers.items.len) {
                             buffer_list_active = false;
                             recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                             current = buffer_list_selected;
                             focused.buf_idx = current;
                             kill_active = false;
                         }
+                    } else if (key.text) |t| {
+                        // Type to filter: every letter (n/p included) narrows
+                        // the list (fuzzy, best rows first); arrows and C-n /
+                        // C-p move the selection.
+                        try picker_query.appendSlice(gpa, t);
+                        filterPicker(gpa, buffers.items, bookmarks.items, false, picker_query.items, &picker_visible, &buffer_list_selected);
                     }
                 } else if (pending_ctrl_x) {
                     pending_ctrl_x = false;
@@ -3231,6 +3374,8 @@ pub fn main(init: std.process.Init) !void {
                         buffer_list_active = true;
                         buffer_list_selected = current;
                         buffer_list_top = 0;
+                        picker_query.clearRetainingCapacity();
+                        pickerFilter(gpa, buffers.items, bookmarks.items, false, "", &picker_visible);
                     } else if (key.matches('k', .{})) {
                         // C-x k: kill the current buffer (Emacs kill-buffer).
                         // A modified file buffer asks first (y saves and
@@ -3340,6 +3485,8 @@ pub fn main(init: std.process.Init) !void {
                         bookmark_list_active = true;
                         bookmark_list_selected = 0;
                         bookmark_list_top = 0;
+                        picker_query.clearRetainingCapacity();
+                        pickerFilter(gpa, buffers.items, bookmarks.items, true, "", &picker_visible);
                     }
                 } else if (pending_alt_l) {
                     // M-l: the my-jump keymap from the author's Emacs
@@ -3358,6 +3505,8 @@ pub fn main(init: std.process.Init) !void {
                         bookmark_list_active = true;
                         bookmark_list_selected = 0;
                         bookmark_list_top = 0;
+                        picker_query.clearRetainingCapacity();
+                        pickerFilter(gpa, buffers.items, bookmarks.items, true, "", &picker_visible);
                     } else if (key.matches('r', .{})) {
                         // M-l r: switch to the *scratch* buffer — the
                         // scratch.txt file the home-screen layout also
@@ -4093,26 +4242,29 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (bookmark_list_active) {
-            // The bookmark picker: one name per row, Enter jumps.
+            // The bookmark picker: one name per row, Enter jumps. Typing
+            // filters the rows (see pickerFilter) — the block cursor marks
+            // the selected bookmark among the visible ones.
+            const sel_pos = pickerSelectionPos(picker_visible.items, bookmark_list_selected);
             if (text_height > 0) {
-                if (bookmark_list_selected < bookmark_list_top) {
-                    bookmark_list_top = bookmark_list_selected;
-                } else if (bookmark_list_selected >= bookmark_list_top + text_height) {
-                    bookmark_list_top = bookmark_list_selected - text_height + 1;
+                if (sel_pos < bookmark_list_top) {
+                    bookmark_list_top = sel_pos;
+                } else if (sel_pos >= bookmark_list_top + text_height) {
+                    bookmark_list_top = sel_pos - text_height + 1;
                 }
             }
             var list_row: u16 = 0;
             var i = bookmark_list_top;
-            while (i < bookmarks.items.len and list_row < text_height) : (i += 1) {
+            while (i < picker_visible.items.len and list_row < text_height) : (i += 1) {
                 // The bookmark name, then its base directory dimmed after
                 // it. For a dired bookmark the path is a directory, so it
                 // shows itself; for a file bookmark, its parent directory.
-                const b = bookmarks.items[i];
+                const b = bookmarks.items[picker_visible.items[i]];
                 // An active isearch highlights the matched part of the
                 // name, like the dired and file-buffer match highlights.
                 const hl: ?Highlight = if (isearch_active and !isearch_failed) blk: {
                     if (isearch_match) |m| {
-                        if (i == m.row) {
+                        if (picker_visible.items[i] == m.row) {
                             const start = @min(m.col, b.name.len);
                             const end = @min(m.col + isearch_query.items.len, b.name.len);
                             if (end > start) break :blk .{ .start = start, .end = end };
@@ -4154,15 +4306,23 @@ pub fn main(init: std.process.Init) !void {
                 if (ml.label_len < ml.len) {
                     _ = body.printSegment(.{ .text = list_ml_buf[ml.label_len..ml.len], .style = .{} }, .{ .row_offset = body.height -| 1, .col_offset = body.gwidth(list_ml_buf[0..ml.label_len]) });
                 }
+            } else if (picker_query.items.len > 0) {
+                const shown = if (picker_visible.items.len > 0) sel_pos + 1 else 0;
+                const list_ml = std.fmt.bufPrint(&list_ml_buf, "Bookmarks ({d}/{d})   filter: {s}   (C-g clears, Enter opens, arrows move, q closes)", .{
+                    shown,
+                    picker_visible.items.len,
+                    picker_query.items,
+                }) catch "Bookmarks";
+                _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
             } else {
-                const list_ml = std.fmt.bufPrint(&list_ml_buf, "Bookmarks ({d}/{d})   (C-s searches, Enter/f jumps, e edits the bookmarks file, n/p move, q closes)", .{
-                    bookmark_list_selected + 1,
+                const list_ml = std.fmt.bufPrint(&list_ml_buf, "Bookmarks ({d}/{d})   (type to filter, C-s searches, Enter jumps, arrows move, q closes)", .{
+                    sel_pos + 1,
                     bookmarks.items.len,
                 }) catch "Bookmarks";
                 _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
             }
             // No highlights: the block cursor marks the selected bookmark.
-            body.showCursor(0, @intCast(bookmark_list_selected - bookmark_list_top));
+            body.showCursor(0, @intCast(sel_pos - bookmark_list_top));
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;
@@ -4170,23 +4330,26 @@ pub fn main(init: std.process.Init) !void {
 
         if (buffer_list_active) {
             // The buffer picker: one buffer name per row, Enter switches.
+            // Typing filters the rows (see pickerFilter) — the block
+            // cursor marks the selected buffer among the visible ones.
+            const sel_pos = pickerSelectionPos(picker_visible.items, buffer_list_selected);
             if (text_height > 0) {
-                if (buffer_list_selected < buffer_list_top) {
-                    buffer_list_top = buffer_list_selected;
-                } else if (buffer_list_selected >= buffer_list_top + text_height) {
-                    buffer_list_top = buffer_list_selected - text_height + 1;
+                if (sel_pos < buffer_list_top) {
+                    buffer_list_top = sel_pos;
+                } else if (sel_pos >= buffer_list_top + text_height) {
+                    buffer_list_top = sel_pos - text_height + 1;
                 }
             }
             var list_row: u16 = 0;
             var i = buffer_list_top;
-            while (i < buffers.items.len and list_row < text_height) : (i += 1) {
-                const b: *Buffer = buffers.items[i];
+            while (i < picker_visible.items.len and list_row < text_height) : (i += 1) {
+                const b: *Buffer = buffers.items[picker_visible.items[i]];
                 const name = b.display_name orelse b.filename orelse "?";
                 // An active isearch highlights the matched part of the
                 // name, like the dired and file-buffer match highlights.
                 const hl: ?Highlight = if (isearch_active and !isearch_failed) blk: {
                     if (isearch_match) |m| {
-                        if (i == m.row) {
+                        if (picker_visible.items[i] == m.row) {
                             const start = @min(m.col, name.len);
                             const end = @min(m.col + isearch_query.items.len, name.len);
                             if (end > start) break :blk .{ .start = start, .end = end };
@@ -4221,15 +4384,23 @@ pub fn main(init: std.process.Init) !void {
                 if (ml.label_len < ml.len) {
                     _ = body.printSegment(.{ .text = list_ml_buf[ml.label_len..ml.len], .style = .{} }, .{ .row_offset = body.height -| 1, .col_offset = body.gwidth(list_ml_buf[0..ml.label_len]) });
                 }
+            } else if (picker_query.items.len > 0) {
+                const shown = if (picker_visible.items.len > 0) sel_pos + 1 else 0;
+                const list_ml = std.fmt.bufPrint(&list_ml_buf, "Buffers ({d}/{d})   filter: {s}   (C-g clears, Enter opens, arrows move, q closes)", .{
+                    shown,
+                    picker_visible.items.len,
+                    picker_query.items,
+                }) catch "Buffers";
+                _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
             } else {
-                const list_ml = std.fmt.bufPrint(&list_ml_buf, "Buffers ({d}/{d})   (C-s searches, Enter/f switches, n/p move, q closes)", .{
-                    buffer_list_selected + 1,
+                const list_ml = std.fmt.bufPrint(&list_ml_buf, "Buffers ({d}/{d})   (type to filter, C-s searches, Enter switches, arrows move, q closes)", .{
+                    sel_pos + 1,
                     buffers.items.len,
                 }) catch "Buffers";
                 _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
             }
             // No highlights: the block cursor marks the selected buffer.
-            body.showCursor(0, if (text_height > 0) @intCast(buffer_list_selected - buffer_list_top) else 0);
+            body.showCursor(0, if (text_height > 0) @intCast(sel_pos - buffer_list_top) else 0);
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;
