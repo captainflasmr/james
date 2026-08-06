@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.28.0 — <2026-08-05>
+
+New tabs open on the current buffer.
+
+- =M-l == now opens a new tab as a single window on the buffer the cursor is in — the point's buffer — instead of the scratch buffer, so a second tab continues the work in view rather than starting from a blank scratch. (Tabs still share the buffer list without per-tab association, so the two tabs show the same buffer like any other split would.)
+
 ** 0.27.0 — <2026-08-05>
 
 The welcome screen's version line shows the build time.

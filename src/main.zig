@@ -3120,8 +3120,9 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('=', .{})) {
                         // M-l =: open a new tab at the right end of the
                         // tab set (capped at MAX_TABS). The new tab is a
-                        // single window on the scratch buffer (created if
-                        // missing), like a fresh start.
+                        // single window on the current buffer — the one
+                        // the cursor is in — so work continues where it
+                        // left off.
                         new_tab: {
                             if (tabs.items.len >= MAX_TABS) {
                                 status_msg = "Max tabs reached";
@@ -3129,20 +3130,14 @@ pub fn main(init: std.process.Init) !void {
                             }
                             const new_root = gpa.create(Pane) catch break :new_tab;
                             tabs.items[active_tab] = .{ .root = root, .focused = focused, .current = current };
-                            var new_current = current;
-                            if (std.Io.Dir.cwd().createFile(io, "scratch.txt", .{ .truncate = false })) |f| {
-                                f.close(io);
-                                new_current = openBufferOrDired(gpa, io, &buffers, &direds, "scratch.txt") catch current;
-                            } else |_| {}
-                            new_root.* = .{ .buf_idx = new_current };
-                            tabs.append(gpa, .{ .root = new_root, .focused = new_root, .current = new_current }) catch {
+                            new_root.* = .{ .buf_idx = current };
+                            tabs.append(gpa, .{ .root = new_root, .focused = new_root, .current = current }) catch {
                                 new_root.destroy(gpa);
                                 break :new_tab;
                             };
                             active_tab = tabs.items.len - 1;
                             root = new_root;
                             focused = new_root;
-                            current = new_current;
                             // Window history doesn't cross tabs.
                             window_undo.clearRetainingCapacity();
                             window_redo.clearRetainingCapacity();
