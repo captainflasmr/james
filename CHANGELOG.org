@@ -10,6 +10,25 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.47.0 — <2026-08-06>
+
+The pickers match Emacs partial-completion style.
+
+- The pickers' filter no longer uses the flex-style subsequence matcher: the query splits at spaces into groups, and every group must be a contiguous case-insensitive substring of the name, in order — =d z= matches =Dired.zig= (the =d=, then a =z= later), while a scattered =maig= no longer matches =main.zig=. Earliest matches rank first; the matched characters still highlight in each row as you type.
+
+** 0.46.0 — <2026-08-06>
+
+The pickers highlight their matches.
+
+- The filter's matched characters highlight in reverse video in every picker row as you type — each visible entry shows exactly which characters the fuzzy match hit, so the narrowing is visible at a glance (in the files picker, the find results; in the buffer, bookmark and recent pickers too). The highlight is one grapheme at a time, so a match landing inside a multi-byte character still renders cleanly, and it loses to an active isearch highlight.
+- The pickers no longer have single-letter action keys — typing =q= now filters like any other letter (a name starting with q, or a bare =q=, filters instead of closing). Closing is =C-g= / Esc, which clears the filter first and closes on the second press; the modeline hints now read =C-g/Esc closes=.
+
+** 0.45.0 — <2026-08-06>
+
+=C-c f= finds files.
+
+- =C-c f= (the my/find-file key from the author's Emacs) lists the current directory's files — the dired's own while browsing, the file's directory otherwise — via ripgrep =--files= when available, falling back to =find -type f= on POSIX and Windows' =dir /s /b= (Windows' built-in =find= searches file contents, the DOS-era grep, so =dir= is the name lister there). The results open in the fuzzy files picker: typing narrows the list (matched against the full path, like fzf), arrows / =C-n= / =C-p= move, Enter opens the file, =C-s= / =C-r= search the rows, =C-g= clears the filter then closes, and =q= closes.
+
 ** 0.44.0 — <2026-08-06>
 
 Grep jumps flash the match.

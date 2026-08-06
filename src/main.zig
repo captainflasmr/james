@@ -1449,6 +1449,20 @@ fn grepRun(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, term: []const u8
     return runCapture(io, gpa, &.{ "grep", "-rni", "-e", term, dir });
 }
 
+/// Run the platform's file-finder over `dir`, returning the file list
+/// (null on failure): ripgrep --files when available, then the built-in
+/// find — `find -type f` on POSIX, Windows' `dir /s /b` (Windows has no
+/// find that lists names: its find.exe searches file contents, the
+/// DOS-era grep — dir is the name lister).
+fn findRun(io: std.Io, gpa: std.mem.Allocator, dir: []const u8) ?[]u8 {
+    if (comptime builtin.os.tag == .windows) {
+        if (runCapture(io, gpa, &.{ "rg", "--files", dir })) |out| return out;
+        return runCapture(io, gpa, &.{ "cmd.exe", "/c", "dir", "/s", "/b", dir });
+    }
+    if (runCapture(io, gpa, &.{ "rg", "--files", dir })) |out| return out;
+    return runCapture(io, gpa, &.{ "find", dir, "-type", "f" });
+}
+
 /// The application the desktop would use to open `path` externally: on
 /// Linux the MIME default handler from xdg-mime (firefox.desktop →
 /// firefox), otherwise the generic opener that `openExternal` would run
@@ -1887,6 +1901,7 @@ const welcome_tail =
     \\    C-c w               copy the region
     \\    C-c C-k             close the dired buffer
     \\    C-c o               open the bookmark list
+    \\    C-c f               find files (fuzzy list)
     \\    C-c g               grep the current directory (Enter opens, F follows)
     \\    C-c j / C-c k       step back / forward through window layouts
     \\
@@ -2183,23 +2198,26 @@ fn syncDiredSelection(direds: []?Dired, current: usize, buf: *Buffer) void {
 
 /// The row source of the modal picker: the open buffers (C-x b), the
 /// bookmark list (C-x r l / C-c o / M-l o), or the recent files (M-l l).
-const PickerKind = enum { buffers, bookmarks, recent };
+const PickerKind = enum { buffers, bookmarks, recent, files };
 
 /// The number of rows in a picker of `kind`.
-fn pickerRowCount(kind: PickerKind, buffers: []*Buffer, bookmarks: []const Bookmark, recent: []const []const u8) usize {
+fn pickerRowCount(kind: PickerKind, buffers: []*Buffer, bookmarks: []const Bookmark, paths: []const []const u8) usize {
     return switch (kind) {
         .buffers => buffers.len,
         .bookmarks => bookmarks.len,
-        .recent => recent.len,
+        .recent, .files => paths.len,
     };
 }
 
-/// The display name of picker row `idx` (a full-list index).
-fn pickerRowName(kind: PickerKind, buffers: []*Buffer, bookmarks: []const Bookmark, recent: []const []const u8, idx: usize) []const u8 {
+/// The display name of picker row `idx` (a full-list index). The files
+/// picker (C-c f) shows the full path, so a fuzzy query matches against
+/// the whole path, like fzf.
+fn pickerRowName(kind: PickerKind, buffers: []*Buffer, bookmarks: []const Bookmark, paths: []const []const u8, idx: usize) []const u8 {
     return switch (kind) {
         .buffers => buffers[idx].display_name orelse buffers[idx].filename orelse "?",
         .bookmarks => bookmarks[idx].name,
-        .recent => std.fs.path.basename(recent[idx]),
+        .recent => std.fs.path.basename(paths[idx]),
+        .files => paths[idx],
     };
 }
 
@@ -2238,49 +2256,61 @@ fn pickerFindNext(
 /// consecutive runs rank higher than scattered hits (an fzf-style filter
 /// for the pickers). Null when `query` isn't a subsequence; higher scores
 /// are better.
-fn fuzzyScore(query: []const u8, text: []const u8) ?i64 {
-    var score: i64 = 0;
-    var qi: usize = 0;
-    var streak: usize = 0;
-    for (text, 0..) |c, ti| {
-        if (qi < query.len and std.ascii.toLower(c) == std.ascii.toLower(query[qi])) {
-            qi += 1;
-            score += if (ti == 0)
-                3
-            else if (!std.ascii.isAlphanumeric(text[ti - 1]))
-                3
-            else if (std.ascii.isUpper(c) and std.ascii.isLower(text[ti - 1]))
-                2
-            else if (streak > 0)
-                2
-            else
-                1;
-            streak += 1;
-            if (qi == query.len) return score;
-        } else {
-            streak = 0;
+/// The byte positions of the matched characters in a match, for
+/// highlighting the filter's hits in the picker rows.
+const FuzzyHl = struct {
+    positions: [64]usize = undefined,
+    len: usize = 0,
+};
+
+/// Emacs partial-completion-style match: the query splits at spaces into
+/// groups, and every group must be a contiguous case-insensitive
+/// substring of `text`, in order — "req b" matches "revert-buffer". The
+/// rank is the start of the first group, so earlier matches sort first.
+fn partialMatch(query: []const u8, text: []const u8) ?struct { rank: usize, hl: FuzzyHl } {
+    var hl: FuzzyHl = .{};
+    var pos: usize = 0;
+    var first_group_start: ?usize = null;
+    var it = std.mem.splitScalar(u8, query, ' ');
+    while (it.next()) |group| {
+        if (group.len == 0) continue;
+        const found = std.ascii.indexOfIgnoreCasePos(text, pos, group) orelse return null;
+        if (first_group_start == null) first_group_start = found;
+        var k = found;
+        while (k < found + group.len) : (k += 1) {
+            if (hl.len < hl.positions.len) {
+                hl.positions[hl.len] = k;
+                hl.len += 1;
+            }
         }
+        pos = found + group.len;
     }
-    return null;
+    return .{ .rank = first_group_start orelse 0, .hl = hl };
 }
 
-/// One picker row that matched the filter, with its fuzzy score.
+/// One picker row that matched the filter, with its rank and the matched
+/// character positions (for the row highlight).
 const PickerMatch = struct {
     idx: usize,
-    score: i64,
+    rank: usize,
+    hl: FuzzyHl = .{},
 
-    /// Higher scores first; ties keep the original order.
+    /// Lower ranks (earlier first-group matches) first; ties keep the
+    /// original order.
     fn lessThan(_: void, a: PickerMatch, b: PickerMatch) bool {
-        return if (a.score != b.score) a.score > b.score else a.idx < b.idx;
+        return if (a.rank != b.rank) a.rank < b.rank else a.idx < b.idx;
     }
 };
 
 /// Rebuild the picker's visible rows for `query`: the full-list indices
 /// of every entry whose name fuzzy-matches, best matches first; the whole
-/// list in its original order for an empty query.
-fn pickerFilter(gpa: std.mem.Allocator, kind: PickerKind, buffers: []*Buffer, bookmarks: []const Bookmark, recent: []const []const u8, query: []const u8, visible: *std.ArrayList(usize)) void {
+/// list in its original order for an empty query. `hl_out` receives the
+/// matched character positions per visible row, parallel to `visible`
+/// (empty when the query is empty).
+fn pickerFilter(gpa: std.mem.Allocator, kind: PickerKind, buffers: []*Buffer, bookmarks: []const Bookmark, paths: []const []const u8, query: []const u8, visible: *std.ArrayList(usize), hl_out: *std.ArrayList(FuzzyHl)) void {
     visible.clearRetainingCapacity();
-    const count = pickerRowCount(kind, buffers, bookmarks, recent);
+    hl_out.clearRetainingCapacity();
+    const count = pickerRowCount(kind, buffers, bookmarks, paths);
     if (query.len == 0) {
         visible.ensureTotalCapacity(gpa, count) catch return;
         var i: usize = 0;
@@ -2291,19 +2321,22 @@ fn pickerFilter(gpa: std.mem.Allocator, kind: PickerKind, buffers: []*Buffer, bo
     defer matches.deinit(gpa);
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        const name = pickerRowName(kind, buffers, bookmarks, recent, i);
-        if (fuzzyScore(query, name)) |s| matches.append(gpa, .{ .idx = i, .score = s }) catch return;
+        const name = pickerRowName(kind, buffers, bookmarks, paths, i);
+        if (partialMatch(query, name)) |m| matches.append(gpa, .{ .idx = i, .rank = m.rank, .hl = m.hl }) catch return;
     }
     std.mem.sort(PickerMatch, matches.items, {}, PickerMatch.lessThan);
-    for (matches.items) |m| visible.append(gpa, m.idx) catch return;
+    for (matches.items) |m| {
+        visible.append(gpa, m.idx) catch return;
+        hl_out.append(gpa, m.hl) catch return;
+    }
 }
 
 /// Refilter a picker, keeping `selected` on its entry when it still
 /// shows; with no rows left it stays put (nothing opens), otherwise the
 /// top match is selected.
-fn filterPicker(gpa: std.mem.Allocator, kind: PickerKind, buffers: []*Buffer, bookmarks: []const Bookmark, recent: []const []const u8, query: []const u8, visible: *std.ArrayList(usize), selected: *usize) void {
+fn filterPicker(gpa: std.mem.Allocator, kind: PickerKind, buffers: []*Buffer, bookmarks: []const Bookmark, paths: []const []const u8, query: []const u8, visible: *std.ArrayList(usize), selected: *usize, hl_out: *std.ArrayList(FuzzyHl)) void {
     const before = selected.*;
-    pickerFilter(gpa, kind, buffers, bookmarks, recent, query, visible);
+    pickerFilter(gpa, kind, buffers, bookmarks, paths, query, visible, hl_out);
     if (visible.items.len == 0) return;
     if (std.mem.indexOfScalar(usize, visible.items, before) == null) selected.* = visible.items[0];
 }
@@ -3069,6 +3102,20 @@ pub fn main(init: std.process.Init) !void {
     defer picker_query.deinit(gpa);
     var picker_visible: std.ArrayList(usize) = .empty;
     defer picker_visible.deinit(gpa);
+    // Matched-character positions per visible picker row, parallel to
+    // picker_visible (see pickerFilter) — drawn so the filter's hits are
+    // visible in the rows as you type.
+    var picker_hl: std.ArrayList(FuzzyHl) = .empty;
+    defer picker_hl.deinit(gpa);
+
+    // C-c f: find files — the platform's file-finder (ripgrep --files,
+    // find, or Windows dir /s /b) lists the current directory, and the
+    // files picker opens over the results for fuzzy filtering.
+    var find_files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (find_files.items) |p| gpa.free(p);
+        find_files.deinit(gpa);
+    }
 
     // C-x j shell: the pid of a shell suspended with C-z (null while one
     // is merely running, or none). On quit, a stopped shell would be
@@ -3223,7 +3270,42 @@ pub fn main(init: std.process.Init) !void {
                         picker_selected = 0;
                         picker_top = 0;
                         picker_query.clearRetainingCapacity();
-                        pickerFilter(gpa, .bookmarks, buffers.items, bookmarks.items, recent.items, "", &picker_visible);
+                        pickerFilter(gpa, .bookmarks, buffers.items, bookmarks.items, recent.items, "", &picker_visible, &picker_hl);
+                    } else if (key.matches('f', .{})) {
+                        // C-c f: find files (the my/find-file key from the
+                        // author's Emacs) — the platform's file-finder
+                        // lists the current directory (the dired's own
+                        // while browsing, else the file's), and the fuzzy
+                        // files picker opens over the results.
+                        find_run: {
+                            const dir = if (direds.items[current]) |*d|
+                                try gpa.dupe(u8, d.path.items)
+                            else
+                                try Dired.startingDir(gpa, buf.filename orelse ".");
+                            defer gpa.free(dir);
+                            for (find_files.items) |p| gpa.free(p);
+                            find_files.clearRetainingCapacity();
+                            const out = findRun(io, gpa, dir) orelse {
+                                status_msg = "No files found";
+                                break :find_run;
+                            };
+                            defer gpa.free(out);
+                            var it = std.mem.splitScalar(u8, out, '\n');
+                            while (it.next()) |raw| {
+                                const p = std.mem.trim(u8, raw, " \t\r");
+                                if (p.len == 0) continue;
+                                find_files.append(gpa, gpa.dupe(u8, p) catch continue) catch continue;
+                            }
+                            if (find_files.items.len == 0) {
+                                status_msg = "No files found";
+                                break :find_run;
+                            }
+                            picker_kind = .files;
+                            picker_selected = 0;
+                            picker_top = 0;
+                            picker_query.clearRetainingCapacity();
+                            pickerFilter(gpa, .files, buffers.items, bookmarks.items, find_files.items, "", &picker_visible, &picker_hl);
+                        }
                     } else if (key.matches('g', .{})) {
                         // C-c g: grep (the my/grep key from the author's
                         // Emacs) — prompt for a search term, prefilled
@@ -3546,6 +3628,9 @@ pub fn main(init: std.process.Init) !void {
                     // Any other key is ignored while confirming.
                 } else if (isearch_active) {
                     if (picker_kind) |kind| {
+                        // The row source: the find results for the files
+                        // picker, the recent list otherwise.
+                        const paths: []const []const u8 = if (kind == .files) find_files.items else recent.items;
                         // List isearch — the buffer, bookmark and recent
                         // pickers: the selection stands in for the cursor,
                         // and the search runs over the rows (row-granular,
@@ -3562,7 +3647,7 @@ pub fn main(init: std.process.Init) !void {
                             isearch_dir = .forward;
                             if (isearch_query.items.len > 0) {
                                 const from = if (isearch_match) |m| pickerSelectionPos(vis, m.row) + 1 else isearch_origin.row;
-                                if (pickerFindNext(kind, buffers.items, bookmarks.items, recent.items, vis, isearch_query.items, from, true)) |m| {
+                                if (pickerFindNext(kind, buffers.items, bookmarks.items, paths, vis, isearch_query.items, from, true)) |m| {
                                     isearch_match = m;
                                     isearch_failed = false;
                                     picker_selected = m.row;
@@ -3574,7 +3659,7 @@ pub fn main(init: std.process.Init) !void {
                             isearch_dir = .backward;
                             if (isearch_query.items.len > 0 and vis.len > 0) {
                                 const from = if (isearch_match) |m| (pickerSelectionPos(vis, m.row) + vis.len - 1) % vis.len else isearch_origin.row;
-                                if (pickerFindNext(kind, buffers.items, bookmarks.items, recent.items, vis, isearch_query.items, from, false)) |m| {
+                                if (pickerFindNext(kind, buffers.items, bookmarks.items, paths, vis, isearch_query.items, from, false)) |m| {
                                     isearch_match = m;
                                     isearch_failed = false;
                                     picker_selected = m.row;
@@ -3588,7 +3673,7 @@ pub fn main(init: std.process.Init) !void {
                                 if (vis.len > 0) picker_selected = vis[isearch_origin.row % vis.len];
                                 isearch_match = null;
                                 isearch_failed = false;
-                            } else if (pickerFindNext(kind, buffers.items, bookmarks.items, recent.items, vis, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
+                            } else if (pickerFindNext(kind, buffers.items, bookmarks.items, paths, vis, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
                                 isearch_match = m;
                                 isearch_failed = false;
                                 picker_selected = m.row;
@@ -3601,7 +3686,7 @@ pub fn main(init: std.process.Init) !void {
                             isearch_active = false;
                         } else if (key.text) |t| {
                             try isearch_query.appendSlice(gpa, t);
-                            if (pickerFindNext(kind, buffers.items, bookmarks.items, recent.items, vis, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
+                            if (pickerFindNext(kind, buffers.items, bookmarks.items, paths, vis, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
                                 isearch_match = m;
                                 isearch_failed = false;
                                 picker_selected = m.row;
@@ -3687,23 +3772,26 @@ pub fn main(init: std.process.Init) !void {
                         }
                     }
                 } else if (picker_kind) |kind| {
-                    if (key.matches('g', .{ .ctrl = true })) {
-                        // C-g: clear the filter first; a second C-g (or q)
-                        // closes the picker.
+                    // The row source: the find results for the files
+                    // picker, the recent list otherwise.
+                    const paths: []const []const u8 = if (kind == .files) find_files.items else recent.items;
+                    // C-g (or Esc): clear the filter first; a second one
+                    // closes the picker. Every printable key filters —
+                    // no single-letter action keys, so typing a name that
+                    // starts with any letter works.
+                    if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                         if (picker_query.items.len > 0) {
                             picker_query.clearRetainingCapacity();
-                            filterPicker(gpa, kind, buffers.items, bookmarks.items, recent.items, picker_query.items, &picker_visible, &picker_selected);
+                            filterPicker(gpa, kind, buffers.items, bookmarks.items, paths, picker_query.items, &picker_visible, &picker_selected, &picker_hl);
                         } else {
                             picker_kind = null;
                         }
-                    } else if (key.matches('q', .{})) {
-                        picker_kind = null;
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
                         // Backspace shortens the filter; at the empty query
                         // it's a no-op (C-g closes).
                         if (picker_query.items.len > 0) {
                             _ = picker_query.pop();
-                            filterPicker(gpa, kind, buffers.items, bookmarks.items, recent.items, picker_query.items, &picker_visible, &picker_selected);
+                            filterPicker(gpa, kind, buffers.items, bookmarks.items, paths, picker_query.items, &picker_visible, &picker_selected, &picker_hl);
                         }
                     } else if (key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
                         const pos = pickerSelectionPos(picker_visible.items, picker_selected);
@@ -3732,7 +3820,7 @@ pub fn main(init: std.process.Init) !void {
                         // Enter / C-j: open the selection — switch to the
                         // buffer, jump to the bookmark, or open the recent
                         // file.
-                        const count = pickerRowCount(kind, buffers.items, bookmarks.items, recent.items);
+                        const count = pickerRowCount(kind, buffers.items, bookmarks.items, paths);
                         if (picker_visible.items.len > 0 and picker_selected < count) {
                             picker_kind = null;
                             switch (kind) {
@@ -3757,6 +3845,13 @@ pub fn main(init: std.process.Init) !void {
                                     focused.buf_idx = current;
                                     kill_active = false;
                                 },
+                                .files => {
+                                    const path = find_files.items[picker_selected];
+                                    recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                                    current = openBufferOrDired(gpa, io, &buffers, &direds, &recent, path) catch current;
+                                    focused.buf_idx = current;
+                                    kill_active = false;
+                                },
                             }
                         }
                     } else if (key.text) |t| {
@@ -3764,7 +3859,7 @@ pub fn main(init: std.process.Init) !void {
                         // the list (fuzzy, best rows first); arrows and C-n /
                         // C-p move the selection.
                         try picker_query.appendSlice(gpa, t);
-                        filterPicker(gpa, kind, buffers.items, bookmarks.items, recent.items, picker_query.items, &picker_visible, &picker_selected);
+                        filterPicker(gpa, kind, buffers.items, bookmarks.items, paths, picker_query.items, &picker_visible, &picker_selected, &picker_hl);
                     }
                 } else if (pending_ctrl_x) {
                     pending_ctrl_x = false;
@@ -3791,7 +3886,7 @@ pub fn main(init: std.process.Init) !void {
                         picker_selected = current;
                         picker_top = 0;
                         picker_query.clearRetainingCapacity();
-                        pickerFilter(gpa, .buffers, buffers.items, bookmarks.items, recent.items, "", &picker_visible);
+                        pickerFilter(gpa, .buffers, buffers.items, bookmarks.items, recent.items, "", &picker_visible, &picker_hl);
                     } else if (key.matches('k', .{})) {
                         // C-x k: kill the current buffer (Emacs kill-buffer).
                         // A modified file buffer asks first (y saves and
@@ -3902,7 +3997,7 @@ pub fn main(init: std.process.Init) !void {
                         picker_selected = 0;
                         picker_top = 0;
                         picker_query.clearRetainingCapacity();
-                        pickerFilter(gpa, .bookmarks, buffers.items, bookmarks.items, recent.items, "", &picker_visible);
+                        pickerFilter(gpa, .bookmarks, buffers.items, bookmarks.items, recent.items, "", &picker_visible, &picker_hl);
                     }
                 } else if (pending_alt_l) {
                     // M-l: the my-jump keymap from the author's Emacs
@@ -3922,7 +4017,7 @@ pub fn main(init: std.process.Init) !void {
                         picker_selected = 0;
                         picker_top = 0;
                         picker_query.clearRetainingCapacity();
-                        pickerFilter(gpa, .bookmarks, buffers.items, bookmarks.items, recent.items, "", &picker_visible);
+                        pickerFilter(gpa, .bookmarks, buffers.items, bookmarks.items, recent.items, "", &picker_visible, &picker_hl);
                     } else if (key.matches('l', .{})) {
                         // M-l l: pick a recently opened file (the
                         // my/fido-recentf key from the author's Emacs).
@@ -3931,7 +4026,7 @@ pub fn main(init: std.process.Init) !void {
                             picker_selected = 0;
                             picker_top = 0;
                             picker_query.clearRetainingCapacity();
-                            pickerFilter(gpa, .recent, buffers.items, bookmarks.items, recent.items, "", &picker_visible);
+                            pickerFilter(gpa, .recent, buffers.items, bookmarks.items, recent.items, "", &picker_visible, &picker_hl);
                         } else {
                             status_msg = "No recent files";
                         }
@@ -4743,6 +4838,9 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (picker_kind) |kind| {
+            // The row source: the find results for the files picker, the
+            // recent list otherwise.
+            const paths: []const []const u8 = if (kind == .files) find_files.items else recent.items;
             // The picker (buffers / bookmarks / recent files): one row per
             // entry, Enter opens the selection. Typing filters the rows
             // (see pickerFilter) — the block cursor marks the selection
@@ -4759,12 +4857,13 @@ pub fn main(init: std.process.Init) !void {
                 .buffers => "Buffers",
                 .bookmarks => "Bookmarks",
                 .recent => "Recent files",
+                .files => "Files",
             };
             var list_row: u16 = 0;
             var i = picker_top;
             while (i < picker_visible.items.len and list_row < text_height) : (i += 1) {
                 const full = picker_visible.items[i];
-                const name = pickerRowName(kind, buffers.items, bookmarks.items, recent.items, full);
+                const name = pickerRowName(kind, buffers.items, bookmarks.items, paths, full);
                 // For bookmarks and recent files the base directory is
                 // dimmed after the name (a dired bookmark's path is a
                 // directory, so it shows itself; otherwise the parent).
@@ -4774,10 +4873,12 @@ pub fn main(init: std.process.Init) !void {
                         break :blk if (isDirectory(io, b.path)) b.path else std.fs.path.dirname(b.path);
                     },
                     .recent => std.fs.path.dirname(recent.items[full]),
-                    .buffers => null,
+                    .buffers, .files => null,
                 };
                 // An active isearch highlights the matched part of the
-                // name, like the dired and file-buffer match highlights.
+                // name, like the dired and file-buffer match highlights;
+                // otherwise an active filter highlights the characters the
+                // fuzzy match hit, so the rows show why they're there.
                 const hl: ?Highlight = if (isearch_active and !isearch_failed) blk: {
                     if (isearch_match) |m| {
                         if (full == m.row) {
@@ -4788,6 +4889,7 @@ pub fn main(init: std.process.Init) !void {
                     }
                     break :blk null;
                 } else null;
+                const fuzzy_hl: ?FuzzyHl = if (hl == null and picker_query.items.len > 0 and i < picker_hl.items.len) picker_hl.items[i] else null;
                 if (hl) |h| {
                     var col: u16 = 0;
                     if (h.start > 0) {
@@ -4798,6 +4900,27 @@ pub fn main(init: std.process.Init) !void {
                     col += body.gwidth(name[h.start..h.end]);
                     if (h.end < name.len) {
                         _ = body.printSegment(.{ .text = name[h.end..], .style = .{} }, .{ .row_offset = list_row, .col_offset = col });
+                    }
+                } else if (fuzzy_hl) |fh| {
+                    // The filter's matched characters, highlighted one
+                    // grapheme at a time (the positions are byte offsets,
+                    // and a match can land mid-UTF-8).
+                    var seg_start: usize = 0;
+                    var col: u16 = 0;
+                    for (fh.positions[0..fh.len]) |p| {
+                        if (p >= name.len) break;
+                        var e = p + 1;
+                        while (e < name.len and (name[e] & 0xC0) == 0x80) e += 1;
+                        if (p > seg_start) {
+                            _ = body.printSegment(.{ .text = name[seg_start..p], .style = .{} }, .{ .row_offset = list_row, .col_offset = col });
+                            col += body.gwidth(name[seg_start..p]);
+                        }
+                        _ = body.printSegment(.{ .text = name[p..e], .style = highlight_style }, .{ .row_offset = list_row, .col_offset = col });
+                        col += body.gwidth(name[p..e]);
+                        seg_start = e;
+                    }
+                    if (seg_start < name.len) {
+                        _ = body.printSegment(.{ .text = name[seg_start..], .style = .{} }, .{ .row_offset = list_row, .col_offset = col });
                     }
                 } else {
                     _ = body.printSegment(.{ .text = name, .style = .{} }, .{ .row_offset = list_row });
@@ -4820,7 +4943,7 @@ pub fn main(init: std.process.Init) !void {
                 }
             } else if (picker_query.items.len > 0) {
                 const shown = if (picker_visible.items.len > 0) sel_pos + 1 else 0;
-                const list_ml = std.fmt.bufPrint(&list_ml_buf, "{s} ({d}/{d})   filter: {s}   (C-g clears, Enter opens, arrows move, q closes)", .{
+                const list_ml = std.fmt.bufPrint(&list_ml_buf, "{s} ({d}/{d})   filter: {s}   (C-g/Esc closes, Enter opens, arrows move)", .{
                     label,
                     shown,
                     picker_visible.items.len,
@@ -4828,8 +4951,8 @@ pub fn main(init: std.process.Init) !void {
                 }) catch label;
                 _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
             } else {
-                const count = pickerRowCount(kind, buffers.items, bookmarks.items, recent.items);
-                const list_ml = std.fmt.bufPrint(&list_ml_buf, "{s} ({d}/{d})   (type to filter, C-s searches, Enter opens, arrows move, q closes)", .{
+                const count = pickerRowCount(kind, buffers.items, bookmarks.items, paths);
+                const list_ml = std.fmt.bufPrint(&list_ml_buf, "{s} ({d}/{d})   (type to filter, C-s searches, Enter opens, arrows move, C-g/Esc closes)", .{
                     label,
                     sel_pos + 1,
                     count,
