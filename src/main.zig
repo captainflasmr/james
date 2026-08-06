@@ -1692,6 +1692,8 @@ fn closeBuffer(
     root: *Pane,
     focused: *Pane,
     current: usize,
+    window_undo: *std.ArrayList(WindowSnapshot),
+    window_redo: *std.ArrayList(WindowSnapshot),
 ) usize {
     if (buffers.items.len <= 1) return current; // never leave zero buffers
     if (current >= buffers.items.len) return current;
@@ -1707,6 +1709,11 @@ fn closeBuffer(
     // Rebase every window's buffer index onto the shrunken list; a pane
     // that showed the killed buffer now shows the buffer that took its slot.
     fixupBufIndices(root, current, buffers.items.len);
+    // Saved layouts (C-c j / C-c k) hold raw buffer indices too: rebase
+    // them the same way, or stepping back into a stale snapshot could land
+    // on a shifted — or out-of-range — buffer and crash the next frame.
+    for (window_undo.items) |*s| fixupSnapshot(s, current, buffers.items.len);
+    for (window_redo.items) |*s| fixupSnapshot(s, current, buffers.items.len);
     const next = @min(current, buffers.items.len - 1);
     focused.buf_idx = next;
     return next;
@@ -2153,6 +2160,21 @@ fn fixupBufIndices(pane: *Pane, removed: usize, len: usize) void {
     fixupBufIndices(pane.right.?, removed, len);
 }
 
+/// Rebase a saved window snapshot onto a shrunken buffer list, mirroring
+/// the fix-up closeBuffer applies to the live tree: any leaf (and the
+/// recorded focus) that sat after the removed slot shifts down by one,
+/// and indices beyond the new end clamp to the last buffer.
+fn fixupSnapshot(snap: *WindowSnapshot, removed: usize, len: usize) void {
+    for (snap.nodes.items) |*n| {
+        if (n.is_leaf) {
+            if (n.buf_idx > removed) n.buf_idx -= 1;
+            if (n.buf_idx >= len) n.buf_idx = len - 1;
+        }
+    }
+    if (snap.current > removed) snap.current -= 1;
+    if (snap.current >= len) snap.current = len - 1;
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -2514,12 +2536,12 @@ pub fn main(init: std.process.Init) !void {
                                 break :kill;
                             };
                             recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current);
+                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo);
                         }
                     } else if (key.matches('n', .{}) or key.matches('N', .{})) {
                         confirming_kill = false;
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                        current = closeBuffer(gpa, &buffers, &direds, root, focused, current);
+                        current = closeBuffer(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo);
                     } else if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                         confirming_kill = false;
                     }
@@ -2542,7 +2564,7 @@ pub fn main(init: std.process.Init) !void {
                         // Jasspa setup).
                         if (direds.items[current] != null) {
                             recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current);
+                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo);
                         }
                     } else if (key.matches('o', .{})) {
                         // C-c o: open the bookmark picker (the "favorites"
@@ -2554,14 +2576,17 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('j', .{})) {
                         // C-c j: step back through window layouts
                         // (winner-mode undo).
-                        if (windowUndo(gpa, &root, &focused, current, &window_undo, &window_redo)) |nc| {
-                            current = nc;
+                        if (windowUndo(gpa, &root, &focused, current, &window_undo, &window_redo)) |_| {
+                            // Keys act on the pane the cursor is drawn in —
+                            // take its buffer rather than the snapshot's
+                            // recorded index so the two never disagree.
+                            current = focused.buf_idx;
                         }
                     } else if (key.matches('k', .{})) {
                         // C-c k: step forward through window layouts
                         // (winner-mode redo).
-                        if (windowRedo(gpa, &root, &focused, current, &window_undo, &window_redo)) |nc| {
-                            current = nc;
+                        if (windowRedo(gpa, &root, &focused, current, &window_undo, &window_redo)) |_| {
+                            current = focused.buf_idx;
                         }
                     }
                 } else if (switching_buffer) {
@@ -3040,7 +3065,7 @@ pub fn main(init: std.process.Init) !void {
                         } else {
                             const before = buffers.items.len;
                             recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current);
+                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo);
                             if (buffers.items.len == before) status_msg = "Can't kill the last buffer";
                         }
                     } else if (key.matches('f', .{ .ctrl = true })) {
@@ -3314,7 +3339,7 @@ pub fn main(init: std.process.Init) !void {
                     if (direds.items[current]) |*d| {
                         if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
                             recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current);
+                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo);
                         } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
                             d.moveDown();
                         } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {

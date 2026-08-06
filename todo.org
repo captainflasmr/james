@@ -1,7 +1,20 @@
-* TODO james roadmap [20/23]
-** TODO word should wrap over line
+* TODO james roadmap [20/25]
 ** TODO show current keybindings in a new buffer
-** TODO C-c j/k a bit flaky, maybe losing the cursor
+** TODO version/data/time/description better formatted on welcome page
+          _   _    __  __ _____ ____
+         | | / \  |  \/  | ____/ ___|
+      _  | |/ _ \ | |\/| |  _| \___ \
+     | |_| / ___ \| |  | | |___ ___) |
+      \___/_/   \_\_|  |_|_____|____/
+
+        0.37.0 (2026-08-05 09:47)
+          C-x + balances the windows.
+
+  Welcome to james, a minimal Emacs-inspired editor for the terminal.
+
+** TODO fuzzy search in buffer and bookmark list
+** TODO any action in a buffer that adds a prompt in the modeline to be in a bold font
+** DOING C-c j/k is a bit flaky, maybe losing the cursor and is sometimes put in a windows that is not the focus
 ** DONE add balance-windows and bind to C-x +
 ** DONE directory listing in windows dired can be a bit slow to load
 ** DONE M-g to goto line
