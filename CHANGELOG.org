@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.26.0 — <2026-08-05>
+
+=M-w= copies a line with its newline.
+
+- =M-w= with no mark set now copies the current line **including its trailing newline** (the buffer's last line has none), so pasting the line restores the line break — copying a line from a file and yanking it produces a full line, not text glued to whatever follows the paste point, matching Emacs's line copy. Consecutive line copies still join cleanly on the kill ring: the join rule adds a newline separator only when neither side has one, so a line ending in =\\n= appended to an earlier kill stays properly separated.
+
 ** 0.25.0 — <2026-08-05>
 
 The selected dired entry is highlighted.

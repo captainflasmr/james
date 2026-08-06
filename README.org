@@ -46,7 +46,7 @@ Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes 
 | =C-space= | set mark |
 | =C-k= | kill to end of line (or kill the newline, at end of line) |
 | =C-w= | save buffer (=C-x C-s= alias) |
-| =M-w= | copy region (or the current line, with no mark) |
+| =M-w= | copy region (or the current line with its newline, with no mark) |
 | =M-d= / =C-delete= | kill word forward (save to kill ring) |
 | =M-backspace= | kill word backward (save to kill ring) |
 | =C-y= | yank (insert most recent kill) |

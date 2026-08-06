@@ -452,14 +452,19 @@ pub fn copyRegion(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRing, a
 
 /// M-w with no mark: copy the current line (the whole logical line under
 /// point) to the kill ring, without deleting it. Like copyRegion, this
-/// doesn't touch the buffer or the mark. The line text is stored without
-/// a trailing newline, so C-y inserts it at point and a following kill
-/// appends cleanly (newline-joined, like consecutive C-k's).
+/// doesn't touch the buffer or the mark. The line's trailing newline is
+/// included — the last line of the buffer has none — so pasting the line
+/// restores the line break, like Emacs's line copy.
 pub fn copyLine(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRing, append: bool) !void {
     const line = self.lines.items[self.cursor_row].items;
-    const owned = try gpa.dupe(u8, line);
-    defer gpa.free(owned);
-    try rememberKill(gpa, kill_ring, owned, append);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try out.appendSlice(gpa, line);
+    // The line break belongs to the line: a paste of a mid-buffer line
+    // reproduces the break, instead of gluing the line to whatever
+    // follows it at the paste point.
+    if (self.cursor_row + 1 < self.lines.items.len) try out.append(gpa, '\n');
+    try rememberKill(gpa, kill_ring, out.items, append);
 }
 
 /// C-c b: copy the whole buffer to the kill ring, leaving point where it
