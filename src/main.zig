@@ -491,6 +491,51 @@ const GotoPromptView = struct {
     query: []const u8,
 };
 
+/// The modeline text split into its prompt label and the rest: the prompt
+/// a command shows while waiting for input is rendered bold so it stands
+/// out from the typed query.
+const PromptModeline = struct {
+    /// Total length of the modeline text written into the buffer.
+    len: usize,
+    /// Byte length of the bold label — the whole text when the prompt has
+    /// no query (a y/n confirmation), zero when no prompt is showing.
+    label_len: usize,
+};
+
+/// Write a modeline into `out`: `label_fmt` formatted with `label_args`
+/// (the label ends in ": " when a query follows), then the typed `query`.
+/// Returns the total length and the bold-label boundary.
+fn fillPromptModeline(out: []u8, comptime label_fmt: []const u8, label_args: anytype, query: []const u8) PromptModeline {
+    const label = std.fmt.bufPrint(out, label_fmt, label_args) catch return .{ .len = 0, .label_len = 0 };
+    const tail = std.fmt.bufPrint(out[label.len..], "{s}", .{query}) catch return .{ .len = label.len, .label_len = label.len };
+    return .{ .len = label.len + tail.len, .label_len = label.len };
+}
+
+/// Print a full-width modeline bar: the row in `buf` padded with spaces
+/// across `win`, the prompt label bold when one is active (see
+/// PromptModeline), the rest in the base `style`. The text lives in `buf`,
+/// which the caller keeps alive until after the frame — vaxis stores
+/// grapheme slices, not copies.
+fn printModeline(win: vaxis.Window, buf: []u8, ml: PromptModeline, style: vaxis.Style, row: u16) void {
+    const text_w = win.gwidth(buf[0..ml.len]);
+    const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), buf.len - ml.len);
+    if (fill_n > 0) @memset(buf[ml.len .. ml.len + fill_n], ' ');
+    const total = ml.len + fill_n;
+    if (ml.label_len == 0) {
+        _ = win.printSegment(.{ .text = buf[0..total], .style = style }, .{ .row_offset = row });
+        return;
+    }
+    var label_style = style;
+    label_style.bold = true;
+    const label_len = @min(ml.label_len, total);
+    if (label_len < total) {
+        _ = win.printSegment(.{ .text = buf[0..label_len], .style = label_style }, .{ .row_offset = row });
+        _ = win.printSegment(.{ .text = buf[label_len..total], .style = style }, .{ .row_offset = row, .col_offset = win.gwidth(buf[0..label_len]) });
+    } else {
+        _ = win.printSegment(.{ .text = buf[0..total], .style = label_style }, .{ .row_offset = row });
+    }
+}
+
 /// Render one buffer's text plus its own compact modeline into `win`, which
 /// may be the whole screen or one pane of a split. An active isearch shows
 /// its match highlight and prompt in this pane, exactly as if the pane were
@@ -541,46 +586,46 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
         row += @intCast(wraps);
     }
 
-    const modeline = if (find_file) |f|
-        std.fmt.bufPrint(modeline_buf, "Find file: {s}", .{f.query}) catch "Find file: ..."
+    const ml: PromptModeline = if (find_file) |f|
+        fillPromptModeline(modeline_buf, "Find file: ", .{}, f.query)
     else if (bookmark_prompt) |p| blk: {
-        break :blk if (p.set)
-            (std.fmt.bufPrint(modeline_buf, "Bookmark name (C-g cancels): {s}", .{p.query}) catch "Bookmark name")
-        else
-            (std.fmt.bufPrint(modeline_buf, "Jump to bookmark (C-g cancels): {s}", .{p.query}) catch "Jump to bookmark");
+        if (p.set) break :blk fillPromptModeline(modeline_buf, "Bookmark name (C-g cancels): ", .{}, p.query);
+        break :blk fillPromptModeline(modeline_buf, "Jump to bookmark (C-g cancels): ", .{}, p.query);
     } else if (goto_prompt) |g|
-        std.fmt.bufPrint(modeline_buf, "Goto line (C-g cancels): {s}", .{g.query}) catch "Goto line"
+        fillPromptModeline(modeline_buf, "Goto line (C-g cancels): ", .{}, g.query)
     else if (search) |s| blk: {
         const label = if (s.failed)
             (if (s.backward) "Failing I-search backward" else "Failing I-search")
         else
             (if (s.backward) "I-search backward" else "I-search");
-        break :blk std.fmt.bufPrint(modeline_buf, "{s}: {s}", .{ label, s.query }) catch label;
-    } else if (status) |m|
-        std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch "Save failed"
-    else std.fmt.bufPrint(modeline_buf, "{s}{s}{s}{s}  L{d}:C{d}", .{
-        // Emacs-style modified marker in the bottom-left corner of the
-        // modeline.
-        if (buf.dirty) "*" else "",
-        buf.display_name orelse buf.filename orelse "?",
-        if (buf.dirty) " [modified]" else "",
-        // M-z: soft wrap off (truncated lines) shows like Emacs's
-        // Truncate mode-line marker; its absence means wrap is on.
-        if (!buf.soft_wrap) " [truncate]" else "",
-        buf.cursor_row + 1,
-        buf.cursor_col + 1,
-    }) catch "?";
+        break :blk fillPromptModeline(modeline_buf, "{s}: ", .{label}, s.query);
+    } else if (status) |m| blk: {
+        const n = std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch break :blk .{ .len = 0, .label_len = 0 };
+        break :blk .{ .len = n.len, .label_len = 0 };
+    } else blk: {
+        const n = std.fmt.bufPrint(modeline_buf, "{s}{s}{s}{s}  L{d}:C{d}", .{
+            // Emacs-style modified marker in the bottom-left corner of the
+            // modeline.
+            if (buf.dirty) "*" else "",
+            buf.display_name orelse buf.filename orelse "?",
+            if (buf.dirty) " [modified]" else "",
+            // M-z: soft wrap off (truncated lines) shows like Emacs's
+            // Truncate mode-line marker; its absence means wrap is on.
+            if (!buf.soft_wrap) " [truncate]" else "",
+            buf.cursor_row + 1,
+            buf.cursor_col + 1,
+        }) catch break :blk .{ .len = 0, .label_len = 0 };
+        break :blk .{ .len = n.len, .label_len = 0 };
+    };
     // The modeline is a bar spanning the pane's full width, like Emacs's
-    // mode line: reverse video when focused, dimmed otherwise. The whole
-    // row (text + spaces) is one segment built in `modeline_buf`, which the
-    // caller keeps alive until after render — vaxis stores grapheme slices,
-    // not copies, so a stack-local fill buffer would dangle and show
-    // garbage once this frame returns.
+    // mode line: reverse video when focused, dimmed otherwise. An active
+    // prompt's label is bold too, so it stands out from the query text.
+    // The whole row is built in `modeline_buf`, which the caller keeps
+    // alive until after render — vaxis stores grapheme slices, not copies,
+    // so a stack-local fill buffer would dangle and show garbage once this
+    // frame returns.
     const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true };
-    const text_w = win.gwidth(modeline);
-    const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
-    if (fill_n > 0) @memset(modeline_buf[modeline.len .. modeline.len + fill_n], ' ');
-    _ = win.printSegment(.{ .text = modeline_buf[0 .. modeline.len + fill_n], .style = style }, .{ .row_offset = row_base + (height -| 1) });
+    printModeline(win, modeline_buf, ml, style, row_base + (height -| 1));
 
     if (is_focused) {
         // The cursor sits on the cursor's visual line, at its display
@@ -1407,51 +1452,50 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
         row += 1;
     }
 
-    const modeline = if (find_file) |f|
-        std.fmt.bufPrint(modeline_buf, "Find file: {s}", .{f.query}) catch "Find file: ..."
+    const ml: PromptModeline = if (find_file) |f|
+        fillPromptModeline(modeline_buf, "Find file: ", .{}, f.query)
     else if (bookmark_prompt) |p| blk: {
-        break :blk if (p.set)
-            (std.fmt.bufPrint(modeline_buf, "Bookmark name (C-g cancels): {s}", .{p.query}) catch "Bookmark name")
-        else
-            (std.fmt.bufPrint(modeline_buf, "Jump to bookmark (C-g cancels): {s}", .{p.query}) catch "Jump to bookmark");
+        if (p.set) break :blk fillPromptModeline(modeline_buf, "Bookmark name (C-g cancels): ", .{}, p.query);
+        break :blk fillPromptModeline(modeline_buf, "Jump to bookmark (C-g cancels): ", .{}, p.query);
     } else if (goto_prompt) |g|
-        std.fmt.bufPrint(modeline_buf, "Goto line (C-g cancels): {s}", .{g.query}) catch "Goto line"
+        fillPromptModeline(modeline_buf, "Goto line (C-g cancels): ", .{}, g.query)
     else if (search) |s| blk: {
         const label = if (s.failed)
             (if (s.backward) "Failing I-search backward" else "Failing I-search")
         else
             (if (s.backward) "I-search backward" else "I-search");
-        break :blk std.fmt.bufPrint(modeline_buf, "{s}: {s}", .{ label, s.query }) catch label;
+        break :blk fillPromptModeline(modeline_buf, "{s}: ", .{label}, s.query);
     } else if (dired_prompt) |p| blk: {
         const is_dir = dired.selected < dired.entries.items.len and dired.entries.items[dired.selected].is_dir;
         const name = if (dired.selected < dired.entries.items.len) dired.entries.items[dired.selected].name else "";
         break :blk switch (p.kind) {
-            .copy => prompt_blk: {
+            .copy => copy_blk: {
                 const n = diredMarkedCount(dired);
-                if (n > 1) break :prompt_blk std.fmt.bufPrint(modeline_buf, "Copy {d} entries to (C-g cancels): {s}", .{ n, p.query }) catch "Copy to: ...";
-                break :prompt_blk std.fmt.bufPrint(modeline_buf, "Copy {s}{s} to (C-g cancels): {s}", .{ if (is_dir) "directory " else "", name, p.query }) catch "Copy to: ...";
+                if (n > 1) break :copy_blk fillPromptModeline(modeline_buf, "Copy {d} entries to (C-g cancels): ", .{n}, p.query);
+                break :copy_blk fillPromptModeline(modeline_buf, "Copy {s}{s} to (C-g cancels): ", .{ if (is_dir) "directory " else "", name }, p.query);
             },
-            .rename => prompt_blk: {
+            .rename => rename_blk: {
                 const n = diredMarkedCount(dired);
-                if (n > 1) break :prompt_blk std.fmt.bufPrint(modeline_buf, "Rename {d} entries to (C-g cancels): {s}", .{ n, p.query }) catch "Rename to: ...";
-                break :prompt_blk std.fmt.bufPrint(modeline_buf, "Rename {s}{s} to (C-g cancels): {s}", .{ if (is_dir) "directory " else "", name, p.query }) catch "Rename to: ...";
+                if (n > 1) break :rename_blk fillPromptModeline(modeline_buf, "Rename {d} entries to (C-g cancels): ", .{n}, p.query);
+                break :rename_blk fillPromptModeline(modeline_buf, "Rename {s}{s} to (C-g cancels): ", .{ if (is_dir) "directory " else "", name }, p.query);
             },
-            .create_dir => std.fmt.bufPrint(modeline_buf, "Create directory (C-g cancels): {s}", .{p.query}) catch "Create directory: ...",
-            .create_file => std.fmt.bufPrint(modeline_buf, "Create file (C-g cancels): {s}", .{p.query}) catch "Create file: ...",
+            .create_dir => fillPromptModeline(modeline_buf, "Create directory (C-g cancels): ", .{}, p.query),
+            .create_file => fillPromptModeline(modeline_buf, "Create file (C-g cancels): ", .{}, p.query),
             .delete => if (diredMarkedCount(dired) > 1)
-                std.fmt.bufPrint(modeline_buf, "Delete {d} entries? (y / n / C-g cancels)", .{diredMarkedCount(dired)}) catch "Delete?"
+                fillPromptModeline(modeline_buf, "Delete {d} entries? (y / n / C-g cancels)", .{diredMarkedCount(dired)}, "")
             else
-                std.fmt.bufPrint(modeline_buf, "{s}{s}? (y / n / C-g cancels)", .{ if (is_dir) "Recursively delete " else "Delete ", name }) catch "Delete?",
-            .open => std.fmt.bufPrint(modeline_buf, "Open {s} with {s}? (y / n / C-g cancels)", .{ name, p.detail }) catch "Open?",
+                fillPromptModeline(modeline_buf, "{s}{s}? (y / n / C-g cancels)", .{ if (is_dir) "Recursively delete " else "Delete ", name }, ""),
+            .open => fillPromptModeline(modeline_buf, "Open {s} with {s}? (y / n / C-g cancels)", .{ name, p.detail }, ""),
         };
-    } else if (status) |m|
-        std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch "Save failed"
-    else std.fmt.bufPrint(modeline_buf, "Dired: {s}{s}", .{ dired.display_path.items, if (dired.hide_details) " (Hide-Details)" else "" }) catch "Dired";
+    } else if (status) |m| blk: {
+        const n = std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch break :blk .{ .len = 0, .label_len = 0 };
+        break :blk .{ .len = n.len, .label_len = 0 };
+    } else blk: {
+        const n = std.fmt.bufPrint(modeline_buf, "Dired: {s}{s}", .{ dired.display_path.items, if (dired.hide_details) " (Hide-Details)" else "" }) catch break :blk .{ .len = 0, .label_len = 0 };
+        break :blk .{ .len = n.len, .label_len = 0 };
+    };
     const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true };
-    const text_w = win.gwidth(modeline);
-    const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
-    if (fill_n > 0) @memset(modeline_buf[modeline.len .. modeline.len + fill_n], ' ');
-    _ = win.printSegment(.{ .text = modeline_buf[0 .. modeline.len + fill_n], .style = style }, .{ .row_offset = row_base + (height -| 1) });
+    printModeline(win, modeline_buf, ml, style, row_base + (height -| 1));
 
     if (is_focused) {
         // The cursor sits at the start of the entry's name, after the
@@ -3967,17 +4011,23 @@ pub fn main(init: std.process.Init) !void {
                 list_row += 1;
             }
             var list_ml_buf: [2048]u8 = undefined;
-            const list_ml = if (isearch_active) blk: {
+            if (isearch_active) {
                 const label = if (isearch_failed)
                     (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")
                 else
                     (if (isearch_dir == .backward) "I-search backward" else "I-search");
-                break :blk std.fmt.bufPrint(&list_ml_buf, "{s}: {s}", .{ label, isearch_query.items }) catch label;
-            } else std.fmt.bufPrint(&list_ml_buf, "Bookmarks ({d}/{d})   (C-s searches, Enter/f jumps, e edits the bookmarks file, n/p move, q closes)", .{
-                bookmark_list_selected + 1,
-                bookmarks.items.len,
-            }) catch "Bookmarks";
-            _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
+                const ml = fillPromptModeline(&list_ml_buf, "{s}: ", .{label}, isearch_query.items);
+                _ = body.printSegment(.{ .text = list_ml_buf[0..ml.label_len], .style = .{ .bold = true } }, .{ .row_offset = body.height -| 1 });
+                if (ml.label_len < ml.len) {
+                    _ = body.printSegment(.{ .text = list_ml_buf[ml.label_len..ml.len], .style = .{} }, .{ .row_offset = body.height -| 1, .col_offset = body.gwidth(list_ml_buf[0..ml.label_len]) });
+                }
+            } else {
+                const list_ml = std.fmt.bufPrint(&list_ml_buf, "Bookmarks ({d}/{d})   (C-s searches, Enter/f jumps, e edits the bookmarks file, n/p move, q closes)", .{
+                    bookmark_list_selected + 1,
+                    bookmarks.items.len,
+                }) catch "Bookmarks";
+                _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
+            }
             // No highlights: the block cursor marks the selected bookmark.
             body.showCursor(0, @intCast(bookmark_list_selected - bookmark_list_top));
             try vx.render(tty.writer());
@@ -4028,17 +4078,23 @@ pub fn main(init: std.process.Init) !void {
                 list_row += 1;
             }
             var list_ml_buf: [2048]u8 = undefined;
-            const list_ml = if (isearch_active) blk: {
+            if (isearch_active) {
                 const label = if (isearch_failed)
                     (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")
                 else
                     (if (isearch_dir == .backward) "I-search backward" else "I-search");
-                break :blk std.fmt.bufPrint(&list_ml_buf, "{s}: {s}", .{ label, isearch_query.items }) catch label;
-            } else std.fmt.bufPrint(&list_ml_buf, "Buffers ({d}/{d})   (C-s searches, Enter/f switches, n/p move, q closes)", .{
-                buffer_list_selected + 1,
-                buffers.items.len,
-            }) catch "Buffers";
-            _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
+                const ml = fillPromptModeline(&list_ml_buf, "{s}: ", .{label}, isearch_query.items);
+                _ = body.printSegment(.{ .text = list_ml_buf[0..ml.label_len], .style = .{ .bold = true } }, .{ .row_offset = body.height -| 1 });
+                if (ml.label_len < ml.len) {
+                    _ = body.printSegment(.{ .text = list_ml_buf[ml.label_len..ml.len], .style = .{} }, .{ .row_offset = body.height -| 1, .col_offset = body.gwidth(list_ml_buf[0..ml.label_len]) });
+                }
+            } else {
+                const list_ml = std.fmt.bufPrint(&list_ml_buf, "Buffers ({d}/{d})   (C-s searches, Enter/f switches, n/p move, q closes)", .{
+                    buffer_list_selected + 1,
+                    buffers.items.len,
+                }) catch "Buffers";
+                _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
+            }
             // No highlights: the block cursor marks the selected buffer.
             body.showCursor(0, if (text_height > 0) @intCast(buffer_list_selected - buffer_list_top) else 0);
             try vx.render(tty.writer());
@@ -4101,33 +4157,32 @@ pub fn main(init: std.process.Init) !void {
         var modeline_buf: [2048]u8 = undefined;
         var count_buf: [32]u8 = undefined;
 
-        const modeline = if (confirming_quit)
-            std.fmt.bufPrint(&modeline_buf, "Save file {s} before exiting? (y / n / C-g cancels)", .{buf.filename orelse "?"}) catch "Save before exiting? (y/n)"
+        const ml: PromptModeline = if (confirming_quit)
+            fillPromptModeline(&modeline_buf, "Save file {s} before exiting? (y / n / C-g cancels)", .{buf.filename orelse "?"}, "")
         else if (confirming_kill)
-            std.fmt.bufPrint(&modeline_buf, "Save file {s} before killing? (y / n / C-g cancels)", .{buf.filename orelse "?"}) catch "Save before killing? (y/n)"
-        else if (status_msg) |m|
-            std.fmt.bufPrint(&modeline_buf, "{s}", .{m}) catch "Save failed"
-        else if (switching_buffer)
-            std.fmt.bufPrint(&modeline_buf, "Find file: {s}", .{switch_query.items}) catch "Find file: ..."
+            fillPromptModeline(&modeline_buf, "Save file {s} before killing? (y / n / C-g cancels)", .{buf.filename orelse "?"}, "")
+        else if (status_msg) |m| blk: {
+            const n = std.fmt.bufPrint(&modeline_buf, "{s}", .{m}) catch break :blk .{ .len = 0, .label_len = 0 };
+            break :blk .{ .len = n.len, .label_len = 0 };
+        } else if (switching_buffer)
+            fillPromptModeline(&modeline_buf, "Find file: ", .{}, switch_query.items)
         else if (bookmark_prompt) |mode| blk: {
-            break :blk if (mode == .set)
-                (std.fmt.bufPrint(&modeline_buf, "Bookmark name (C-g cancels): {s}", .{bookmark_query.items}) catch "Bookmark name")
-            else
-                (std.fmt.bufPrint(&modeline_buf, "Jump to bookmark (C-g cancels): {s}", .{bookmark_query.items}) catch "Jump to bookmark");
+            if (mode == .set) break :blk fillPromptModeline(&modeline_buf, "Bookmark name (C-g cancels): ", .{}, bookmark_query.items);
+            break :blk fillPromptModeline(&modeline_buf, "Jump to bookmark (C-g cancels): ", .{}, bookmark_query.items);
         } else if (goto_prompt) blk: {
-            break :blk std.fmt.bufPrint(&modeline_buf, "Goto line (C-g cancels): {s}", .{goto_query.items}) catch "Goto line";
+            break :blk fillPromptModeline(&modeline_buf, "Goto line (C-g cancels): ", .{}, goto_query.items);
         } else if (isearch_active) blk: {
             const label = if (isearch_failed)
                 (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")
             else
                 (if (isearch_dir == .backward) "I-search backward" else "I-search");
-            break :blk std.fmt.bufPrint(&modeline_buf, "{s}: {s}", .{ label, isearch_query.items }) catch label;
+            break :blk fillPromptModeline(&modeline_buf, "{s}: ", .{label}, isearch_query.items);
         } else blk: {
             const buf_count = if (buffers.items.len > 1)
                 (std.fmt.bufPrint(&count_buf, "  ({d}/{d})", .{ current + 1, buffers.items.len }) catch "")
             else
                 "";
-            break :blk std.fmt.bufPrint(&modeline_buf, "{s}-- {s}{s}{s}{s}{s}  L{d}:C{d} --", .{
+            const n = std.fmt.bufPrint(&modeline_buf, "{s}-- {s}{s}{s}{s}{s}  L{d}:C{d} --", .{
                 // Emacs-style modified marker in the bottom-left corner of
                 // the modeline.
                 if (buf.dirty) "*" else "",
@@ -4140,15 +4195,13 @@ pub fn main(init: std.process.Init) !void {
                 buf_count,
                 buf.cursor_row + 1,
                 buf.cursor_col + 1,
-            }) catch "-- zemacs --";
+            }) catch break :blk .{ .len = 0, .label_len = 0 };
+            break :blk .{ .len = n.len, .label_len = 0 };
         };
-        // Same full-width bar as the pane modelines: the whole row is one
-        // segment in `modeline_buf`, kept alive until after the render.
-        const style: vaxis.Style = highlight_style;
-        const text_w = body.gwidth(modeline);
-        const fill_n = @min(@as(usize, @intCast(body.width -| text_w)), modeline_buf.len - modeline.len);
-        if (fill_n > 0) @memset(modeline_buf[modeline.len .. modeline.len + fill_n], ' ');
-        _ = body.printSegment(.{ .text = modeline_buf[0 .. modeline.len + fill_n], .style = style }, .{ .row_offset = body.height -| 1 });
+        // Same full-width bar as the pane modelines: the whole row lives
+        // in `modeline_buf`, kept alive until after the render. An active
+        // prompt's label is bold too, so it stands out.
+        printModeline(body, &modeline_buf, ml, highlight_style, body.height -| 1);
 
         const cv = cursorVisual(buf, body.width, vx.screen.width_method);
         body.showCursor(

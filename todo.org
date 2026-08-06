@@ -1,4 +1,4 @@
-* TODO james roadmap [20/25]
+* TODO james roadmap [22/25]
 ** TODO show current keybindings in a new buffer
 ** TODO version/data/time/description better formatted on welcome page
           _   _    __  __ _____ ____
@@ -13,8 +13,8 @@
   Welcome to james, a minimal Emacs-inspired editor for the terminal.
 
 ** TODO fuzzy search in buffer and bookmark list
-** TODO any action in a buffer that adds a prompt in the modeline to be in a bold font
-** DOING C-c j/k is a bit flaky, maybe losing the cursor and is sometimes put in a windows that is not the focus
+** DONE any action in a buffer that adds a prompt in the modeline to be in a bold font
+** DONE C-c j/k is a bit flaky, maybe losing the cursor and is sometimes put in a windows that is not the focus
 ** DONE add balance-windows and bind to C-x +
 ** DONE directory listing in windows dired can be a bit slow to load
 ** DONE M-g to goto line
