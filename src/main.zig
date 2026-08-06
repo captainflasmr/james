@@ -670,6 +670,15 @@ const Pane = struct {
         ancestor.left_frac = @intCast(next);
     }
 
+    /// C-x +: balance-windows — every split's divider returns to the
+    /// middle (128 of 256), so all windows end up equal, like Emacs.
+    fn balance(self: *Pane) void {
+        if (self.isLeaf()) return;
+        self.left_frac = 128;
+        self.left.?.balance();
+        self.right.?.balance();
+    }
+
     /// Append the leaves of this subtree to `out` in render order.
     fn collectLeaves(self: *Pane, out: []*Pane, n: *usize) void {
         if (self.isLeaf()) {
@@ -3092,6 +3101,12 @@ pub fn main(init: std.process.Init) !void {
                             focused = nf;
                             current = focused.buf_idx;
                         }
+                    } else if (key.matches('+', .{})) {
+                        // C-x +: balance-windows — every split's divider
+                        // returns to the middle, so all windows end up
+                        // equal (Emacs C-x +).
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                        root.balance();
                     } else if (key.matches('o', .{})) {
                         if (moveFocus(root, focused, 1)) |nf| {
                             focused = nf;

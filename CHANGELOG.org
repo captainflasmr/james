@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.37.0 — <2026-08-05>
+
+=C-x += balances the windows.
+
+- =C-x += makes all windows equal — every split's divider returns to the middle (128 of 256), recursively through nested splits, like Emacs's =balance-windows= (bound to =C-x += there too). Window history records the change, so =C-c j= steps back out of it.
+
 ** 0.36.0 — <2026-08-05>
 
 Faster dired listings on Windows.
