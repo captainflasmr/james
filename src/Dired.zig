@@ -20,6 +20,9 @@ recenter_pos: u8 = 0,
 /// How the listing is ordered — the digit keys 3-6 in dired, mirroring
 /// the ls flags S / t / (default) / X.
 sort_mode: SortMode = .name,
+/// ( toggles dired-hide-details-mode: hide the metadata prefix
+/// (permissions, size, date) so only the names remain, like Emacs.
+hide_details: bool = false,
 
 pub const SortMode = enum { name, size, date, extension };
 

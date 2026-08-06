@@ -1316,8 +1316,13 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
         // Column 0 is the mark column, like Emacs: "*" for a marked
         // entry, a blank otherwise.
         _ = win.printSegment(.{ .text = if (e.marked) "*" else " ", .style = style }, .{ .row_offset = row_base + row });
-        _ = win.printSegment(.{ .text = e.meta, .style = style }, .{ .row_offset = row_base + row, .col_offset = 1 });
-        const name_col = 1 + win.gwidth(e.meta);
+        // ( toggles dired-hide-details-mode: with the details hidden the
+        // metadata prefix (permissions, size, date) is skipped, so only
+        // the names remain — the mark column and name line up as usual.
+        const name_col: u16 = if (dired.hide_details) 1 else 1 + win.gwidth(e.meta);
+        if (!dired.hide_details) {
+            _ = win.printSegment(.{ .text = e.meta, .style = style }, .{ .row_offset = row_base + row, .col_offset = 1 });
+        }
         const hl: ?Highlight = if (searching) blk: {
             if (match) |m| {
                 if (i == m.row) {
@@ -1385,7 +1390,7 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
         };
     } else if (status) |m|
         std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch "Save failed"
-    else std.fmt.bufPrint(modeline_buf, "Dired: {s}", .{dired.display_path.items}) catch "Dired";
+    else std.fmt.bufPrint(modeline_buf, "Dired: {s}{s}", .{ dired.display_path.items, if (dired.hide_details) " (Hide-Details)" else "" }) catch "Dired";
     const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true };
     const text_w = win.gwidth(modeline);
     const fill_n = @min(@as(usize, @intCast(win.width -| text_w)), modeline_buf.len - modeline.len);
@@ -3246,6 +3251,12 @@ pub fn main(init: std.process.Init) !void {
                             for (d.entries.items) |*en| {
                                 if (!std.mem.eql(u8, en.name, "..")) en.marked = !en.marked;
                             }
+                        } else if (key.matches('(', .{})) {
+                            // ( : toggle dired-hide-details-mode — hide
+                            // the metadata (permissions, size, date) so
+                            // only the names remain, like Emacs; the
+                            // modeline shows (Hide-Details) while hidden.
+                            d.hide_details = !d.hide_details;
                         } else if (key.matches('l', .{ .ctrl = true })) {
                             // C-l: recenter the listing on the selection.
                             // The header line (when shown) takes one of the

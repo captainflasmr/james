@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.32.0 — <2026-08-05>
+
+=(= hides dired details.
+
+- =(= in a dired buffer toggles =dired-hide-details-mode=, like Emacs: the metadata prefix (permissions, size, modification time) is hidden, leaving just the names — with the mark column and directory =/=s intact — and the modeline reads =Dired: <path> (Hide-Details)= while hidden, so a details-free listing is obvious at a glance. Each dired keeps its own toggle, and the metadata stays in the buffer model (only the rendering hides it), so =3=/=4=/=5=/=6= sorting and =C= / =R= / =D= keep working on the real data.
+
 ** 0.31.0 — <2026-08-05>
 
 Page scroll on =M-J= / =M-L=.
