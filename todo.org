@@ -1,0 +1,24 @@
+* TODO james roadmap [18/23]
+** TODO word should wrap over line
+** DONE show line numbers
+** TODO see the full mark including cursor
+** TODO show current keybindings in a new buffer
+** TODO directory listing in windows dired can be a bit slow to load
+** TODO C-c j/k a bit flaky, maybe losing the cursor
+** DONE resize windows with C-M-h/j/k/l
+** DONE soft wrap on and off
+** DONE toggle dired details on and off
+** DONE page scroll up/down using M-J and M-K
+** DONE set bookmark doesn't need to jump into another buffer
+** DONE add redo?
+** DONE the current buffer to open in a new tab
+** DONE put time also along date in version line in welcome screen
+** DONE highlight the file/dir in dired when selected
+** DONE copy line to include newline
+** DONE on bookmarks list buffer add option to jump to file for editing
+** DONE bookmarks may not be saved in windows?, where are the bookmarks saved?
+** DONE in dired C-m doesn't work
+** DONE search in lists
+** DONE show version number and date and last change on the welcome screen
+** DONE C-x k to kill a buffer
+** DONE "g" to refresh, reread a dired
