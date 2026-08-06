@@ -1613,27 +1613,145 @@ const welcome_greeting =
     \\  Welcome to james, a minimal Emacs-inspired editor for the terminal.
 ;
 
+/// The keybinding reference under the greeting, grouped by prefix (C-x,
+/// C-c, M-l) and by context (dired, pickers, prompts). Kept in sync with
+/// the dispatch in the event loop.
 const welcome_tail =
     \\
     \\
     \\  No file was given, so this is the home screen. Get to work with:
     \\
-    \\    C-x d         browse files (dired)
-    \\    C-x C-f       open or create a file
-    \\    C-x b         switch to an open buffer
+    \\    C-x d / C-x m       browse files (dired)
+    \\    C-x C-f             open or create a file
+    \\    C-x b               pick an open buffer
     \\
-    \\  The essentials, once you're editing:
+    \\  C-x — files, buffers and windows:
     \\
-    \\    C-s / C-r     incremental search
-    \\    C-x 2 / C-x 3 split the window, C-x o moves to the next one
-    \\    C-space       set the mark; C-x C-k kills the region, C-y yanks
-    \\    C-w           save (as does C-x C-s)
-    \\    C-x u         undo
-    \\    C-g C-/ / M-/  redo
-    \\    C-x C-s       save
-    \\    C-x j / C-x c  drop to a real shell (C-z / exit returns)
-    \\    M-l = / M-l -  new / close tab; M-1..M-9, M-i / M-u select
-    \\    C-x C-c       quit
+    \\    C-x C-s             save the buffer (C-w saves too)
+    \\    C-x C-c             quit (asks first if modified)
+    \\    C-x u               undo
+    \\    C-x k               kill the current buffer
+    \\    C-x C-f             open or create a file
+    \\    C-x g               re-read the file from disk
+    \\    C-x h               mark the whole buffer
+    \\    C-x C-k             kill the region
+    \\    C-x d / C-x m       browse the file's directory
+    \\    C-x 2 / C-x 3       split the window (below / to the right)
+    \\    C-x 1               one window
+    \\    C-x 0               delete the focused window
+    \\    C-x +               balance the windows
+    \\    C-x o               move to the next window
+    \\    C-x j / C-x c       drop to a shell (C-z suspends, C-x j resumes)
+    \\    C-x r m             set a bookmark at point
+    \\    C-x r b             jump to a bookmark
+    \\    C-x r l             list the bookmarks
+    \\
+    \\  C-c — kill ring and window history:
+    \\
+    \\    C-c b               copy the whole buffer
+    \\    C-c w               copy the region
+    \\    C-c C-k             close the dired buffer
+    \\    C-c o               open the bookmark list
+    \\    C-c j / C-c k       step back / forward through window layouts
+    \\
+    \\  M-l — jumps and tabs (the my-jump prefix):
+    \\
+    \\    M-l h               the home directory
+    \\    M-l b               ~/bin
+    \\    M-l d               Downloads
+    \\    M-l s               ~/source
+    \\    M-l g               the config directory
+    \\    M-l i               the Emacs-vanilla config
+    \\    M-l y               the Emacs-DIYer config
+    \\    M-l r               the scratch buffer
+    \\    M-l o               the bookmark list
+    \\    M-l = / M-l -       new / close tab
+    \\
+    \\  Tabs and windows:
+    \\
+    \\    M-1 .. M-9          select a tab by number
+    \\    M-i / M-u           next / previous tab
+    \\    M-n / M-p           next / previous window
+    \\    M-; / M-m           split below / to the right
+    \\    M-q / M-'           delete the window
+    \\    M-a                 one window
+    \\    M-e                 open dired at the file's directory
+    \\    C-M-h / C-M-l       resize the window left / right
+    \\    C-M-j / C-M-k       resize the window up / down
+    \\
+    \\  Movement:
+    \\
+    \\    C-f / C-b           forward / backward character (arrows too)
+    \\    C-n / C-p           next / previous line (arrows too)
+    \\    C-a / C-e           start / end of the visual line
+    \\    M-f / M-b           forward / backward word
+    \\    M-j / M-k           5 lines down / up
+    \\    M-J / M-K           page down / up
+    \\    M-< / M->           start / end of the buffer
+    \\    M-g                 go to a line
+    \\
+    \\  Editing:
+    \\
+    \\    C-k                 kill to the end of the line
+    \\    M-d                 kill one word forward
+    \\    M-Backspace         kill one word backward
+    \\    C-d / Delete        delete forward
+    \\    Backspace           delete backward (or the region)
+    \\    C-;                 comment / uncomment the line
+    \\    M-z                 toggle soft wrap (truncate)
+    \\    C-l                 recenter the window
+    \\    C-space             set the mark (C-@ too)
+    \\    C-g                 cancel the mark / a prompt
+    \\
+    \\  Kill ring, undo and redo:
+    \\
+    \\    C-y                 yank (paste)
+    \\    M-y                 yank-pop (cycle through older kills)
+    \\    M-w                 copy the region (or the line)
+    \\    C-/                 undo
+    \\    C-g C-/ / M-/       redo
+    \\    C-w                 save the buffer
+    \\
+    \\  Search (C-s / C-r):
+    \\
+    \\    C-s                 search forward
+    \\    C-r                 search backward
+    \\    C-g                 leave the search
+    \\
+    \\  Dired:
+    \\
+    \\    n / p               next / previous entry (arrows too)
+    \\    Enter / f           open the selected entry
+    \\    m / u               mark / unmark the entry
+    \\    U                   unmark everything
+    \\    t                   toggle all marks
+    \\    (                   hide / show the details
+    \\    s                   toggle name / date sort
+    \\    3 / 4 / 5 / 6       sort by size / date / name / extension
+    \\    g                   re-read the listing
+    \\    M-e / ^             go up to the parent directory
+    \\    C                   copy the marked entries
+    \\    R                   rename the marked entries
+    \\    D                   delete the marked entries
+    \\    +                   create a directory
+    \\    _                   create a file
+    \\    W                   open externally
+    \\    q / C-g             close the dired
+    \\
+    \\  Pickers (buffers and bookmarks):
+    \\
+    \\    n / p               move the selection (arrows too)
+    \\    Enter / f           open the selection
+    \\    e                   edit the bookmarks file
+    \\    C-s / C-r           search the list
+    \\    q / C-g             close
+    \\
+    \\  Prompts and confirmations:
+    \\
+    \\    Enter               confirm
+    \\    y / n               answer a confirmation
+    \\    Backspace           edit the input
+    \\    C-g / Esc           cancel
 ;
 
 /// Add a fresh buffer containing the home screen to `buffers`. Used only

@@ -1,5 +1,5 @@
 * TODO james roadmap [23/25]
-** TODO show current keybindings in a new buffer
+** DOING show current keybindings in the welcome screen
 ** TODO fuzzy search in buffer and bookmark list
 ** DONE version/data/time/description better formatted on welcome page
           _   _    __  __ _____ ____
