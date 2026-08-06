@@ -1359,6 +1359,25 @@ fn shellForegroundPgrp(tty: *vaxis.Tty) ?std.posix.pid_t {
     return std.posix.tcgetpgrp(tty.fd.handle) catch null;
 }
 
+// --- Windows console input flush ----------------------------------------
+//
+// loop.stop() wakes the input thread by sending a Device Status Report
+// (CSI 5n); the terminal's "CSI 0n" answer lands in the console input
+// buffer as key records. The dying input thread often exits before
+// consuming them — or, if the response arrives late, before it ever
+// starts — leaving ESC [ 0 n queued for the next reader. cmd.exe reads
+// and echoes that, so the shell's very first prompt comes out as
+// "C:\...\>^[[0n". FlushConsoleInputBuffer discards the residue before
+// the shell starts, and again after it exits, so stale records can
+// neither decorate the prompt nor leak back into the editor as phantom
+// keys once the loop restarts.
+extern "kernel32" fn FlushConsoleInputBuffer(hConsoleInput: windows.HANDLE) callconv(.winapi) windows.BOOL;
+
+fn winFlushConsoleInput(tty: *vaxis.Tty) void {
+    if (comptime builtin.os.tag != .windows) return;
+    _ = FlushConsoleInputBuffer(tty.stdin);
+}
+
 /// C-x j: hand the terminal to a real shell. Returns the pid of a shell
 /// suspended with C-z (to resume on the next C-x j), or null when the
 /// shell exited or none could be started.
@@ -1435,6 +1454,11 @@ fn enterShellWindows(
 ) !?std.posix.pid_t {
     loop.stop();
     while (loop.tryEvent() catch null) |_| {}
+    // The DSR that woke the input thread answers in the console input
+    // buffer; whatever the dying thread left unread (or that arrived
+    // after it exited) would be echoed by the shell as garbage — flush
+    // it before the shell ever reads.
+    winFlushConsoleInput(tty);
 
     // Reset the editor's terminal state and hand the console back to the
     // user's normal mode and codepage, so cmd.exe behaves as usual.
@@ -1452,6 +1476,10 @@ fn enterShellWindows(
         return null;
     };
     _ = child.wait(io) catch {};
+    // The shell's own input residue (and any DSR answer that was still
+    // in flight while it ran) must not leak back into the editor as
+    // phantom keypresses once the loop restarts.
+    winFlushConsoleInput(tty);
 
     // The shell is done: raw console mode again, back into the alternate
     // screen, forcing a full repaint.
