@@ -455,11 +455,19 @@ const FindFileView = struct {
     query: []const u8,
 };
 
+/// The bookmark name prompt (C-x r m) / jump prompt (C-x r b) rendered
+/// in the focused window's modeline, like the find-file prompt — setting
+/// or jumping to a bookmark never disturbs the window layout.
+const BookmarkPromptView = struct {
+    query: []const u8,
+    set: bool,
+};
+
 /// Render one buffer's text plus its own compact modeline into `win`, which
 /// may be the whole screen or one pane of a split. An active isearch shows
 /// its match highlight and prompt in this pane, exactly as if the pane were
 /// the whole screen.
-fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, search: ?IsearchView, status: ?[]const u8) void {
+fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, search: ?IsearchView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     const method = win.screen.width_method;
     scrollToCursorVisual(buf, text_height, win.width, method);
@@ -495,7 +503,12 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
 
     const modeline = if (find_file) |f|
         std.fmt.bufPrint(modeline_buf, "Find file: {s}", .{f.query}) catch "Find file: ..."
-    else if (search) |s| blk: {
+    else if (bookmark_prompt) |p| blk: {
+        break :blk if (p.set)
+            (std.fmt.bufPrint(modeline_buf, "Bookmark name (C-g cancels): {s}", .{p.query}) catch "Bookmark name")
+        else
+            (std.fmt.bufPrint(modeline_buf, "Jump to bookmark (C-g cancels): {s}", .{p.query}) catch "Jump to bookmark");
+    } else if (search) |s| blk: {
         const label = if (s.failed)
             (if (s.backward) "Failing I-search backward" else "Failing I-search")
         else
@@ -1267,7 +1280,7 @@ fn armSizeWatchdog(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event)) void {
 /// taking over the whole screen; when a file is chosen it's simply
 /// replaced by the newly opened buffer. An active isearch shows its prompt
 /// in the modeline; the match is the selected entry.
-fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, search: ?IsearchView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
+fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, search: ?IsearchView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     // The full directory path heads the listing (the classic dired header
     // line), taking one row unless the pane is too small to spare it.
@@ -1337,7 +1350,12 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
 
     const modeline = if (find_file) |f|
         std.fmt.bufPrint(modeline_buf, "Find file: {s}", .{f.query}) catch "Find file: ..."
-    else if (search) |s| blk: {
+    else if (bookmark_prompt) |p| blk: {
+        break :blk if (p.set)
+            (std.fmt.bufPrint(modeline_buf, "Bookmark name (C-g cancels): {s}", .{p.query}) catch "Bookmark name")
+        else
+            (std.fmt.bufPrint(modeline_buf, "Jump to bookmark (C-g cancels): {s}", .{p.query}) catch "Jump to bookmark");
+    } else if (search) |s| blk: {
         const label = if (s.failed)
             (if (s.backward) "Failing I-search backward" else "Failing I-search")
         else
@@ -1407,6 +1425,7 @@ fn renderTree(
     direds: []?Dired,
     focused: *Pane,
     find_file: ?FindFileView,
+    bookmark_prompt: ?BookmarkPromptView,
     search: ?IsearchView,
     dired_prompt: ?DiredPromptView,
     status: ?[]const u8,
@@ -1432,12 +1451,13 @@ fn renderTree(
         const pane_search: ?IsearchView = if (pane == focused) search else null;
         const pane_prompt: ?DiredPromptView = if (pane == focused) dired_prompt else null;
         const pane_find_file: ?FindFileView = if (pane == focused) find_file else null;
+        const pane_bookmark_prompt: ?BookmarkPromptView = if (pane == focused) bookmark_prompt else null;
         const pane_status: ?[]const u8 = if (pane == focused) status else null;
         const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
         if (direds[pane.buf_idx]) |*d| {
-            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_search, pane_prompt, pane_status);
+            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_search, pane_prompt, pane_status);
         } else {
-            renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_search, pane_status);
+            renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_search, pane_status);
         }
         return;
     }
@@ -1449,8 +1469,8 @@ fn renderTree(
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             // The one blank column between the panes gets the separator.
             drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
-            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, search, dired_prompt, status, focused_h, focused_w);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
@@ -1458,8 +1478,8 @@ fn renderTree(
             // a blank row between the panes for the separator (mirroring
             // the one blank column of a vertical split).
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
-            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, search, dired_prompt, status, focused_h, focused_w);
         },
     }
 }
@@ -3684,7 +3704,7 @@ pub fn main(init: std.process.Init) !void {
         // Dired and isearch are not modal: they render inside whichever
         // pane they apply to, leaving the window layout untouched. Only the
         // prompt-style modes take over the whole screen.
-        const is_modal = confirming_quit or confirming_kill or bookmark_prompt != null or bookmark_list_active or buffer_list_active;
+        const is_modal = confirming_quit or confirming_kill or bookmark_list_active or buffer_list_active;
 
         const search_view: ?IsearchView = if (isearch_active)
             .{ .failed = isearch_failed, .match = isearch_match, .query = isearch_query.items, .backward = isearch_dir == .backward }
@@ -3693,6 +3713,11 @@ pub fn main(init: std.process.Init) !void {
 
         const find_file_view: ?FindFileView = if (switching_buffer)
             .{ .query = switch_query.items }
+        else
+            null;
+
+        const bookmark_prompt_view: ?BookmarkPromptView = if (bookmark_prompt) |mode|
+            .{ .query = bookmark_query.items, .set = mode == .set }
         else
             null;
 
@@ -3708,7 +3733,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, search_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, bookmark_prompt_view, search_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;
@@ -3848,7 +3873,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal) {
             if (direds.items[current]) |*d| {
                 var modeline_buf: [2048]u8 = undefined;
-                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, search_view, dired_prompt_view, status_msg);
+                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, bookmark_prompt_view, search_view, dired_prompt_view, status_msg);
                 try vx.render(tty.writer());
                 frame_allocs.reset();
                 continue;

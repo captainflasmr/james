@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.30.0 — <2026-08-05>
+
+The bookmark prompts stay in the window.
+
+- Setting a bookmark (=C-x r m=) and the jump prompt (=C-x r b=) no longer take over the whole screen: the =Bookmark name (C-g cancels): ...= / =Jump to bookmark (C-g cancels): ...= prompt now appears in the focused window's own modeline, like the find-file, isearch and dired prompts — a split layout stays intact while you type the name, and Enter confirms without the view ever changing. (The bookmark picker =C-x r l= and the other full-screen modes are unaffected.)
+
 ** 0.29.0 — <2026-08-05>
 
 Redo.
