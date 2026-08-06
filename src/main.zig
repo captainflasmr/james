@@ -1595,8 +1595,8 @@ fn renderTree(
 /// It's a plain buffer (so movement, search and every C-x command work on
 /// it) with no backing file; C-x d / C-x C-f lead somewhere real. The
 /// version line is inserted between `welcome_head` and `welcome_tail` at
-/// startup (see openWelcome), right under the welcome message so it's
-/// visible however short the terminal is.
+/// startup (see openWelcome), centered under the art so it's visible
+/// however short the terminal is.
 const welcome_head =
     \\          _   _    __  __ _____ ____
     \\         | | / \  |  \/  | ____/ ___|
@@ -1604,6 +1604,12 @@ const welcome_head =
     \\     | |_| / ___ \| |  | | |___ ___) |
     \\      \___/_/   \_\_|  |_|_____|____/
     \\
+    \\
+;
+
+/// The greeting line under the version block: the one-line summary of
+/// what james is.
+const welcome_greeting =
     \\  Welcome to james, a minimal Emacs-inspired editor for the terminal.
 ;
 
@@ -1631,10 +1637,11 @@ const welcome_tail =
 ;
 
 /// Add a fresh buffer containing the home screen to `buffers`. Used only
-/// at startup when no files were given. The version line under the
-/// welcome message — version, date, and the last change, baked in at
-/// build time from CHANGELOG.org (see build.zig) — follows the welcome
-/// line.
+/// at startup when no files were given. The version block — version,
+/// release date, and the last change, baked in at build time from
+/// CHANGELOG.org (see build.zig) — is centered under the art: the
+/// version line with the build time, the change description below it,
+/// then the greeting.
 fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer)) !void {
     const new_buf = try gpa.create(Buffer);
     errdefer gpa.destroy(new_buf);
@@ -1643,7 +1650,10 @@ fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer)) !void {
     defer text.deinit(gpa);
     try text.appendSlice(gpa, welcome_head);
     if (build_options.version.len > 0) {
-        try text.appendSlice(gpa, "\n  james ");
+        // The version line sits centered under the art (nine spaces of
+        // indent); the description is indented one more, so the two-line
+        // block hangs slightly to the right like a caption.
+        try text.appendSlice(gpa, "         ");
         try text.appendSlice(gpa, build_options.version);
         try text.appendSlice(gpa, " (");
         try text.appendSlice(gpa, build_options.date);
@@ -1651,9 +1661,14 @@ fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer)) !void {
             try text.appendSlice(gpa, " ");
             try text.appendSlice(gpa, build_options.built);
         }
-        try text.appendSlice(gpa, ") — ");
-        try text.appendSlice(gpa, build_options.theme);
+        try text.appendSlice(gpa, ")");
+        if (build_options.theme.len > 0) {
+            try text.appendSlice(gpa, "\n          ");
+            try text.appendSlice(gpa, build_options.theme);
+        }
+        try text.appendSlice(gpa, "\n\n");
     }
+    try text.appendSlice(gpa, welcome_greeting);
     try text.appendSlice(gpa, welcome_tail);
 
     new_buf.* = try Buffer.fromText(gpa, text.items);
