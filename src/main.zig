@@ -47,6 +47,13 @@ const Event = union(enum) {
 // blinking block cursor marks position there.
 const highlight_style: vaxis.Style = .{ .reverse = true };
 
+/// Tab stops for displaying tabs: every `tab_width` columns (Emacs
+/// tab-width; the author's config sets 4). A raw tab byte is dropped by
+/// vaxis (its measured width is 0), so lines containing tabs are
+/// expanded to spaces at render time (see expandTabs) — without it, the
+/// tab-separated fields of the bookmarks file glue together.
+const tab_width: usize = 4;
+
 const Highlight = struct { start: usize, end: usize };
 
 /// Build the segments needed to draw a line, reverse-videoing the given
@@ -137,6 +144,29 @@ fn highlightFor(
 // agree with what is on screen. They live here rather than in Buffer.zig
 // because they need the terminal's display width tables.
 
+/// The display-width contribution of a tab at display column `col`:
+/// spaces up to the next tab stop.
+fn tabStop(col: usize) usize {
+    return tab_width - (col % tab_width);
+}
+
+/// The display width of `line[start..end]` with tabs counted up to the
+/// next tab stop — the raw byte range as it maps into the expanded
+/// rendering.
+fn tabAwareWidth(line: []const u8, start: usize, end: usize, method: vaxis.gwidth.Method) usize {
+    var col: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(line[start..end]);
+    while (it.next()) |g| {
+        const s = g.bytes(line[start..end]);
+        if (std.mem.eql(u8, s, "\t")) {
+            col += tabStop(col);
+        } else {
+            col += vaxis.gwidth.gwidth(s, method);
+        }
+    }
+    return col;
+}
+
 /// The byte offsets at which `line`'s visual (wrapped) lines begin, for a
 /// pane `width` columns wide: offsets[0] = 0, each later entry a wrap
 /// point. Returns the segment count.
@@ -148,9 +178,13 @@ fn wrapOffsets(line: []const u8, width: usize, method: vaxis.gwidth.Method, offs
     var n: usize = 1;
     offsets[0] = 0;
     var vis_col: usize = 0;
+    // Tabs count up to the next tab stop from the LOGICAL line's start
+    // (not the wrap), so the stop is computed on the absolute column.
+    var abs_col: usize = 0;
     var it = vaxis.unicode.graphemeIterator(line);
     while (it.next()) |g| {
-        const w = vaxis.gwidth.gwidth(g.bytes(line), method);
+        const s = g.bytes(line);
+        const w = if (std.mem.eql(u8, s, "\t")) tabStop(abs_col) else vaxis.gwidth.gwidth(s, method);
         if (w == 0) continue;
         if (vis_col >= width) {
             if (n >= 1024) break;
@@ -159,6 +193,7 @@ fn wrapOffsets(line: []const u8, width: usize, method: vaxis.gwidth.Method, offs
             vis_col = 0;
         }
         vis_col += w;
+        abs_col += w;
     }
     return n;
 }
@@ -172,10 +207,17 @@ fn wrapCount(line: []const u8, width: usize, method: vaxis.gwidth.Method) usize 
 /// The display column of byte offset `col` within the visual segment of
 /// `line` starting at `start`.
 fn visualColAt(line: []const u8, start: usize, col: usize, method: vaxis.gwidth.Method) usize {
+    // Tab stops are counted from the logical line's start.
+    const base = tabAwareWidth(line, 0, start, method);
     var v: usize = 0;
     var it = vaxis.unicode.graphemeIterator(line[start..col]);
     while (it.next()) |g| {
-        v += vaxis.gwidth.gwidth(g.bytes(line[start..col]), method);
+        const s = g.bytes(line[start..col]);
+        if (std.mem.eql(u8, s, "\t")) {
+            v += tabStop(base + v);
+        } else {
+            v += vaxis.gwidth.gwidth(s, method);
+        }
     }
     return v;
 }
@@ -184,17 +226,63 @@ fn visualColAt(line: []const u8, start: usize, col: usize, method: vaxis.gwidth.
 /// display column first reaches `target` — clamped to the segment's end,
 /// so it never crosses a wrap point.
 fn byteAtVisualCol(line: []const u8, start: usize, target: usize, width: usize, method: vaxis.gwidth.Method) usize {
+    // Tab stops are counted from the logical line's start.
+    const base = tabAwareWidth(line, 0, start, method);
     var vis_col: usize = 0;
     var it = vaxis.unicode.graphemeIterator(line[start..]);
     while (it.next()) |g| {
         const s = g.bytes(line[start..]);
-        const w = vaxis.gwidth.gwidth(s, method);
+        const w = if (std.mem.eql(u8, s, "\t")) tabStop(base + vis_col) else vaxis.gwidth.gwidth(s, method);
         if (w == 0) continue;
         if (vis_col >= width) return start + g.start; // the segment's wrap point
         if (vis_col + w > target) return start + g.start; // reached the target column
         vis_col += w;
     }
     return line.len;
+}
+
+/// Heap allocations made while rendering one frame (the tab expansions):
+/// vaxis keeps grapheme slices of printed text until the frame renders,
+/// so the expansions must outlive the print calls; they're freed after
+/// each vx.render (see FrameAllocs.reset).
+const FrameAllocs = struct {
+    gpa: std.mem.Allocator,
+    items: std.ArrayList([]u8) = .empty,
+
+    fn reset(self: *FrameAllocs) void {
+        for (self.items.items) |a| self.gpa.free(a);
+        self.items.clearRetainingCapacity();
+    }
+};
+
+/// Expand the tabs in `line` to the spaces up to the next tab stop —
+/// vaxis drops a raw tab byte (measured width 0), which would glue
+/// tab-separated fields together. The expansion is heap-allocated and
+/// recorded on `frame` for freeing after the frame renders. Returns null
+/// when the line has no tabs, so the common case allocates nothing.
+fn expandTabs(frame: *FrameAllocs, line: []const u8, method: vaxis.gwidth.Method) ?[]u8 {
+    if (std.mem.indexOfScalar(u8, line, '\t') == null) return null;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(frame.gpa);
+    var col: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(line);
+    while (it.next()) |g| {
+        const s = g.bytes(line);
+        if (std.mem.eql(u8, s, "\t")) {
+            const w = tabStop(col);
+            for (0..w) |_| out.append(frame.gpa, ' ') catch return null;
+            col += w;
+        } else {
+            out.appendSlice(frame.gpa, s) catch return null;
+            col += vaxis.gwidth.gwidth(s, method);
+        }
+    }
+    const owned = out.toOwnedSlice(frame.gpa) catch return null;
+    frame.items.append(frame.gpa, owned) catch {
+        frame.gpa.free(owned);
+        return null;
+    };
+    return owned;
 }
 
 /// The visual segment of the cursor within its logical line, and its
@@ -371,7 +459,7 @@ const FindFileView = struct {
 /// may be the whole screen or one pane of a split. An active isearch shows
 /// its match highlight and prompt in this pane, exactly as if the pane were
 /// the whole screen.
-fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, search: ?IsearchView, status: ?[]const u8) void {
+fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, search: ?IsearchView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     const method = win.screen.width_method;
     scrollToCursorVisual(buf, text_height, win.width, method);
@@ -383,13 +471,24 @@ fn renderPane(win: vaxis.Window, buf: *Buffer, is_focused: bool, row_base: u16, 
     var row: u16 = 0;
     var i = buf.top_line;
     while (i < buf.lines.items.len and row < text_height) : (i += 1) {
-        const h = highlightFor(buf, i, searching, match, query_len);
+        const raw = buf.lines.items[i].items;
+        // Tabs render as spaces up to the next tab stop — vaxis drops a
+        // raw tab byte, gluing tab-separated fields together.
+        const expanded = expandTabs(frame, raw, method);
+        const line = expanded orelse raw;
+        var h = highlightFor(buf, i, searching, match, query_len);
+        if (h.hl) |hl| {
+            if (expanded != null) {
+                // Map the raw highlight offsets through the expansion.
+                h.hl = .{ .start = tabAwareWidth(raw, 0, hl.start, method), .end = tabAwareWidth(raw, 0, hl.end, method) };
+            }
+        }
         var seg_storage: [3]vaxis.Segment = undefined;
-        const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage, is_focused and i == buf.cursor_row);
+        const segs = lineSegments(line, h.hl, h.empty_marker, &seg_storage, is_focused and i == buf.cursor_row);
         // Advance by the line's wrapped height, so a soft-wrapped line
         // takes all of its visual rows instead of the next line
         // clobbering its continuation.
-        const wraps = wrapCount(buf.lines.items[i].items, win.width, method);
+        const wraps = wrapCount(raw, win.width, method);
         _ = win.print(segs, .{ .row_offset = row_base + row });
         row += @intCast(wraps);
     }
@@ -1292,6 +1391,7 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
 /// showing its buffer.
 fn renderTree(
     win: vaxis.Window,
+    frame: *FrameAllocs,
     pane: *Pane,
     x_off: i17,
     y_off: u16,
@@ -1333,7 +1433,7 @@ fn renderTree(
         if (direds[pane.buf_idx]) |*d| {
             renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_search, pane_prompt, pane_status);
         } else {
-            renderPane(child, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_search, pane_status);
+            renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_search, pane_status);
         }
         return;
     }
@@ -1345,8 +1445,8 @@ fn renderTree(
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             // The one blank column between the panes gets the separator.
             drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
-            renderTree(win, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
@@ -1354,8 +1454,8 @@ fn renderTree(
             // a blank row between the panes for the separator (mirroring
             // the one blank column of a vertical split).
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
-            renderTree(win, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, search, dired_prompt, status, focused_h, focused_w);
         },
     }
 }
@@ -1828,12 +1928,41 @@ fn bookmarkJump(
     return null;
 }
 
-/// Persist bookmarks to ~/.james-bookmarks (tab-separated lines).
+/// The bookmarks file james keeps the bookmark list in: <home>/.james-
+/// bookmarks, tab-separated name/path/row/col lines. The home directory
+/// is %USERPROFILE% on Windows, $HOME elsewhere (see jumpHome). Caller
+/// frees the returned path.
+fn bookmarksFilePath(gpa: std.mem.Allocator, env_map: *std.process.Environ.Map) ?[]u8 {
+    const home_raw = jumpHome(env_map) orelse return null;
+    return std.fs.path.join(gpa, &.{ home_raw, ".james-bookmarks" }) catch null;
+}
+
+/// Drop the in-memory bookmark list and reload it from the bookmarks
+/// file — used after the user edits and saves the file itself, so a
+/// hand-edited list takes effect immediately.
+fn reloadBookmarks(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map, bookmarks: *std.ArrayList(Bookmark)) void {
+    for (bookmarks.items) |*b| {
+        gpa.free(b.name);
+        gpa.free(b.path);
+    }
+    bookmarks.clearRetainingCapacity();
+    loadBookmarks(gpa, io, env_map, bookmarks);
+}
+
+/// After a save: when the saved buffer is the bookmarks file itself (the
+/// e key's edit target), refresh the in-memory list from it — otherwise
+/// james's exit-time save would write the stale in-memory list back over
+/// the user's edits.
+fn refreshBookmarksAfterSave(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map, bookmarks: *std.ArrayList(Bookmark), buf: *Buffer) void {
+    const f = buf.filename orelse return;
+    const path = bookmarksFilePath(gpa, env_map) orelse return;
+    defer gpa.free(path);
+    if (std.mem.eql(u8, f, path)) reloadBookmarks(gpa, io, env_map, bookmarks);
+}
+
+/// Persist bookmarks to the bookmarks file (see bookmarksFilePath).
 fn saveBookmarks(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map, bookmarks: *const std.ArrayList(Bookmark)) void {
-    const home_raw = env_map.get("HOME") orelse return;
-    const home = gpa.dupe(u8, home_raw) catch return;
-    defer gpa.free(home);
-    const path = std.fs.path.join(gpa, &.{ home, ".james-bookmarks" }) catch return;
+    const path = bookmarksFilePath(gpa, env_map) orelse return;
     defer gpa.free(path);
 
     var out: std.ArrayList(u8) = .empty;
@@ -1846,12 +1975,10 @@ fn saveBookmarks(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Envir
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items }) catch {};
 }
 
-/// Load bookmarks from ~/.james-bookmarks, if it exists.
+/// Load bookmarks from the bookmarks file, if it exists (see
+/// bookmarksFilePath).
 fn loadBookmarks(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map, bookmarks: *std.ArrayList(Bookmark)) void {
-    const home_raw = env_map.get("HOME") orelse return;
-    const home = gpa.dupe(u8, home_raw) catch return;
-    defer gpa.free(home);
-    const path = std.fs.path.join(gpa, &.{ home, ".james-bookmarks" }) catch return;
+    const path = bookmarksFilePath(gpa, env_map) orelse return;
     defer gpa.free(path);
 
     const contents = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch return;
@@ -2089,6 +2216,9 @@ pub fn main(init: std.process.Init) !void {
     // M-l: the my-jump prefix keymap from the author's Emacs init.el — a
     // jump to a well-known directory is two keys, like every Emacs prefix.
     var pending_alt_l = false;
+    // Heap allocations made while rendering one frame (tab expansions),
+    // freed after each vx.render.
+    var frame_allocs: FrameAllocs = .{ .gpa = gpa };
     var confirming_quit = false;
     var confirming_kill = false;
 
@@ -2690,9 +2820,24 @@ pub fn main(init: std.process.Init) !void {
                         isearch_match = null;
                         isearch_failed = false;
                         isearch_query.clearRetainingCapacity();
+                    } else if (key.matches('e', .{})) {
+                        // e: open the bookmarks file itself for editing —
+                        // the plain text file james keeps the bookmark
+                        // list in (name<TAB>path<TAB>row<TAB>col per
+                        // line), so the list can be reviewed or hand-
+                        // edited directly. Saving it reloads the in-memory
+                        // list (see refreshBookmarksAfterSave).
+                        if (bookmarksFilePath(gpa, init.environ_map)) |path| {
+                            defer gpa.free(path);
+                            bookmark_list_active = false;
+                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                            current = try openBufferOrDired(gpa, io, &buffers, &direds, path);
+                            focused.buf_idx = current;
+                        }
                     } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches('f', .{})) {
                         // Enter / C-j, or "f" (the dirlst-find-file key from
-                        // the Jasspa setup): open the selected bookmark.
+                        // the Jasspa setup): open the selected bookmark,
+                        // jumping to the recorded position.
                         if (bookmark_list_selected < bookmarks.items.len) {
                             const name = bookmarks.items[bookmark_list_selected].name;
                             bookmark_list_active = false;
@@ -2742,6 +2887,7 @@ pub fn main(init: std.process.Init) !void {
                         buf.save(gpa, io) catch {
                             status_msg = "Save failed";
                         };
+                        refreshBookmarksAfterSave(gpa, io, init.environ_map, &bookmarks, buf);
                     } else if (key.matches('c', .{ .ctrl = true })) {
                         // Buffers with no backing file (the home screen) are
                         // scratch space — quitting them never prompts.
@@ -3242,6 +3388,7 @@ pub fn main(init: std.process.Init) !void {
                         buf.save(gpa, io) catch {
                             status_msg = "Save failed";
                         };
+                        refreshBookmarksAfterSave(gpa, io, init.environ_map, &bookmarks, buf);
                     } else if (key.matches('w', .{ .alt = true })) {
                         // M-w: copy the region (point to mark), or — with no
                         // mark set — the current line, like Emacs's M-w on a
@@ -3540,8 +3687,9 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(body, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, search_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, search_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
             try vx.render(tty.writer());
+            frame_allocs.reset();
             continue;
         }
 
@@ -3603,7 +3751,7 @@ pub fn main(init: std.process.Init) !void {
                 else
                     (if (isearch_dir == .backward) "I-search backward" else "I-search");
                 break :blk std.fmt.bufPrint(&list_ml_buf, "{s}: {s}", .{ label, isearch_query.items }) catch label;
-            } else std.fmt.bufPrint(&list_ml_buf, "Bookmarks ({d}/{d})   (C-s searches, Enter/f jumps, n/p move, q closes)", .{
+            } else std.fmt.bufPrint(&list_ml_buf, "Bookmarks ({d}/{d})   (C-s searches, Enter/f jumps, e edits the bookmarks file, n/p move, q closes)", .{
                 bookmark_list_selected + 1,
                 bookmarks.items.len,
             }) catch "Bookmarks";
@@ -3611,6 +3759,7 @@ pub fn main(init: std.process.Init) !void {
             // No highlights: the block cursor marks the selected bookmark.
             body.showCursor(0, @intCast(bookmark_list_selected - bookmark_list_top));
             try vx.render(tty.writer());
+            frame_allocs.reset();
             continue;
         }
 
@@ -3671,6 +3820,7 @@ pub fn main(init: std.process.Init) !void {
             // No highlights: the block cursor marks the selected buffer.
             body.showCursor(0, if (text_height > 0) @intCast(buffer_list_selected - buffer_list_top) else 0);
             try vx.render(tty.writer());
+            frame_allocs.reset();
             continue;
         }
 
@@ -3679,6 +3829,7 @@ pub fn main(init: std.process.Init) !void {
                 var modeline_buf: [2048]u8 = undefined;
                 renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, search_view, dired_prompt_view, status_msg);
                 try vx.render(tty.writer());
+                frame_allocs.reset();
                 continue;
             }
         }
@@ -3691,11 +3842,21 @@ pub fn main(init: std.process.Init) !void {
         var row: u16 = 0;
         var i = buf.top_line;
         while (i < buf.lines.items.len and row < text_height) : (i += 1) {
-            const h = highlightFor(buf, i, search_view != null, if (search_view) |s| (if (s.failed) null else s.match) else null, if (search_view) |s| s.query.len else 0);
+            const raw = buf.lines.items[i].items;
+            // Tabs render as spaces up to the next tab stop (see
+            // renderPane).
+            const expanded = expandTabs(&frame_allocs, raw, vx.screen.width_method);
+            const line = expanded orelse raw;
+            var h = highlightFor(buf, i, search_view != null, if (search_view) |s| (if (s.failed) null else s.match) else null, if (search_view) |s| s.query.len else 0);
+            if (h.hl) |hl| {
+                if (expanded != null) {
+                    h.hl = .{ .start = tabAwareWidth(raw, 0, hl.start, vx.screen.width_method), .end = tabAwareWidth(raw, 0, hl.end, vx.screen.width_method) };
+                }
+            }
             var seg_storage: [3]vaxis.Segment = undefined;
-            const segs = lineSegments(buf.lines.items[i].items, h.hl, h.empty_marker, &seg_storage, i == buf.cursor_row);
+            const segs = lineSegments(line, h.hl, h.empty_marker, &seg_storage, i == buf.cursor_row);
             // Advance by the line's wrapped height (see renderPane).
-            const wraps = wrapCount(buf.lines.items[i].items, body.width, vx.screen.width_method);
+            const wraps = wrapCount(raw, body.width, vx.screen.width_method);
             _ = body.print(segs, .{ .row_offset = row });
             row += @intCast(wraps);
         }
@@ -3757,5 +3918,6 @@ pub fn main(init: std.process.Init) !void {
         );
 
         try vx.render(tty.writer());
+        frame_allocs.reset();
     }
 }

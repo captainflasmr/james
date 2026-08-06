@@ -10,6 +10,24 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.24.0 — <2026-08-05>
+
+Tabs render at tab stops.
+
+- Tab characters now display as spaces up to the next tab stop — every 4 columns, matching the author's Emacs =tab-width=: vaxis drops a raw tab byte (it measures 0 wide), so the fields of tab-separated text like the bookmarks file (=e= in the picker) used to glue together. The expansion happens at render time, so the buffer keeps its real tabs and files save byte-for-byte; the wrap, cursor, and highlight math all count tabs at their stops, so soft-wrapped tabbed lines, visual-line navigation, and isearch highlights stay in place. The expansions are freed after each frame renders.
+
+** 0.23.0 — <2026-08-05>
+
+Bookmarks persist on Windows.
+
+- Bookmarks are now saved and loaded from the home directory the way Windows actually spells it: =%USERPROFILE%\.james-bookmarks= on Windows (falling back to =$HOME=, like the =M-l= jump keys), =~/.james-bookmarks= elsewhere — previously =saveBookmarks= and =loadBookmarks= both looked up =$HOME= directly, which Windows consoles almost never set, so on Windows no bookmark was ever saved or loaded (both calls bailed out silently).
+
+** 0.22.0 — <2026-08-05>
+
+=e= opens a bookmark's file from the top.
+
+- The bookmark picker (=C-x r l= / =C-c o=) gains =e=: open the bookmarks file itself for editing — the plain text file james keeps the bookmark list in (=name<TAB>path<TAB>row<TAB>col= per line, =~/.james-bookmarks= / =%USERPROFILE%\.james-bookmarks=) — so the list can be reviewed or hand-edited directly. Saving that buffer (C-x C-s or =C-w=) reloads the in-memory bookmark list from the file immediately, so hand edits take effect at once instead of being overwritten by james's exit-time save of the stale list. The picker's modeline lists the new key.
+
 ** 0.21.0 — <2026-08-05>
 
 The welcome screen shows the latest release.
