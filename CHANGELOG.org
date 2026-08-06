@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.34.0 — <2026-08-05>
+
+Window resizing matches the author's Emacs.
+
+- The =C-M-h= / =C-M-j= / =C-M-k= / =C-M-l= window-resize keys now match the author's Emacs config (=my/adaptive-resize=): =C-M-h= and =C-M-l= resize width, =C-M-j= and =C-M-k= resize height, with the direction adapting to the window's position in its split — =C-M-h= shrinks a window on the left of a side-by-side split and grows one on the right, =C-M-l= the reverse, and =C-M-j= / =C-M-k= do the same for the top / bottom windows of a stacked split. The width keys already behaved this way; the =C-M-j= / =C-M-k= height directions were previously swapped. The chords now also work on terminals without the kitty keyboard protocol — which had silently dropped them, since a legacy terminal encodes Ctrl+Alt+key as ESC plus the control byte (vaxis reports it as alt + the raw control codepoint, now bound too) — so GNOME Terminal and other non-kitty terminals resize as well.
+
 ** 0.33.0 — <2026-08-05>
 
 =M-z= toggles soft wrap.

@@ -81,8 +81,8 @@ Window keys (mostly aliases of the =C-x= window commands, plus a few extras):
 | =M-p= | move to the previous window |
 | =C-x 0= / =M-q= / =M-'= | delete the current window |
 | =C-x 1= / =M-a= | collapse back to a single window |
-| =M-C-h= / =M-C-l= | shrink / enlarge the current window's width |
-| =M-C-k= / =M-C-j= | shrink / enlarge the current window's depth |
+| =C-M-h= / =C-M-l= | resize the window's width (direction adapts to the window's side, like the author's Emacs) |
+| =C-M-j= / =C-M-k= | resize the window's height (direction adapts to the window's position) |
 | =M-e= | in a file: open dired at the file's directory; in dired: go up a directory |
 
 Buffer keys:

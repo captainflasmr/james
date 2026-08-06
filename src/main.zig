@@ -3713,16 +3713,31 @@ pub fn main(init: std.process.Init) !void {
                         // the state. The buffer remembers its own
                         // setting.
                         buf.soft_wrap = !buf.soft_wrap;
-                    } else if (key.matches('h', .{ .alt = true, .ctrl = true })) {
+                    } else if (key.matches(0x08, .{ .alt = true }) or key.matches('h', .{ .alt = true, .ctrl = true })) {
+                        // C-M-h: resize width, matching the author's
+                        // Emacs my/adaptive-resize — a window on the left
+                        // of a split shrinks, one on the right grows (the
+                        // divider moves in the h direction). Terminals
+                        // without the kitty keyboard protocol send the
+                        // chord as ESC + the control byte (0x08 = C-h),
+                        // which vaxis reports as alt + 0x08 — both
+                        // encodings are bound here.
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         root.resizeDivider(focused, .vertical, -8);
-                    } else if (key.matches('l', .{ .alt = true, .ctrl = true })) {
+                    } else if (key.matches(0x0C, .{ .alt = true }) or key.matches('l', .{ .alt = true, .ctrl = true })) {
+                        // C-M-l: the mirror of C-M-h — a left window
+                        // grows, a right one shrinks.
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         root.resizeDivider(focused, .vertical, 8);
-                    } else if (key.matches('k', .{ .alt = true, .ctrl = true })) {
+                    } else if (key.matches(0x0A, .{ .alt = true }) or key.matches('j', .{ .alt = true, .ctrl = true })) {
+                        // C-M-j: resize height, matching the author's
+                        // Emacs — a top window shrinks, a bottom one
+                        // grows.
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         root.resizeDivider(focused, .horizontal, -8);
-                    } else if (key.matches('j', .{ .alt = true, .ctrl = true })) {
+                    } else if (key.matches(0x0B, .{ .alt = true }) or key.matches('k', .{ .alt = true, .ctrl = true })) {
+                        // C-M-k: the mirror of C-M-j — a top window
+                        // grows, a bottom one shrinks.
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         root.resizeDivider(focused, .horizontal, 8);
                     } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
