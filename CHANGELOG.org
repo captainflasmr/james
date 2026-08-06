@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.31.0 — <2026-08-05>
+
+Page scroll on =M-J= / =M-L=.
+
+- =M-J= scrolls a page down and =M-K= a page up — the author's Emacs habit, where his config binds =M-J= to full-page =scroll-up= and =M-K= to =scroll-down=: the cursor moves one screenful (the focused window's text height minus its modeline), with the view following — in file buffers and in dired, where the selection jumps a listing page. =M-j= / =M-k= keep their 5-line moves.
+
 ** 0.30.0 — <2026-08-05>
 
 The bookmark prompts stay in the window.

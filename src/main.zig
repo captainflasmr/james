@@ -3296,6 +3296,14 @@ pub fn main(init: std.process.Init) !void {
                         } else if (key.matches('k', .{ .alt = true })) {
                             // M-k: 5 entries up.
                             d.selected -|= 5;
+                        } else if (key.matches('J', .{ .alt = true })) {
+                            // M-J: a page down the listing (Emacs
+                            // scroll-up): the selection moves one
+                            // screenful of entries.
+                            d.selected = @min(d.selected + (focused_text_height -| 1), d.entries.items.len -| 1);
+                        } else if (key.matches('K', .{ .alt = true })) {
+                            // M-K: a page up the listing.
+                            d.selected -|= focused_text_height -| 1;
                         } else if (key.matches('C', .{})) {
                             // C: copy the marked entries, or just the
                             // selected one when nothing is marked (Emacs
@@ -3637,6 +3645,14 @@ pub fn main(init: std.process.Init) !void {
                         buf.moveLines(5);
                     } else if (key.matches('k', .{ .alt = true })) {
                         buf.moveLines(-5);
+                    } else if (key.matches('J', .{ .alt = true })) {
+                        // M-J: page down — the cursor moves a screenful
+                        // (the focused window's text height, minus the
+                        // modeline), like Emacs scroll-up.
+                        buf.moveLines(@intCast(focused_text_height -| 1));
+                    } else if (key.matches('K', .{ .alt = true })) {
+                        // M-K: page up (Emacs scroll-down).
+                        buf.moveLines(-@as(isize, @intCast(focused_text_height -| 1)));
                     } else if (key.matches('<', .{ .alt = true })) {
                         buf.moveBufStart();
                     } else if (key.matches('>', .{ .alt = true })) {

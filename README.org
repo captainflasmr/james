@@ -91,6 +91,7 @@ Buffer keys:
 |---+---|
 | =M-<= / =M->= | beginning / end of buffer |
 | =M-j= / =M-k= | 5 lines down / up |
+| =M-J= / =M-K= | page down / up (one screenful) |
 | =C-x k= | kill (close) the current buffer (modified file buffers ask first) |
 | =C-x C-k= | kill region (point to mark) |
 
