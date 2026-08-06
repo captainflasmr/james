@@ -561,7 +561,7 @@ fn printModeline(win: vaxis.Window, buf: []u8, ml: PromptModeline, style: vaxis.
 /// may be the whole screen or one pane of a split. An active isearch shows
 /// its match highlight and prompt in this pane, exactly as if the pane were
 /// the whole screen.
-fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, search: ?IsearchView, status: ?[]const u8) void {
+fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, grep_follow: bool, grep_match_count: usize, grep_hl: ?GrepHl, search: ?IsearchView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     const method = win.screen.width_method;
     scrollToCursorVisual(buf, text_height, win.width, method);
@@ -579,6 +579,19 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
         const expanded = expandTabs(frame, raw, method);
         const line = expanded orelse raw;
         var h = highlightFor(buf, i, searching, match, query_len);
+        // The transient grep-match highlight: shown on the match's line in
+        // the target file after a jump (see GrepHl), losing to an active
+        // isearch highlight.
+        if (h.hl == null) {
+            if (grep_hl) |gh| {
+                if (i == gh.row) {
+                    const line_len = buf.lines.items[i].items.len;
+                    const start = @min(gh.col, line_len);
+                    const end = @min(gh.col + gh.len, line_len);
+                    if (end > start) h.hl = .{ .start = start, .end = end };
+                }
+            }
+        }
         if (h.hl) |hl| {
             if (expanded != null) {
                 // Map the raw highlight offsets through the expansion.
@@ -626,12 +639,28 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
         const n = std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch break :blk .{ .len = 0, .label_len = 0 };
         break :blk .{ .len = n.len, .label_len = 0 };
     } else blk: {
-        const n = std.fmt.bufPrint(modeline_buf, "{s}{s}{s}{s}  L{d}:C{d}", .{
+        // The grep results buffer shows its match position and keys in
+        // the modeline instead of the L:C readout.
+        const is_grep = std.mem.eql(u8, buf.display_name orelse "", "*grep*");
+        if (is_grep and grep_match_count > 0) {
+            const n = std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}   (n/p move, Enter opens, F follows, g rerun, q close)", .{
+                buf.display_name orelse "?",
+                if (grep_follow) " [follow]" else "",
+                buf.cursor_row + 1,
+                grep_match_count,
+                if (!buf.soft_wrap) " [truncate]" else "",
+            }) catch break :blk .{ .len = 0, .label_len = 0 };
+            break :blk .{ .len = n.len, .label_len = 0 };
+        }
+        const n = std.fmt.bufPrint(modeline_buf, "{s}{s}{s}{s}{s}  L{d}:C{d}", .{
             // Emacs-style modified marker in the bottom-left corner of the
             // modeline.
             if (buf.dirty) "*" else "",
             buf.display_name orelse buf.filename orelse "?",
             if (buf.dirty) " [modified]" else "",
+            // F in the grep results buffer: follow mode — n/p opens each
+            // match in the target window.
+            if (grep_follow and std.mem.eql(u8, buf.display_name orelse "", "*grep*")) " [follow]" else "",
             // M-z: soft wrap off (truncated lines) shows like Emacs's
             // Truncate mode-line marker; its absence means wrap is on.
             if (!buf.soft_wrap) " [truncate]" else "",
@@ -840,6 +869,74 @@ fn paneInTree(root: *const Pane, target: *const Pane) bool {
     if (root == target) return true;
     if (root.isLeaf()) return false;
     return paneInTree(root.left.?, target) or paneInTree(root.right.?, target);
+}
+
+/// Open grep match `sel` in the target window (see grep_target): a lone
+/// grep window splits to the right, otherwise the window last used for a
+/// jump (or the next one over) is replaced. Focus stays on the grep
+/// buffer, so n/p + Enter — or F follow mode — steps through the matches
+/// without the layout changing.
+fn grepOpenMatch(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    buffers: *std.ArrayList(*Buffer),
+    direds: *std.ArrayList(?Dired),
+    recent: *std.ArrayList([]u8),
+    root: *Pane,
+    focused: **Pane,
+    current: usize,
+    undo: *std.ArrayList(WindowSnapshot),
+    redo: *std.ArrayList(WindowSnapshot),
+    matches: []const GrepMatch,
+    sel: usize,
+    grep_target: *?*Pane,
+    term: ?[]const u8,
+    grep_hl: *?GrepHl,
+) void {
+    if (sel >= matches.len) return;
+    const m = matches[sel];
+    const idx = openBufferOrDired(gpa, io, buffers, direds, recent, m.path) catch return;
+    const tgt = buffers.items[idx];
+    if (tgt.lines.items.len > 0) {
+        tgt.cursor_row = @min(m.line -| 1, tgt.lines.items.len - 1);
+        tgt.cursor_col = @min(m.col -| 1, tgt.lines.items[tgt.cursor_row].items.len);
+        // A transient highlight of the term at the match, so it's easy to
+        // spot while stepping (see GrepHl).
+        if (term) |t| {
+            const line = tgt.lines.items[tgt.cursor_row].items;
+            const c = tgt.cursor_col;
+            if (c < line.len) {
+                const hl_len = @min(t.len, line.len - c);
+                if (hl_len > 0 and std.ascii.eqlIgnoreCase(line[c .. c + hl_len], t[0..hl_len])) {
+                    grep_hl.* = .{ .buf = tgt, .row = tgt.cursor_row, .col = c, .len = hl_len, .set_at = std.Io.Clock.now(.real, io).nanoseconds };
+                }
+            }
+        }
+    }
+    recordWindow(gpa, root, focused.*, current, undo, redo);
+    if (root.isLeaf()) {
+        // Only the grep window: split to the right, the match on the
+        // right, focus staying on the grep buffer.
+        if (root.leafCount() < MAX_PANES) {
+            focused.*.split(gpa, .vertical) catch return;
+            focused.*.right.?.buf_idx = idx;
+            grep_target.* = focused.*.right.?;
+            focused.* = focused.*.left.?;
+        }
+    } else if (grep_target.*) |t| {
+        if (paneInTree(root, t)) {
+            t.buf_idx = idx;
+        } else {
+            grep_target.* = null;
+        }
+    }
+    if (grep_target.* == null) {
+        // Replace the next window over and remember it for the next jump.
+        if (moveFocus(root, focused.*, 1)) |nf| {
+            nf.buf_idx = idx;
+            grep_target.* = nf;
+        }
+    }
 }
 
 /// C-x o / M-n / M-p: the pane `step` places away from `focused` in render
@@ -1280,6 +1377,23 @@ const GrepMatch = struct {
     col: usize,
 };
 
+/// A transient highlight of the grepped term in the target file, like
+/// Emacs's next-error-highlight: set on every grep jump and drawn for a
+/// moment (GREP_HL_NS), so the match is easy to spot while stepping
+/// through the results. `buf` is the buffer pointer (stable across
+/// buffer-index shifts); `row`/`col` are the match position and `len`
+/// the matched bytes.
+const GrepHl = struct {
+    buf: *Buffer,
+    row: usize,
+    col: usize,
+    len: usize,
+    set_at: i128,
+};
+
+/// How long the grep match highlight stays visible after a jump.
+const GREP_HL_NS: i128 = 2 * std.time.ns_per_s;
+
 /// Parse one grep result line into a match: the first "colon, digits,
 /// [colon, digits], colon" segment ends the file path — ripgrep prints
 /// "path:line:col: text", grep and findstr "path:line:text" (findstr with
@@ -1486,7 +1600,12 @@ fn armSizeWatchdog(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event)) void {
 /// taking over the whole screen; when a file is chosen it's simply
 /// replaced by the newly opened buffer. An active isearch shows its prompt
 /// in the modeline; the match is the selected entry.
-fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, search: ?IsearchView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
+fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, grep_follow: bool, grep_match_count: usize, grep_hl: ?GrepHl, search: ?IsearchView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
+    // The grep buffer never renders through a dired pane; the parameters
+    // exist so both leaf renderers share the renderTree signature.
+    _ = grep_follow;
+    _ = grep_match_count;
+    _ = grep_hl;
     const text_height: usize = if (height > 1) height - 1 else height;
     // The full directory path heads the listing (the classic dired header
     // line), taking one row unless the pane is too small to spare it.
@@ -1642,6 +1761,9 @@ fn renderTree(
     bookmark_prompt: ?BookmarkPromptView,
     goto_prompt: ?GotoPromptView,
     grep_prompt: ?GrepPromptView,
+    grep_follow: bool,
+    grep_match_count: usize,
+    grep_hl: ?GrepHl,
     search: ?IsearchView,
     dired_prompt: ?DiredPromptView,
     status: ?[]const u8,
@@ -1670,12 +1792,14 @@ fn renderTree(
         const pane_bookmark_prompt: ?BookmarkPromptView = if (pane == focused) bookmark_prompt else null;
         const pane_goto_prompt: ?GotoPromptView = if (pane == focused) goto_prompt else null;
         const pane_grep_prompt: ?GrepPromptView = if (pane == focused) grep_prompt else null;
+        const pane_grep_follow: bool = pane == focused and grep_follow;
+        const pane_grep_hl: ?GrepHl = if (grep_hl) |gh| (if (buffers[pane.buf_idx] == gh.buf) gh else null) else null;
         const pane_status: ?[]const u8 = if (pane == focused) status else null;
         const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
         if (direds[pane.buf_idx]) |*d| {
-            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_search, pane_prompt, pane_status);
+            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_follow, grep_match_count, pane_grep_hl, pane_search, pane_prompt, pane_status);
         } else {
-            renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_search, pane_status);
+            renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_follow, grep_match_count, pane_grep_hl, pane_search, pane_status);
         }
         return;
     }
@@ -1687,8 +1811,8 @@ fn renderTree(
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             // The one blank column between the panes gets the separator.
             drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
-            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, search, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_follow, grep_match_count, grep_hl, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_follow, grep_match_count, grep_hl, search, dired_prompt, status, focused_h, focused_w);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
@@ -1696,8 +1820,8 @@ fn renderTree(
             // a blank row between the panes for the separator (mirroring
             // the one blank column of a vertical split).
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
-            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, search, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_follow, grep_match_count, grep_hl, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_follow, grep_match_count, grep_hl, search, dired_prompt, status, focused_h, focused_w);
         },
     }
 }
@@ -1763,7 +1887,7 @@ const welcome_tail =
     \\    C-c w               copy the region
     \\    C-c C-k             close the dired buffer
     \\    C-c o               open the bookmark list
-    \\    C-c g               grep the current directory (Enter opens the match)
+    \\    C-c g               grep the current directory (Enter opens, F follows)
     \\    C-c j / C-c k       step back / forward through window layouts
     \\
     \\  M-l — jumps and tabs (the my-jump prefix):
@@ -2919,6 +3043,14 @@ pub fn main(init: std.process.Init) !void {
     // the same window. Null until the first jump; validated against the
     // pane tree before reuse (see paneInTree).
     var grep_target: ?*Pane = null;
+    // F in the grep buffer: follow mode — each n/p (or C-n / C-p / arrow)
+    // move auto-opens the match under point in the target window, focus
+    // staying on the grep buffer.
+    var grep_follow = false;
+    // A transient highlight of the term in the target file after a grep
+    // jump (see GrepHl) — drawn for a moment so the match is easy to spot
+    // while stepping.
+    var grep_hl: ?GrepHl = null;
     var grep_matches: std.ArrayList(GrepMatch) = .empty;
     defer {
         for (grep_matches.items) |m| gpa.free(m.path);
@@ -3211,6 +3343,8 @@ pub fn main(init: std.process.Init) !void {
                                     _ = closeBuffer(gpa, &buffers, &direds, root, focused, old, &window_undo, &window_redo);
                                 }
                                 grep_buf_idx = null;
+                                grep_target = null;
+                                grep_hl = null;
                                 for (grep_matches.items) |m| gpa.free(m.path);
                                 grep_matches.clearRetainingCapacity();
                             }
@@ -3973,21 +4107,34 @@ pub fn main(init: std.process.Init) !void {
                             current = closeBuffer(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo);
                             grep_buf_idx = null;
                             grep_target = null;
+                            grep_follow = false;
+                            grep_hl = null;
                             for (grep_matches.items) |m| gpa.free(m.path);
                             grep_matches.clearRetainingCapacity();
-                        } else if (key.matches('n', .{})) {
-                            // n / p: move between the matches (the C-n /
-                            // C-p / arrow keys fall through to the normal
-                            // movement dispatch, moving the same cursor).
+                        } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
+                            // n / p (and C-n / C-p / arrows) move between
+                            // the matches; with follow mode on (F) the
+                            // match under point opens in the target window
+                            // automatically, focus staying here.
                             if (buf.cursor_row + 1 < grep_matches.items.len) {
                                 buf.cursor_row += 1;
                                 buf.cursor_col = 0;
+                                if (grep_follow) {
+                                    grepOpenMatch(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, grep_matches.items, buf.cursor_row, &grep_target, grep_last_term, &grep_hl);
+                                }
                             }
-                        } else if (key.matches('p', .{})) {
+                        } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
                             if (buf.cursor_row > 0) {
                                 buf.cursor_row -= 1;
                                 buf.cursor_col = 0;
+                                if (grep_follow) {
+                                    grepOpenMatch(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, grep_matches.items, buf.cursor_row, &grep_target, grep_last_term, &grep_hl);
+                                }
                             }
+                        } else if (key.matches('F', .{})) {
+                            // F: toggle follow mode — stepping with n/p
+                            // opens each match in the target window.
+                            grep_follow = !grep_follow;
                         } else if (key.matches('g', .{})) {
                             // g: re-run the search — the prompt reopens
                             // prefilled with the previous term.
@@ -3995,47 +4142,11 @@ pub fn main(init: std.process.Init) !void {
                             grep_query.clearRetainingCapacity();
                             if (grep_last_term) |t| grep_query.appendSlice(gpa, t) catch {};
                         } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
-                            // Enter: open the match in another window — the
-                            // grep buffer stays put, and the window it opens
-                            // into is reused for every jump, so n/p + Enter
-                            // steps through the matches without the layout
-                            // changing. A lone grep window splits to the
-                            // right; with other windows around, the one last
-                            // used for a jump (or the next one) is replaced.
+                            // Enter: open the match in the target window —
+                            // the grep buffer stays put and the window is
+                            // reused for every jump (see grepOpenMatch).
                             const sel = @min(buf.cursor_row, grep_matches.items.len -| 1);
-                            const m = grep_matches.items[sel];
-                            const idx = openBufferOrDired(gpa, io, &buffers, &direds, &recent, m.path) catch current;
-                            const tgt = buffers.items[idx];
-                            if (tgt.lines.items.len > 0) {
-                                tgt.cursor_row = @min(m.line -| 1, tgt.lines.items.len - 1);
-                                tgt.cursor_col = @min(m.col -| 1, tgt.lines.items[tgt.cursor_row].items.len);
-                            }
-                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                            if (root.isLeaf()) {
-                                // Only the grep window: split to the right,
-                                // the match on the right, focus staying on
-                                // the grep buffer.
-                                if (root.leafCount() < MAX_PANES) {
-                                    try focused.split(gpa, .vertical);
-                                    focused.right.?.buf_idx = idx;
-                                    grep_target = focused.right.?;
-                                    focused = focused.left.?;
-                                }
-                            } else if (grep_target) |t| {
-                                if (paneInTree(root, t)) {
-                                    t.buf_idx = idx;
-                                } else {
-                                    grep_target = null;
-                                }
-                            }
-                            if (grep_target == null) {
-                                // Replace the next window over and remember
-                                // it for the next jump.
-                                if (moveFocus(root, focused, 1)) |nf| {
-                                    nf.buf_idx = idx;
-                                    grep_target = nf;
-                                }
-                            }
+                            grepOpenMatch(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, grep_matches.items, sel, &grep_target, grep_last_term, &grep_hl);
                         }
                     } else if (direds.items[current]) |*d| {
                         if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
@@ -4364,12 +4475,14 @@ pub fn main(init: std.process.Init) !void {
                         // M-b: backward word (Emacs backward-word) — the
                         // mirror of M-f, landing at the start of the word.
                         if (editing) buf.moveWordBackward();
-                    } else if (key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
+                    } else if (!in_grep_results and (key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{}))) {
                         // C-n: down one visual (soft-wrapped) line, so a
                         // wrapped paragraph is stepped through line by
-                        // line (Emacs visual-line-mode).
+                        // line (Emacs visual-line-mode). The grep results
+                        // buffer owns these keys (see the grep branch), so
+                        // they don't double-move its selection.
                         moveDownVisual(buf, focused_text_width, vx.screen.width_method);
-                    } else if (key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
+                    } else if (!in_grep_results and (key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{}))) {
                         moveUpVisual(buf, focused_text_width, vx.screen.width_method);
                     } else if (key.matches('a', .{ .ctrl = true })) {
                         // C-a: the start of the visual line (the segment's
@@ -4603,6 +4716,14 @@ pub fn main(init: std.process.Init) !void {
         else
             null;
 
+        // The transient grep-match highlight, expired once GREP_HL_NS has
+        // passed since the jump (it only redraws on events anyway, so the
+        // highlight lingers until the next keypress at most).
+        const grep_hl_view: ?GrepHl = if (grep_hl) |h| blk: {
+            if (std.Io.Clock.now(.real, io).nanoseconds - h.set_at < GREP_HL_NS) break :blk h;
+            break :blk null;
+        } else null;
+
         const dired_prompt_view: ?DiredPromptView = if (dired_copy_prompt)
             .{ .kind = dired_copy_kind, .query = dired_copy_query.items }
         else if (confirming_delete)
@@ -4615,7 +4736,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, search_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_follow, grep_matches.items.len, grep_hl_view, search_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;
@@ -4725,7 +4846,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal) {
             if (direds.items[current]) |*d| {
                 var modeline_buf: [2048]u8 = undefined;
-                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, search_view, dired_prompt_view, status_msg);
+                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_follow, grep_matches.items.len, grep_hl_view, search_view, dired_prompt_view, status_msg);
                 try vx.render(tty.writer());
                 frame_allocs.reset();
                 continue;
@@ -4746,6 +4867,17 @@ pub fn main(init: std.process.Init) !void {
             const expanded = expandTabs(&frame_allocs, raw, vx.screen.width_method);
             const line = expanded orelse raw;
             var h = highlightFor(buf, i, search_view != null, if (search_view) |s| (if (s.failed) null else s.match) else null, if (search_view) |s| s.query.len else 0);
+            // The transient grep-match highlight (see GrepHl).
+            if (h.hl == null) {
+                if (grep_hl_view) |gh| {
+                    if (i == gh.row) {
+                        const line_len = buf.lines.items[i].items.len;
+                        const start = @min(gh.col, line_len);
+                        const end = @min(gh.col + gh.len, line_len);
+                        if (end > start) h.hl = .{ .start = start, .end = end };
+                    }
+                }
+            }
             if (h.hl) |hl| {
                 if (expanded != null) {
                     h.hl = .{ .start = tabAwareWidth(raw, 0, hl.start, vx.screen.width_method), .end = tabAwareWidth(raw, 0, hl.end, vx.screen.width_method) };
@@ -4800,17 +4932,33 @@ pub fn main(init: std.process.Init) !void {
                 (if (isearch_dir == .backward) "I-search backward" else "I-search");
             break :blk fillPromptModeline(&modeline_buf, "{s}: ", .{label}, isearch_query.items);
         } else blk: {
+            // The grep results buffer shows its match position and keys in
+            // the modeline instead of the L:C readout.
+            const is_grep = std.mem.eql(u8, buf.display_name orelse "", "*grep*");
+            if (is_grep and grep_matches.items.len > 0) {
+                const n = std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}   (n/p move, Enter opens, F follows, g rerun, q close) --", .{
+                    buf.display_name orelse "?",
+                    if (grep_follow) " [follow]" else "",
+                    buf.cursor_row + 1,
+                    grep_matches.items.len,
+                    if (!buf.soft_wrap) " [truncate]" else "",
+                }) catch break :blk .{ .len = 0, .label_len = 0 };
+                break :blk .{ .len = n.len, .label_len = 0 };
+            }
             const buf_count = if (buffers.items.len > 1)
                 (std.fmt.bufPrint(&count_buf, "  ({d}/{d})", .{ current + 1, buffers.items.len }) catch "")
             else
                 "";
-            const n = std.fmt.bufPrint(&modeline_buf, "{s}-- {s}{s}{s}{s}{s}  L{d}:C{d} --", .{
+            const n = std.fmt.bufPrint(&modeline_buf, "{s}-- {s}{s}{s}{s}{s}{s}  L{d}:C{d} --", .{
                 // Emacs-style modified marker in the bottom-left corner of
                 // the modeline.
                 if (buf.dirty) "*" else "",
                 buf.display_name orelse buf.filename orelse "?",
                 if (buf.dirty) " [modified]" else "",
                 if (buf.mark != null) " [mark set]" else "",
+                // F in the grep results buffer: follow mode — n/p opens
+                // each match in the target window.
+                if (grep_follow and std.mem.eql(u8, buf.display_name orelse "", "*grep*")) " [follow]" else "",
                 // M-z: soft wrap off (truncated lines) shows like Emacs's
                 // Truncate mode-line marker; its absence means wrap is on.
                 if (!buf.soft_wrap) " [truncate]" else "",

@@ -10,6 +10,24 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.44.0 — <2026-08-06>
+
+Grep jumps flash the match.
+
+- Every grep jump — Enter, and the =F= follow-mode moves — now flashes a transient highlight of the grepped term in the target file (like Emacs's =next-error-highlight=): the matched bytes render in reverse video for a couple of seconds, then fade on their own, so the match is easy to spot while stepping through the results. The highlight is case-insensitive (a smart-case match highlights whatever case rg matched) and loses to an active isearch highlight.
+
+** 0.43.0 — <2026-08-06>
+
+The grep buffer's modeline shows its keys.
+
+- The =*grep*= buffer's modeline now shows the match position (=*grep* 3/7=) and its keybindings (=n/p= move, Enter opens, =F= follows, =g= re-run, =q= close) instead of the plain L:C readout, with the =[follow]= / =[truncate]= markers as before — the keys are visible at a glance while stepping through the matches.
+
+** 0.42.0 — <2026-08-06>
+
+=F= follows the grep matches.
+
+- =F= in the =*grep*= buffer toggles follow mode (the modeline shows =[follow]=): while it's on, every =n= / =p= move — arrows and =C-n= / =C-p= included — opens the match under point in the target window automatically, focus staying on the grep buffer, so a run of =n= keys steps through every match with the file always showing the current one. Enter still opens the match on demand.
+
 ** 0.41.0 — <2026-08-06>
 
 Grep results open in the match's window.
