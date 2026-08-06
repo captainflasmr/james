@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.41.0 — <2026-08-06>
+
+Grep results open in the match's window.
+
+- The =*grep*= buffer now always shows its rows truncated — each result is one line, however long, with the modeline's =[truncate]= marker showing the state. Enter no longer replaces the grep buffer with the file: the match opens in another window — a lone grep window splits to the right, and when other windows exist the one last used for a grep jump (or the next one over) is replaced — and that window is reused, so =n= / =p= + Enter steps through the matches without the layout changing. Focus stays on the grep buffer while stepping; =C-x o= jumps across to edit a match.
+
 ** 0.40.0 — <2026-08-06>
 
 =C-c g= greps the current directory.

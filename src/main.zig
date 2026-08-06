@@ -832,6 +832,16 @@ fn deleteFocusedPane(gpa: std.mem.Allocator, root: **Pane, focused: *Pane) ?*Pan
     return leaf;
 }
 
+/// True when `target` is a pane of the tree rooted at `root`. Panes can
+/// be destroyed by window deletion, the C-c j/k layout restores, and tab
+/// switches, so a remembered pane (the grep target window) is validated
+/// against the tree before it is reused.
+fn paneInTree(root: *const Pane, target: *const Pane) bool {
+    if (root == target) return true;
+    if (root.isLeaf()) return false;
+    return paneInTree(root.left.?, target) or paneInTree(root.right.?, target);
+}
+
 /// C-x o / M-n / M-p: the pane `step` places away from `focused` in render
 /// order (wrapping around), or null if there aren't two panes to choose
 /// between.
@@ -1753,7 +1763,7 @@ const welcome_tail =
     \\    C-c w               copy the region
     \\    C-c C-k             close the dired buffer
     \\    C-c o               open the bookmark list
-    \\    C-c g               grep the current directory (ripgrep)
+    \\    C-c g               grep the current directory (Enter opens the match)
     \\    C-c j / C-c k       step back / forward through window layouts
     \\
     \\  M-l — jumps and tabs (the my-jump prefix):
@@ -2904,6 +2914,11 @@ pub fn main(init: std.process.Init) !void {
     var grep_last_term: ?[]u8 = null;
     defer if (grep_last_term) |t| gpa.free(t);
     var grep_buf_idx: ?usize = null;
+    // The pane the last grep jump opened its file into — reused for the
+    // next jump, so stepping through the matches with n/p + Enter keeps
+    // the same window. Null until the first jump; validated against the
+    // pane tree before reuse (see paneInTree).
+    var grep_target: ?*Pane = null;
     var grep_matches: std.ArrayList(GrepMatch) = .empty;
     defer {
         for (grep_matches.items) |m| gpa.free(m.path);
@@ -3228,6 +3243,10 @@ pub fn main(init: std.process.Init) !void {
                             errdefer gpa.destroy(new_buf);
                             new_buf.* = try Buffer.fromText(gpa, text.items);
                             new_buf.display_name = try gpa.dupe(u8, "*grep*");
+                            // Results always truncate: one match per row,
+                            // however long the line (the modeline's
+                            // [truncate] shows the state).
+                            new_buf.soft_wrap = false;
                             try buffers.append(gpa, new_buf);
                             try direds.append(gpa, null);
                             grep_buf_idx = buffers.items.len - 1;
@@ -3953,6 +3972,7 @@ pub fn main(init: std.process.Init) !void {
                             recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                             current = closeBuffer(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo);
                             grep_buf_idx = null;
+                            grep_target = null;
                             for (grep_matches.items) |m| gpa.free(m.path);
                             grep_matches.clearRetainingCapacity();
                         } else if (key.matches('n', .{})) {
@@ -3975,17 +3995,46 @@ pub fn main(init: std.process.Init) !void {
                             grep_query.clearRetainingCapacity();
                             if (grep_last_term) |t| grep_query.appendSlice(gpa, t) catch {};
                         } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
-                            // Enter: jump to the match — open the file and
-                            // put the cursor on the matching line.
+                            // Enter: open the match in another window — the
+                            // grep buffer stays put, and the window it opens
+                            // into is reused for every jump, so n/p + Enter
+                            // steps through the matches without the layout
+                            // changing. A lone grep window splits to the
+                            // right; with other windows around, the one last
+                            // used for a jump (or the next one) is replaced.
                             const sel = @min(buf.cursor_row, grep_matches.items.len -| 1);
                             const m = grep_matches.items[sel];
-                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                            current = openBufferOrDired(gpa, io, &buffers, &direds, &recent, m.path) catch current;
-                            focused.buf_idx = current;
-                            const tgt = buffers.items[current];
+                            const idx = openBufferOrDired(gpa, io, &buffers, &direds, &recent, m.path) catch current;
+                            const tgt = buffers.items[idx];
                             if (tgt.lines.items.len > 0) {
                                 tgt.cursor_row = @min(m.line -| 1, tgt.lines.items.len - 1);
                                 tgt.cursor_col = @min(m.col -| 1, tgt.lines.items[tgt.cursor_row].items.len);
+                            }
+                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                            if (root.isLeaf()) {
+                                // Only the grep window: split to the right,
+                                // the match on the right, focus staying on
+                                // the grep buffer.
+                                if (root.leafCount() < MAX_PANES) {
+                                    try focused.split(gpa, .vertical);
+                                    focused.right.?.buf_idx = idx;
+                                    grep_target = focused.right.?;
+                                    focused = focused.left.?;
+                                }
+                            } else if (grep_target) |t| {
+                                if (paneInTree(root, t)) {
+                                    t.buf_idx = idx;
+                                } else {
+                                    grep_target = null;
+                                }
+                            }
+                            if (grep_target == null) {
+                                // Replace the next window over and remember
+                                // it for the next jump.
+                                if (moveFocus(root, focused, 1)) |nf| {
+                                    nf.buf_idx = idx;
+                                    grep_target = nf;
+                                }
                             }
                         }
                     } else if (direds.items[current]) |*d| {
