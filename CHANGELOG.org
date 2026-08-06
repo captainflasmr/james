@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.25.0 — <2026-08-05>
+
+The selected dired entry is highlighted.
+
+- Marked entries in dired are now highlighted: the whole row of a marked entry shows in reverse video, on top of the =*= in column 0 (the mark column) — the monochrome equivalent of Emacs's highlighted marks. General navigation is unchanged: the selected entry's row stays bold, like the cursor's line in a file buffer. An isearch match on a highlighted row drops the reverse (plain bold) so it stays distinct; matches elsewhere remain reverse video.
+
 ** 0.24.0 — <2026-08-05>
 
 Tabs render at tab stops.

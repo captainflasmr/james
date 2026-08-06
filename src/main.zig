@@ -1291,11 +1291,15 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
     var i = dired.top;
     while (i < dired.entries.items.len and row < text_height) : (i += 1) {
         const e = dired.entries.items[i];
-        // The selected entry's whole row is bold, like the cursor's line
-        // in a file buffer; an isearch match on it merges with the bold.
+        // A marked entry's whole row is highlighted in reverse video (the
+        // * in column 0 is the mark itself); the selected entry's row is
+        // bold, like the cursor's line in a file buffer. An isearch match
+        // on a highlighted row drops the reverse (plain bold) so it stays
+        // distinct against the row.
+        const is_marked = e.marked;
         const current = i == dired.selected;
-        const style: vaxis.Style = if (current) .{ .bold = true } else .{};
-        const hl_style: vaxis.Style = if (current) .{ .reverse = true, .bold = true } else highlight_style;
+        const style: vaxis.Style = if (is_marked) highlight_style else if (current) .{ .bold = true } else .{};
+        const hl_style: vaxis.Style = if (is_marked) .{ .bold = true } else if (current) .{ .reverse = true, .bold = true } else highlight_style;
         // Column 0 is the mark column, like Emacs: "*" for a marked
         // entry, a blank otherwise.
         _ = win.printSegment(.{ .text = if (e.marked) "*" else " ", .style = style }, .{ .row_offset = row_base + row });
