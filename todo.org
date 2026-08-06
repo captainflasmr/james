@@ -1,8 +1,9 @@
-* DONE james roadmap [25/29]
+* DONE james roadmap [26/30]
 ** TODO C-c f find files (fuzzy list) (but would be need to have visibility of an external tool? - has windows got a built in find?)
-** TODO C-c g grep (fuzzy list) (but would be need to have visibility of an external tool? - has windows got a built in grep?)
 ** TODO occur
-** DOING recent files
+** TODO some form of sticky keys?
+** DOING C-c g grep (fuzzy list) (but would be need to have visibility of an external tool? - has windows got a built in grep?)
+** DONE recent files
 ** DONE fuzzy search in buffer and bookmark list
 ** DONE show current keybindings in the welcome screen
 ** DONE version/data/time/description better formatted on welcome page

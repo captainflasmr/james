@@ -422,9 +422,23 @@ fn scrollToCursorVisual(buf: *Buffer, height: usize, width: usize, method: vaxis
         buf.top_line = buf.cursor_row;
         return;
     }
-    while (visualRowOfCursor(buf, buf.top_line, width, method) >= height and buf.top_line < buf.cursor_row) {
-        buf.top_line += 1;
+    // The cursor's visual row shrinks as top_line rises, so the first
+    // top_line that fits is found by binary search — a handful of
+    // O(n) passes instead of the previous loop of single-line
+    // increments, each re-walking the buffer (a jump deep into a large
+    // file took seconds).
+    if (visualRowOfCursor(buf, buf.top_line, width, method) < height) return;
+    var lo = buf.top_line;
+    var hi = buf.cursor_row;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (visualRowOfCursor(buf, mid, width, method) >= height) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
+    buf.top_line = lo;
 }
 
 /// C-l: recenter the window on the cursor's visual line, cycling middle →
@@ -491,6 +505,13 @@ const GotoPromptView = struct {
     query: []const u8,
 };
 
+/// The C-c g grep term prompt rendered in the focused window's modeline,
+/// like the goto-line prompt — the search runs over the current
+/// directory without disturbing the window layout.
+const GrepPromptView = struct {
+    query: []const u8,
+};
+
 /// The modeline text split into its prompt label and the rest: the prompt
 /// a command shows while waiting for input is rendered bold so it stands
 /// out from the typed query.
@@ -540,7 +561,7 @@ fn printModeline(win: vaxis.Window, buf: []u8, ml: PromptModeline, style: vaxis.
 /// may be the whole screen or one pane of a split. An active isearch shows
 /// its match highlight and prompt in this pane, exactly as if the pane were
 /// the whole screen.
-fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, search: ?IsearchView, status: ?[]const u8) void {
+fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, search: ?IsearchView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     const method = win.screen.width_method;
     scrollToCursorVisual(buf, text_height, win.width, method);
@@ -593,6 +614,8 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
         break :blk fillPromptModeline(modeline_buf, "Jump to bookmark (C-g cancels): ", .{}, p.query);
     } else if (goto_prompt) |g|
         fillPromptModeline(modeline_buf, "Goto line (C-g cancels): ", .{}, g.query)
+    else if (grep_prompt) |g|
+        fillPromptModeline(modeline_buf, "Grep: ", .{}, g.query)
     else if (search) |s| blk: {
         const label = if (s.failed)
             (if (s.backward) "Failing I-search backward" else "Failing I-search")
@@ -1213,7 +1236,6 @@ fn runCapture(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) ?[]u
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     if (child.stdout) |f| {
-        defer f.close(io);
         var buf: [256]u8 = undefined;
         var r = f.reader(io, &buf);
         var chunk: [256]u8 = undefined;
@@ -1222,10 +1244,85 @@ fn runCapture(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) ?[]u
             if (n == 0) break;
             out.appendSlice(gpa, chunk[0..n]) catch break;
         }
+        // The pipe must not be closed here: child.wait's cleanup closes
+        // the handles, and closing the fd twice panics (BADF) in Debug
+        // builds and corrupts the descriptor table in Release ones.
     }
     _ = child.wait(io) catch null;
     const trimmed = std.mem.trimEnd(u8, out.items, " \t\r\n");
     return if (trimmed.len > 0) gpa.dupe(u8, trimmed) catch null else null;
+}
+
+// --- C-c g grep (my/grep) ----------------------------------------------
+//
+// Mirrors the author's Emacs my/grep: ripgrep when it's on the PATH
+// (--smart-case, columns and line numbers), with the platform's built-in
+// grep as fallback — grep -rni on POSIX, findstr /s /n /i on Windows
+// (Windows has no grep, but findstr has shipped with every Windows since
+// NT 4, so the fallback always exists there).
+
+/// One parsed grep result: the file, the 1-based line and column of the
+/// match (column 0 when the tool didn't report one), and the text the
+/// buffer shows for it. `path` is heap-allocated.
+const GrepMatch = struct {
+    path: []u8,
+    line: usize,
+    col: usize,
+};
+
+/// Parse one grep result line into a match: the first "colon, digits,
+/// [colon, digits], colon" segment ends the file path — ripgrep prints
+/// "path:line:col: text", grep and findstr "path:line:text" (findstr with
+/// a trailing \r). Returns null when the line isn't a result.
+fn parseGrepLine(gpa: std.mem.Allocator, line: []const u8) ?GrepMatch {
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        if (line[i] != ':') continue;
+        const line_start = i + 1;
+        var j = line_start;
+        while (j < line.len and std.ascii.isDigit(line[j])) j += 1;
+        if (j == line_start) continue;
+        const line_num = std.fmt.parseUnsigned(usize, line[line_start..j], 10) catch continue;
+        var col: usize = 0;
+        if (j < line.len and line[j] == ':') {
+            // "line:col: text" (rg) or "line:text" (grep): try the column.
+            const col_start = j + 1;
+            var k = col_start;
+            while (k < line.len and std.ascii.isDigit(line[k])) k += 1;
+            if (k > col_start and k < line.len and line[k] == ':') {
+                col = std.fmt.parseUnsigned(usize, line[col_start..k], 10) catch 0;
+                j = k;
+            }
+        }
+        if (j >= line.len or line[j] != ':') continue;
+        const path = std.mem.trim(u8, line[0..i], " \t");
+        if (path.len == 0) continue;
+        return .{
+            .path = gpa.dupe(u8, path) catch return null,
+            .line = line_num,
+            .col = col,
+        };
+    }
+    return null;
+}
+
+/// Run the grep over `dir` for `term`, returning the raw output (null on
+/// failure or no matches): ripgrep first, then grep (POSIX) / findstr
+/// (Windows).
+fn grepRun(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, term: []const u8) ?[]u8 {
+    if (comptime builtin.os.tag == .windows) {
+        if (runCapture(io, gpa, &.{ "rg", "--color=never", "--column", "--line-number", "--no-heading", "--smart-case", "-e", term, dir })) |out| return out;
+        const literal = std.fmt.allocPrint(gpa, "/c:{s}", .{term}) catch return null;
+        defer gpa.free(literal);
+        const pattern = if (dir.len > 0 and dir[dir.len - 1] == std.fs.path.sep)
+            std.fmt.allocPrint(gpa, "{s}*", .{dir}) catch return null
+        else
+            std.fmt.allocPrint(gpa, "{s}{c}*", .{ dir, std.fs.path.sep }) catch return null;
+        defer gpa.free(pattern);
+        return runCapture(io, gpa, &.{ "findstr", "/s", "/n", "/i", literal, pattern });
+    }
+    if (runCapture(io, gpa, &.{ "rg", "--color=never", "--column", "--line-number", "--no-heading", "--smart-case", "-e", term, dir })) |out| return out;
+    return runCapture(io, gpa, &.{ "grep", "-rni", "-e", term, dir });
 }
 
 /// The application the desktop would use to open `path` externally: on
@@ -1379,7 +1476,7 @@ fn armSizeWatchdog(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event)) void {
 /// taking over the whole screen; when a file is chosen it's simply
 /// replaced by the newly opened buffer. An active isearch shows its prompt
 /// in the modeline; the match is the selected entry.
-fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, search: ?IsearchView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
+fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, search: ?IsearchView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     // The full directory path heads the listing (the classic dired header
     // line), taking one row unless the pane is too small to spare it.
@@ -1459,6 +1556,8 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
         break :blk fillPromptModeline(modeline_buf, "Jump to bookmark (C-g cancels): ", .{}, p.query);
     } else if (goto_prompt) |g|
         fillPromptModeline(modeline_buf, "Goto line (C-g cancels): ", .{}, g.query)
+    else if (grep_prompt) |g|
+        fillPromptModeline(modeline_buf, "Grep: ", .{}, g.query)
     else if (search) |s| blk: {
         const label = if (s.failed)
             (if (s.backward) "Failing I-search backward" else "Failing I-search")
@@ -1532,6 +1631,7 @@ fn renderTree(
     find_file: ?FindFileView,
     bookmark_prompt: ?BookmarkPromptView,
     goto_prompt: ?GotoPromptView,
+    grep_prompt: ?GrepPromptView,
     search: ?IsearchView,
     dired_prompt: ?DiredPromptView,
     status: ?[]const u8,
@@ -1559,12 +1659,13 @@ fn renderTree(
         const pane_find_file: ?FindFileView = if (pane == focused) find_file else null;
         const pane_bookmark_prompt: ?BookmarkPromptView = if (pane == focused) bookmark_prompt else null;
         const pane_goto_prompt: ?GotoPromptView = if (pane == focused) goto_prompt else null;
+        const pane_grep_prompt: ?GrepPromptView = if (pane == focused) grep_prompt else null;
         const pane_status: ?[]const u8 = if (pane == focused) status else null;
         const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
         if (direds[pane.buf_idx]) |*d| {
-            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_search, pane_prompt, pane_status);
+            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_search, pane_prompt, pane_status);
         } else {
-            renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_search, pane_status);
+            renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_search, pane_status);
         }
         return;
     }
@@ -1576,8 +1677,8 @@ fn renderTree(
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             // The one blank column between the panes gets the separator.
             drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
-            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, search, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, search, dired_prompt, status, focused_h, focused_w);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
@@ -1585,8 +1686,8 @@ fn renderTree(
             // a blank row between the panes for the separator (mirroring
             // the one blank column of a vertical split).
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
-            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, search, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, search, dired_prompt, status, focused_h, focused_w);
         },
     }
 }
@@ -1652,6 +1753,7 @@ const welcome_tail =
     \\    C-c w               copy the region
     \\    C-c C-k             close the dired buffer
     \\    C-c o               open the bookmark list
+    \\    C-c g               grep the current directory (ripgrep)
     \\    C-c j / C-c k       step back / forward through window layouts
     \\
     \\  M-l — jumps and tabs (the my-jump prefix):
@@ -2788,6 +2890,25 @@ pub fn main(init: std.process.Init) !void {
     var goto_prompt = false;
     var goto_query: std.ArrayList(u8) = .empty;
     defer goto_query.deinit(gpa);
+
+    // C-c g: the grep prompt (the author's Emacs my/grep key) — type a
+    // search term, Enter runs ripgrep (grep / findstr fallbacks) over the
+    // current directory. The results live in a buffer (display name
+    // "*grep*"); `grep_buf_idx` is its index, `grep_matches` the parsed
+    // (path, line, col) per result line, aligned with the buffer lines.
+    var grep_prompt = false;
+    var grep_query: std.ArrayList(u8) = .empty;
+    defer grep_query.deinit(gpa);
+    // The term of the last run search, for the results buffer's g key
+    // (re-run, prefilled).
+    var grep_last_term: ?[]u8 = null;
+    defer if (grep_last_term) |t| gpa.free(t);
+    var grep_buf_idx: ?usize = null;
+    var grep_matches: std.ArrayList(GrepMatch) = .empty;
+    defer {
+        for (grep_matches.items) |m| gpa.free(m.path);
+        grep_matches.deinit(gpa);
+    }
     // The modal picker (C-x b buffers, C-x r l / C-c o / M-l o bookmarks,
     // M-l l recent files): one at a time, over rows that filter as you
     // type (see pickerFilter). `picker_kind` selects the row source;
@@ -2956,6 +3077,22 @@ pub fn main(init: std.process.Init) !void {
                         picker_top = 0;
                         picker_query.clearRetainingCapacity();
                         pickerFilter(gpa, .bookmarks, buffers.items, bookmarks.items, recent.items, "", &picker_visible);
+                    } else if (key.matches('g', .{})) {
+                        // C-c g: grep (the my/grep key from the author's
+                        // Emacs) — prompt for a search term, prefilled
+                        // with the word at point, and run ripgrep (grep /
+                        // findstr fallbacks) over the current directory.
+                        grep_prompt = true;
+                        grep_query.clearRetainingCapacity();
+                        if (buf.lines.items.len > 0) {
+                            const line = buf.lines.items[buf.cursor_row].items;
+                            const col = @min(buf.cursor_col, line.len);
+                            var s = col;
+                            while (s > 0 and (std.ascii.isAlphanumeric(line[s - 1]) or line[s - 1] == '_')) s -= 1;
+                            var e = col;
+                            while (e < line.len and (std.ascii.isAlphanumeric(line[e]) or line[e] == '_')) e += 1;
+                            if (e > s) grep_query.appendSlice(gpa, line[s..e]) catch {};
+                        }
                     } else if (key.matches('j', .{})) {
                         // C-c j: step back through window layouts
                         // (winner-mode undo).
@@ -3035,6 +3172,73 @@ pub fn main(init: std.process.Init) !void {
                         try goto_query.appendSlice(gpa, t);
                     } else {
                         goto_prompt = false;
+                    }
+                } else if (grep_prompt) {
+                    if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        grep_prompt = false;
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        if (grep_query.items.len > 0) _ = grep_query.pop();
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
+                        const term = std.mem.trim(u8, grep_query.items, " ");
+                        grep_prompt = false;
+                        if (term.len > 0) run_blk: {
+                            // The search directory: the dired's own while
+                            // browsing, else the current buffer's.
+                            const dir = if (direds.items[current]) |*d|
+                                try gpa.dupe(u8, d.path.items)
+                            else
+                                try Dired.startingDir(gpa, buf.filename orelse ".");
+                            defer gpa.free(dir);
+                            // An old results buffer is replaced.
+                            if (grep_buf_idx) |old| {
+                                if (old < buffers.items.len) {
+                                    recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                                    _ = closeBuffer(gpa, &buffers, &direds, root, focused, old, &window_undo, &window_redo);
+                                }
+                                grep_buf_idx = null;
+                                for (grep_matches.items) |m| gpa.free(m.path);
+                                grep_matches.clearRetainingCapacity();
+                            }
+                            const out = grepRun(io, gpa, dir, term) orelse {
+                                status_msg = "No matches";
+                                break :run_blk;
+                            };
+                            defer gpa.free(out);
+                            if (grep_last_term) |t| gpa.free(t);
+                            grep_last_term = gpa.dupe(u8, term) catch null;
+                            var text: std.ArrayList(u8) = .empty;
+                            defer text.deinit(gpa);
+                            var it = std.mem.splitScalar(u8, out, '\n');
+                            while (it.next()) |raw| {
+                                const line = std.mem.trimEnd(u8, raw, "\r");
+                                if (parseGrepLine(gpa, line)) |m| {
+                                    text.appendSlice(gpa, line) catch break;
+                                    text.append(gpa, '\n') catch break;
+                                    grep_matches.append(gpa, m) catch {
+                                        gpa.free(m.path);
+                                        break;
+                                    };
+                                }
+                            }
+                            if (grep_matches.items.len == 0) {
+                                status_msg = "No matches";
+                                break :run_blk;
+                            }
+                            const new_buf = try gpa.create(Buffer);
+                            errdefer gpa.destroy(new_buf);
+                            new_buf.* = try Buffer.fromText(gpa, text.items);
+                            new_buf.display_name = try gpa.dupe(u8, "*grep*");
+                            try buffers.append(gpa, new_buf);
+                            try direds.append(gpa, null);
+                            grep_buf_idx = buffers.items.len - 1;
+                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                            current = grep_buf_idx.?;
+                            focused.buf_idx = current;
+                        }
+                    } else if (key.text) |t| {
+                        try grep_query.appendSlice(gpa, t);
+                    } else {
+                        grep_prompt = false;
                     }
                 } else if (dired_copy_prompt) {
                     if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
@@ -3726,14 +3930,65 @@ pub fn main(init: std.process.Init) !void {
                     // deliberately NOT an else-if chain: keys it doesn't
                     // consume fall through to the editing dispatch below.
                     //
+                    // The grep results buffer (C-c g) takes over the plain
+                    // keys like a dired: n/p move between matches, Enter
+                    // jumps to the match, g re-runs the search, q / C-g
+                    // closes. The display-name check keeps a stale
+                    // `grep_buf_idx` (the buffer killed via C-x k, say)
+                    // from hijacking whatever buffer now sits at that
+                    // index.
+                    const in_grep_results = current == grep_buf_idx and
+                        std.mem.eql(u8, buffers.items[current].display_name orelse "", "*grep*");
                     // `editing` is captured BEFORE the dired block runs: it
                     // must describe the buffer this keypress actually acts
                     // on. Opening a file from dired changes `current` mid-
                     // keypress, and a stale true value would let the same
                     // key fall through into the editing dispatch against the
-                    // zero-line dired buffer.
-                    const editing = direds.items[current] == null;
-                    if (direds.items[current]) |*d| {
+                    // zero-line dired buffer. The grep results buffer is
+                    // read-only like a dired, so keys it doesn't consume
+                    // (typing, kills) don't corrupt its match lines.
+                    const editing = direds.items[current] == null and !in_grep_results;
+                    if (in_grep_results) {
+                        if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
+                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo);
+                            grep_buf_idx = null;
+                            for (grep_matches.items) |m| gpa.free(m.path);
+                            grep_matches.clearRetainingCapacity();
+                        } else if (key.matches('n', .{})) {
+                            // n / p: move between the matches (the C-n /
+                            // C-p / arrow keys fall through to the normal
+                            // movement dispatch, moving the same cursor).
+                            if (buf.cursor_row + 1 < grep_matches.items.len) {
+                                buf.cursor_row += 1;
+                                buf.cursor_col = 0;
+                            }
+                        } else if (key.matches('p', .{})) {
+                            if (buf.cursor_row > 0) {
+                                buf.cursor_row -= 1;
+                                buf.cursor_col = 0;
+                            }
+                        } else if (key.matches('g', .{})) {
+                            // g: re-run the search — the prompt reopens
+                            // prefilled with the previous term.
+                            grep_prompt = true;
+                            grep_query.clearRetainingCapacity();
+                            if (grep_last_term) |t| grep_query.appendSlice(gpa, t) catch {};
+                        } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
+                            // Enter: jump to the match — open the file and
+                            // put the cursor on the matching line.
+                            const sel = @min(buf.cursor_row, grep_matches.items.len -| 1);
+                            const m = grep_matches.items[sel];
+                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                            current = openBufferOrDired(gpa, io, &buffers, &direds, &recent, m.path) catch current;
+                            focused.buf_idx = current;
+                            const tgt = buffers.items[current];
+                            if (tgt.lines.items.len > 0) {
+                                tgt.cursor_row = @min(m.line -| 1, tgt.lines.items.len - 1);
+                                tgt.cursor_col = @min(m.col -| 1, tgt.lines.items[tgt.cursor_row].items.len);
+                            }
+                        }
+                    } else if (direds.items[current]) |*d| {
                         if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
                             recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                             current = closeBuffer(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo);
@@ -4294,6 +4549,11 @@ pub fn main(init: std.process.Init) !void {
         else
             null;
 
+        const grep_prompt_view: ?GrepPromptView = if (grep_prompt)
+            .{ .query = grep_query.items }
+        else
+            null;
+
         const dired_prompt_view: ?DiredPromptView = if (dired_copy_prompt)
             .{ .kind = dired_copy_kind, .query = dired_copy_query.items }
         else if (confirming_delete)
@@ -4306,7 +4566,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, bookmark_prompt_view, goto_prompt_view, search_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, search_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;
@@ -4416,7 +4676,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal) {
             if (direds.items[current]) |*d| {
                 var modeline_buf: [2048]u8 = undefined;
-                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, bookmark_prompt_view, goto_prompt_view, search_view, dired_prompt_view, status_msg);
+                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, search_view, dired_prompt_view, status_msg);
                 try vx.render(tty.writer());
                 frame_allocs.reset();
                 continue;
@@ -4482,6 +4742,8 @@ pub fn main(init: std.process.Init) !void {
             break :blk fillPromptModeline(&modeline_buf, "Jump to bookmark (C-g cancels): ", .{}, bookmark_query.items);
         } else if (goto_prompt) blk: {
             break :blk fillPromptModeline(&modeline_buf, "Goto line (C-g cancels): ", .{}, goto_query.items);
+        } else if (grep_prompt) blk: {
+            break :blk fillPromptModeline(&modeline_buf, "Grep: ", .{}, grep_query.items);
         } else if (isearch_active) blk: {
             const label = if (isearch_failed)
                 (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")

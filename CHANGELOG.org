@@ -10,6 +10,13 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.40.0 — <2026-08-06>
+
+=C-c g= greps the current directory.
+
+- =C-c g= prompts for a search term (prefilled with the word at point, like the author's Emacs =my/grep=) and runs ripgrep over the current directory — the dired's own while browsing, the current file's directory otherwise — falling back to =grep -rni= on POSIX and =findstr /s /n /i= on Windows (the built-in grep that has shipped with every Windows since NT 4, so the fallback always exists). The matches open in a =*grep*= buffer, one per row (=path:line:col: text=): =n= / =p= move between them, Enter jumps to the file at the matching line and column, =g= re-runs the search with the term prefilled, =q= / =C-g= closes, and =C-s= / =C-r= search the results. The search term is remembered across re-runs.
+- Two latent bugs surfaced along the way. The external-command runner double-closed the child's stdout pipe — a BADF panic in Debug builds and a corrupted descriptor table in Release ones; the dired =W= open-app lookup and the new grep shared the bug. And =scrollToCursorVisual= moved =top_line= one line at a time, each step re-walking the buffer, so a jump deep into a large file (the grep Enter, or =M-<= / =M->=) took seconds; the viewport start is now found by binary search.
+
 ** 0.39.0 — <2026-08-06>
 
 =M-l l= picks a recently opened file.
