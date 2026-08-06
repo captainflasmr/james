@@ -1496,6 +1496,7 @@ const welcome_tail =
     \\    C-space       set the mark; C-x C-k kills the region, C-y yanks
     \\    C-w           save (as does C-x C-s)
     \\    C-x u         undo
+    \\    C-g C-/ / M-/  redo
     \\    C-x C-s       save
     \\    C-x j / C-x c  drop to a real shell (C-z / exit returns)
     \\    M-l = / M-l -  new / close tab; M-1..M-9, M-i / M-u select
@@ -2208,6 +2209,9 @@ pub fn main(init: std.process.Init) !void {
     // True while consecutive C-l presses are cycling recenter positions
     // (center → top → bottom); any other key resets the next C-l to center.
     var last_was_recenter = false;
+    // C-g C-/: redo — the author's Emacs habit. C-g leaves this set for
+    // the next keypress; anything other than C-/ clears it again.
+    var pending_ctrl_g = false;
     if (tty.getWinsize() catch null) |ws| {
         if (ws.cols > 0 and ws.rows > 0) {
             try vx.resize(gpa, tty.writer(), ws);
@@ -2393,6 +2397,10 @@ pub fn main(init: std.process.Init) !void {
                 // message (failed save) lives until the next keypress too.
                 if (!key.matches('l', .{ .ctrl = true })) last_was_recenter = false;
                 if (!key.matches('y', .{ .alt = true })) yank_state = null;
+                // C-g arms redo for the next keypress; any key other than
+                // C-/ disarms it again.
+                if (!key.matches('/', .{ .ctrl = true }) and !key.matches(0x1F, .{})) pending_ctrl_g = false;
+                if (key.matches('g', .{ .ctrl = true })) pending_ctrl_g = true;
                 status_msg = null;
                 const buf: *Buffer = buffers.items[current];
 
@@ -3353,7 +3361,17 @@ pub fn main(init: std.process.Init) !void {
                         // branch above).
                         pending_alt_l = true;
                     } else if (key.matches('/', .{ .ctrl = true }) or key.matches(0x1F, .{})) {
-                        buf.undo(gpa);
+                        if (pending_ctrl_g) {
+                            // C-g C-/: redo (the author's Emacs habit);
+                            // plain C-/ undoes.
+                            pending_ctrl_g = false;
+                            buf.redo(gpa);
+                        } else {
+                            buf.undo(gpa);
+                        }
+                    } else if (key.matches('/', .{ .alt = true })) {
+                        // M-/: redo, the single-key alias of C-g C-/.
+                        buf.redo(gpa);
                     } else if (key.matches(';', .{ .ctrl = true })) {
                         if (editing) try buf.toggleComment(gpa);
                     } else if (key.matches('s', .{ .ctrl = true })) {

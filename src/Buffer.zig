@@ -12,7 +12,11 @@ filename: ?[]const u8 = null,
 display_name: ?[]const u8 = null,
 dirty: bool = false,
 mark: ?Pos = null,
-undo_stack: std.ArrayList(Snapshot) = .empty,
+    undo_stack: std.ArrayList(Snapshot) = .empty,
+    /// The redo stack: the states each undo discards, restored by redo
+    /// (C-g C-/ or M-/). A new edit clears it, like Emacs abandoning the
+    /// redo branch once you type after undoing.
+    redo_stack: std.ArrayList(Snapshot) = .empty,
 /// Kind of the most recent edit, so a run of the same kind (typing, or
 /// backspacing) coalesces into a single undo step instead of one per key.
 undo_group: UndoKind = .none,
@@ -65,6 +69,8 @@ pub fn deinit(self: *Buffer, gpa: std.mem.Allocator) void {
     self.lines.deinit(gpa);
     for (self.undo_stack.items) |*snap| snap.deinit(gpa);
     self.undo_stack.deinit(gpa);
+    for (self.redo_stack.items) |*snap| snap.deinit(gpa);
+    self.redo_stack.deinit(gpa);
     if (self.filename) |f| gpa.free(f);
     if (self.display_name) |d| gpa.free(d);
 }
@@ -107,6 +113,8 @@ pub fn reread(self: *Buffer, gpa: std.mem.Allocator, io: std.Io) !void {
     if (self.filename) |f| gpa.free(f);
     for (self.undo_stack.items) |*snap| snap.deinit(gpa);
     self.undo_stack.deinit(gpa);
+    for (self.redo_stack.items) |*snap| snap.deinit(gpa);
+    self.redo_stack.deinit(gpa);
     self.* = fresh;
 }
 
@@ -141,6 +149,9 @@ fn cloneLines(self: Buffer, gpa: std.mem.Allocator) !std.ArrayList(std.ArrayList
 /// of the same kind of edit (so a burst of typing undoes as one step).
 fn recordUndo(self: *Buffer, gpa: std.mem.Allocator, kind: UndoKind) !void {
     if (kind == self.undo_group and self.undo_stack.items.len > 0) return;
+    // A new edit abandons the redo branch, like Emacs.
+    for (self.redo_stack.items) |*snap| snap.deinit(gpa);
+    self.redo_stack.clearRetainingCapacity();
     try self.undo_stack.append(gpa, .{
         .lines = try self.cloneLines(gpa),
         .cursor_row = self.cursor_row,
@@ -151,10 +162,49 @@ fn recordUndo(self: *Buffer, gpa: std.mem.Allocator, kind: UndoKind) !void {
     self.undo_group = kind;
 }
 
-/// C-x u: restore the state from before the last undo group. There is no
-/// redo yet — undoing is a one-way trip back through history.
+/// Clone the current state onto `stack` — the counterpart of an undo or
+/// redo step. Best effort: if the clone or the append fails, the step
+/// simply has no counterpart (undo still works; that step just isn't
+/// redoable — or vice versa).
+fn pushState(self: *Buffer, gpa: std.mem.Allocator, stack: *std.ArrayList(Snapshot)) void {
+    const lines = self.cloneLines(gpa) catch return;
+    errdefer {
+        for (lines.items) |*l| l.deinit(gpa);
+        lines.deinit(gpa);
+    }
+    stack.append(gpa, .{
+        .lines = lines,
+        .cursor_row = self.cursor_row,
+        .cursor_col = self.cursor_col,
+        .mark = self.mark,
+        .dirty = self.dirty,
+    }) catch return;
+}
+
+/// C-x u / C-/: restore the state from before the last undo group. The
+/// state being undone is pushed onto the redo stack, so redo (C-g C-/
+/// or M-/) brings it back.
 pub fn undo(self: *Buffer, gpa: std.mem.Allocator) void {
     const snap = self.undo_stack.pop() orelse return;
+    // The state being undone becomes the redo's target.
+    self.pushState(gpa, &self.redo_stack);
+    for (self.lines.items) |*line| line.deinit(gpa);
+    self.lines.deinit(gpa);
+    self.lines = snap.lines;
+    self.cursor_row = snap.cursor_row;
+    self.cursor_col = snap.cursor_col;
+    self.mark = snap.mark;
+    self.undo_group = .none;
+    self.dirty = snap.dirty;
+}
+
+/// M-/ / C-g C-/: redo — restore the state the last undo discarded, and
+/// push the current state back onto the undo stack, so the redo is
+/// itself undoable.
+pub fn redo(self: *Buffer, gpa: std.mem.Allocator) void {
+    const snap = self.redo_stack.pop() orelse return;
+    // The state being redone away becomes undoable again.
+    self.pushState(gpa, &self.undo_stack);
     for (self.lines.items) |*line| line.deinit(gpa);
     self.lines.deinit(gpa);
     self.lines = snap.lines;

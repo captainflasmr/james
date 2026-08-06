@@ -53,6 +53,7 @@ Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes 
 | =M-y= | yank-pop (after a yank, replace it with the next older kill) |
 | =C-s= / =C-r= | incremental search forward / backward |
 | =C-/= (or =C-x u=) | undo |
+| =C-g C-/= (or =M-/=) | redo |
 | =C-;= | comment / uncomment the current line (marker guessed from the file extension) |
 | =C-x b= | list open buffers and pick one (n/p move, Enter switches, q closes) |
 | =C-x C-f= | open or switch to a file by path (status-line prompt) |

@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.29.0 — <2026-08-05>
+
+Redo.
+
+- Redo now works: =C-g C-/= (the author's Emacs habit) or =M-/= restores the state the last undo discarded — an undone edit comes back, cursor, mark, and modified flag included, and the redo is itself undoable (=C-/= undoes it again). Each undo pushes the state it discards onto a per-buffer redo stack; any new edit clears the stack, like Emacs abandoning the redo branch once you type after undoing. =C-/= alone still undoes — only a =C-/= pressed right after =C-g= redoes.
+
 ** 0.28.0 — <2026-08-05>
 
 New tabs open on the current buffer.
