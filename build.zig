@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", release.version);
     build_options.addOption([]const u8, "date", release.date);
+    build_options.addOption([]const u8, "built", buildTime(b));
     build_options.addOption([]const u8, "theme", release.theme);
     exe.root_module.addOptions("build_options", build_options);
 
@@ -110,4 +111,18 @@ fn latestRelease(b: *std.Build) ReleaseInfo {
         return empty;
     }
     return empty;
+}
+
+/// The build moment's clock time, "HH:MM" (UTC, like every timestamp
+/// james shows) — the welcome screen's version line pairs it with the
+/// release date from CHANGELOG.org, so a rebuild of the same version is
+/// visible at a glance. Empty on failure.
+fn buildTime(b: *std.Build) []const u8 {
+    var buf: [8]u8 = undefined;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const secs: u64 = @intCast(@max(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_s), 0));
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const ds = es.getDaySeconds();
+    const s = std.fmt.bufPrint(&buf, "{d:0>2}:{d:0>2}", .{ ds.getHoursIntoDay(), ds.getMinutesIntoHour() }) catch return "";
+    return b.allocator.dupe(u8, s) catch return "";
 }

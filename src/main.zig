@@ -1519,6 +1519,10 @@ fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer)) !void {
         try text.appendSlice(gpa, build_options.version);
         try text.appendSlice(gpa, " (");
         try text.appendSlice(gpa, build_options.date);
+        if (build_options.built.len > 0) {
+            try text.appendSlice(gpa, " ");
+            try text.appendSlice(gpa, build_options.built);
+        }
         try text.appendSlice(gpa, ") — ");
         try text.appendSlice(gpa, build_options.theme);
     }

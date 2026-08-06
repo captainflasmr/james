@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.27.0 — <2026-08-05>
+
+The welcome screen's version line shows the build time.
+
+- The version line under the welcome message now pairs the release date with the time the binary was built — =james 0.27.0 (2026-08-05 14:30) — The welcome screen's version line shows the build time.=, say — baked in by =build.zig= at compile time (UTC, like every timestamp james shows), so rebuilding the same version is visible at a glance on the home screen.
+
 ** 0.26.0 — <2026-08-05>
 
 =M-w= copies a line with its newline.
