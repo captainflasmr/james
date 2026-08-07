@@ -1,0 +1,68 @@
+#+title: Roadmap for james
+#+language: en
+#+options: ':t toc:nil num:nil
+#+startup: showall
+
+Ideas for james, drawn from the author's Emacs configs (=~/.emacs.d/Emacs-vanilla= and =~/.emacs.d/Emacs-DIYer=): features that see real daily use in Emacs and would slot into james's architecture — the platform-facing layer already shells out to external tools (ripgrep, =xdg-open=, =wl-paste= / =xsel=), so anything that runs a command and shows the output fits the existing =runCapture= / results-buffer pattern.
+
+TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =todo.org= keeps the worklog.
+
+* Near term
+
+** TODO M-/ word completion (dabbrev) and autosuggest
+- Emacs: =my/popup-completion-in-region= + =my/dabbrev-capf=, and =simple-autosuggest-mode=, which is *globally enabled* — the single most-used editor "feel" feature in the author's Emacs, and james has no completion at all.
+- =M-/= expands the word at point using dabbrev-style matches gathered from every open buffer (Emacs =dabbrev-expand= is the first =hippie-expand= try in the config). Pure text state — lives happily in =Buffer.zig= / =main.zig= without touching the terminal layer.
+- A dimmed ghost-text suggestion on the current line (mirroring =simple-autosuggest-mode=) could follow, reusing the transient-highlight machinery.
+- Effort: medium (dabbrev core is small; autosuggest rendering is the fiddly half).
+
+** TODO occur — M-c
+- Emacs: =occur= on =M-c=, and =my/occur-from-isearch= (M-c inside isearch turns the search string into an occur).
+- The =*grep*= buffer machinery is a direct template: an =*occur*= buffer listing =line: text= matches of the isearch term in the current buffer, =n= / =p= to step, Enter to jump, =g= to re-run. Also unblocks isearch-in-a-results-buffer.
+- Effort: small-to-medium (clone of the results-buffer path).
+
+** TODO Dired: disk usage, compress, file clipboard
+- Emacs: =my/dired-du= (=du = sort = awk = column= into a =*dired-du*= buffer, largest first), the =my/dired-compress-transient= formats (xz / gzip / tar.gz / bzip2 / zstd / lzip / 7z) with async progress, and =my-dired-clipboard-mode= (=M-w= copy files, =C-y= paste, conflict renaming). Dired is the most-developed area of the author's Emacs (~800 lines in =Emacs-vanilla= alone).
+- james dired already has =C= / =R= / =D=, marks, and dwim-target; the file *clipboard* (=C-y= pastes marked files, not text) is the standout — Emacs muscle memory =C-y= in dired.
+- =du= is a one-shot =runCapture= over the current directory into a listing buffer; compress is the same with a format picker (reuse the modeline prompt pattern).
+- Effort: small (=du=), medium (compress), small (clipboard).
+
+** TODO Sticky keys / repeat-mode
+- Emacs: =windmove-repeat-map= (h/j/k/l keep moving windows after one press) and =my/repeat-history= (=C-c j= then =j= / =k= keeps stepping winner-mode history).
+- For james: after =C-c j= / =C-c k=, =j= / =k= repeat; after a window-motion key (=M-n= / =M-p=), the direction repeats. The =pending_*= pattern already in =main.zig= (C-g arms redo) is the same plumbing.
+- Effort: small.
+
+* Medium term
+
+** TODO Spell-check the word at point — M-$
+- Emacs: =flyspell= / =ispell= with en_GB hunspell and a personal dictionary; spelling-menu on =C-c s=, =M-4= ispell-word.
+- Shell out to hunspell/aspell for the word at point, show suggestions in a picker, replace on selection. Personal-dictionary appending fits the bookmarks/recent files persistence pattern.
+- Effort: medium.
+
+** TODO Quick window jump — M-o
+- Emacs: =my/quick-window-jump= — each window gets a one-char label (j/k/l/;/a/s/d/f), typing it jumps; direct jump when two windows.
+- Transposes cleanly to a TUI (overlay labels in the corners like ace-window). james only cycles with =M-n= / =M-p= today.
+- Effort: small-to-medium.
+
+* Quick wins
+
+** TODO Flash on copy
+- Emacs: =my/kill-ring-save= flashes the copied text; james already has the transient highlight from grep jumps — reuse it for =M-w= / =C-c w=.
+** TODO M-h mark block
+- Emacs: =my/mark-block= — mark the text between surrounding blank lines. Trivial in james (scan rows, set mark).
+** TODO Isearch lazy count
+- Emacs: =isearch-lazy-count= with the =(%s/%s)= format; show match position / total in the modeline while searching.
+** TODO Dired duplicate file and trash delete
+- Emacs: =my/dired-duplicate-file= (=_NNN= incremented names, async) and =my/dired-async-do-delete= (trash instead of =D='s hard delete, with a confirm prompt like james's existing y/n).
+
+* Deferred
+
+- **Go-to-definition (M-.)** — Emacs has the xref memoization + live-preview stack and etags for C-family code; james would need a dumb rg/etags-based index. Valuable for a coder's editor, but the largest item here.
+- **Folding** — Emacs =my/selective-display-fold= folds by indentation; james has no folding at all.
+- **Centered buffer** — Emacs =my/center-buffer-mode= (olivetti-style margins); aesthetic, no editing payoff.
+- **Named shell buffers + popup manager** — Emacs =my/shell-menu= with popper-style popups; james's =C-x j= real-shell drop covers most of the need.
+- **Rainbow color overlays** — Emacs =my/rainbow-mode=; needs rendering-layer support beyond current styles.
+- **Org publish / RSS / picture tagging / gh-release** — genuinely useful in Emacs but too domain-specific for a mini editor.
+
+* Already in james
+
+=recentf= (=M-l l=), grep (=C-c g=), find files (=C-c f=), tabs (=M-l ==, =M-l -=, =M-1..9=, =M-i=, =M-u=), winner-mode window history (=C-c j= / =C-c k=), dired sorting (3/4/5/6, =s=) and dwim-target copy/rename, window resize (=C-M-h/j/k/l=), quarter-page and page scrolling (=M-j/k=, =M-J/K=), jump keys (=M-l= prefix), comment/uncomment (=C-;=), copy line / buffer / region (=M-w=, =C-c b=, =C-c w=), shell drop (=C-x j= / =C-x c=).
