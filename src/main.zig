@@ -3438,6 +3438,15 @@ pub fn main(init: std.process.Init) !void {
                 yank_state = null;
             },
             .key_press => |key| {
+                // Windows delivers a bare modifier held alone (Ctrl/Alt/Shift)
+                // as its own .key_press with no text — the ~/ keypress arrives
+                // as a separate record after it. Linux never emits these, so
+                // every prompt, isearch and picker cancels on any unmatched
+                // text-less key, which would end the prompt mid-keystroke
+                // (e.g. Ctrl while typing C-s to continue an isearch). Drop
+                // the modifier-only events here, before the bookkeeping, so
+                // they don't disarm pending_ctrl_g either.
+                if (key.isModifier()) continue;
                 // C-l cycles recenter positions only when pressed back to
                 // back (Emacs recenter-top-bottom); any other key makes the
                 // next C-l recenter to the middle again. A transient status
