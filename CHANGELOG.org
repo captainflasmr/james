@@ -10,6 +10,18 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.52.0 — <2026-08-07>
+
+Typing at a prefilled =Grep:= / =Occur:= prompt replaces the prefill instead of appending to it.
+
+- Both prompts start prefilled with the word at point (and occur also with the isearch query or the last term on a =g= re-run), so typing a fresh term on top of the prefill silently searched for the two glued together — =todoTODO= — and found nothing. The first character typed now replaces the prefill: =M-c= on a TODO, typing =TODO= and Enter finds every TODO, not "No matches". Backspace still shrinks the prefill as before.
+
+** 0.51.0 — <2026-08-07>
+
+=M-c= collects the buffer's matching lines into an =*occur*= buffer, like the author's Emacs occur.
+
+- Every line of the current buffer matching a term lands in a persistent =*occur*= buffer, one row per match as =line: text=, matching ASCII case-insensitively like isearch — no external tool, so it works everywhere. The prompt is prefilled with the word at point; =M-c= during a search (=C-s= / =C-r=) starts from the search string instead (my/occur-from-isearch). The buffer behaves exactly like =*grep*=: =n= / =p= move between the matches, Enter jumps to the match in the source file — splitting to the right when the occur buffer is the only window, reusing the window of the last jump otherwise, focus staying on the results — =F= follows so stepping opens each match automatically, =g= re-runs over the source file (picking up any edits made since, and leaving the old buffer intact when the re-run finds nothing), and =q= / =C-g= closes. Each jump flashes a transient highlight of the term in the source, like a grep jump. Occur is editing-only: results buffers and direds have nothing to scan, and the home screen has no file to jump back to; a failed search shows =No matches= on the modeline.
+
 ** 0.50.0 — <2026-08-07>
 
 =C-y= pastes the system clipboard on Linux, and an outside copy wins over a stale kill-ring head.
