@@ -5044,7 +5044,12 @@ pub fn main(init: std.process.Init) !void {
                         // grows, a bottom one shrinks.
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         root.resizeDivider(focused, .horizontal, 8);
-                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches(0x0A, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
+                        // A bare LF (0x0A) key event is a paste-delivered
+                        // line break: Windows terminals that synthesize
+                        // per-character key events for a paste send LF
+                        // with no matching key code, and it would
+                        // otherwise be dropped here.
                         if (editing) try buf.insertNewline(gpa);
                     } else if (key.text) |t| {
                         // Dired buffers are read-only: typing is ignored.

@@ -100,7 +100,13 @@ pub fn loadFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Buffer {
     var it = std.mem.splitScalar(u8, contents, '\n');
     while (it.next()) |line_slice| {
         var line: std.ArrayList(u8) = .empty;
-        try line.appendSlice(gpa, line_slice);
+        // CRLF files keep a trailing \r on every line; drop it so the
+        // line renders as text instead of a carriage-return control cell.
+        const lf = if (line_slice.len > 0 and line_slice[line_slice.len - 1] == '\r')
+            line_slice[0 .. line_slice.len - 1]
+        else
+            line_slice;
+        try line.appendSlice(gpa, lf);
         try buf.lines.append(gpa, line);
     }
     if (buf.lines.items.len == 0) try buf.lines.append(gpa, .empty);
@@ -226,9 +232,34 @@ fn insertSliceRaw(self: *Buffer, gpa: std.mem.Allocator, text: []const u8) !void
     self.dirty = true;
 }
 
+/// Insert `text` at point, splitting on line breaks so a multi-line
+/// paste (clipboard reads, bracketed paste) keeps its line structure
+/// instead of embedding the break bytes inside one logical line — a line
+/// with embedded \r\n renders its \r as a control cell, and the terminal
+/// treats the carriage return as "back to column 0", gluing the text
+/// together. CRLF and bare CR line endings normalize to LF, like Emacs's
+/// yank. A trailing break doesn't leave an empty tail line.
+fn insertTextRaw(self: *Buffer, gpa: std.mem.Allocator, text: []const u8) !void {
+    var seg_start: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        if (c == '\n' or c == '\r') {
+            try self.insertSliceRaw(gpa, text[seg_start..i]);
+            try self.insertNewlineRaw(gpa);
+            i += 1;
+            if (c == '\r' and i < text.len and text[i] == '\n') i += 1;
+            seg_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if (seg_start < text.len) try self.insertSliceRaw(gpa, text[seg_start..]);
+}
+
 pub fn insertSlice(self: *Buffer, gpa: std.mem.Allocator, text: []const u8) !void {
     try self.recordUndo(gpa, .typing);
-    try self.insertSliceRaw(gpa, text);
+    try self.insertTextRaw(gpa, text);
 }
 
 fn insertNewlineRaw(self: *Buffer, gpa: std.mem.Allocator) !void {
@@ -535,12 +566,9 @@ pub fn copyWholeBuffer(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRi
 }
 
 fn yankRaw(self: *Buffer, gpa: std.mem.Allocator, text: []const u8) !void {
-    var it = std.mem.splitScalar(u8, text, '\n');
-    try self.insertSliceRaw(gpa, it.next().?);
-    while (it.next()) |seg| {
-        try self.insertNewlineRaw(gpa);
-        try self.insertSliceRaw(gpa, seg);
-    }
+    // The kill ring holds raw text (a Windows clipboard read keeps its
+    // CRLF), so yank through the same split/normalize path as a paste.
+    try self.insertTextRaw(gpa, text);
 }
 
 /// C-y: insert kill text at point (the head of the kill ring).

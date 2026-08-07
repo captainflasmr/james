@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.49.0 — <2026-08-07>
+
+Pasting keeps the line breaks.
+
+- Pasting multi-line text no longer glues it into a single block: =C-y= on Windows reads the clipboard's raw =\\r\\n=, and both it and the terminal's paste event inserted those break bytes inside one logical line, so the line's =\\r= wrote a carriage return to the terminal and every later line overwrote the start of the one before. A paste now splits across lines at each break, CRLF and bare CR endings normalizing to LF (like Emacs's yank), with no phantom empty line after a trailing break. The same normalization now covers kill-ring yanks of clipboard-sourced text, and opening CRLF files strips the trailing =\\r= per line. A bare =LF= key event — how some Windows terminals deliver a pasted line break — is treated as a newline instead of being silently dropped.
+
 ** 0.48.0 — <2026-08-06>
 
 Find results live in a =*files*= buffer.
