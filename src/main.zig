@@ -1568,6 +1568,30 @@ fn runCapture(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) ?[]u
     return if (trimmed.len > 0) gpa.dupe(u8, trimmed) catch null else null;
 }
 
+/// Read the system clipboard through the platform's clipboard tool
+/// (wl-paste on Wayland, xsel / xclip on X11), returning the exact text
+/// — untrimmed, so a trailing newline in the clipboard survives. Null
+/// when the tool can't spawn or there's no clipboard to read. Used as
+/// the Linux paste path for C-y, since many terminals (alacritty among
+/// them) never answer an OSC 52 clipboard read.
+fn clipboardGet(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
+    var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .pipe, .stderr = .ignore }) catch return null;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    if (child.stdout) |f| {
+        var buf: [256]u8 = undefined;
+        var r = f.reader(io, &buf);
+        var chunk: [256]u8 = undefined;
+        while (true) {
+            const n = r.interface.readSliceShort(&chunk) catch break;
+            if (n == 0) break;
+            out.appendSlice(gpa, chunk[0..n]) catch break;
+        }
+    }
+    _ = child.wait(io) catch null;
+    return if (out.items.len > 0) gpa.dupe(u8, out.items) catch null else null;
+}
+
 // --- C-c g grep (my/grep) ----------------------------------------------
 //
 // Mirrors the author's Emacs my/grep: ripgrep when it's on the PATH
@@ -4824,6 +4848,46 @@ pub fn main(init: std.process.Init) !void {
                                             // too, and heads the kill ring
                                             // like any fresh kill.
                                             kill_ring.remember(gpa, clip, false) catch {};
+                                            yank_state = null;
+                                            break :yank_clip;
+                                        }
+                                    }
+                                } else if (comptime builtin.os.tag == .linux) {
+                                    // The same clipboard-first rule as the
+                                    // Windows branch above: the system
+                                    // clipboard is consulted on every C-y, not
+                                    // just when the kill ring is empty, so an
+                                    // external copy made since the last yank
+                                    // must win over the (now-stale) kill-ring
+                                    // head. Many terminals (alacritty's osc52
+                                    // setting defaults to OnlyCopy) never
+                                    // answer an OSC 52 clipboard read, so the
+                                    // platform's clipboard tool reads it
+                                    // directly — wl-paste on Wayland, xsel /
+                                    // xclip on X11. Content that merely
+                                    // repeats the current kill-ring head falls
+                                    // through to a normal yank; with no
+                                    // clipboard at all the empty kill ring is
+                                    // handled below.
+                                    var clip: ?[]u8 = null;
+                                    if (init.environ_map.get("WAYLAND_DISPLAY") != null) {
+                                        clip = clipboardGet(io, gpa, &.{ "wl-paste", "--no-newline" });
+                                    } else if (init.environ_map.get("DISPLAY") != null) {
+                                        clip = clipboardGet(io, gpa, &.{ "xsel", "--clipboard", "--output" }) orelse
+                                            clipboardGet(io, gpa, &.{ "xclip", "-selection", "clipboard", "-o" });
+                                    }
+                                    if (clip) |c| {
+                                        defer gpa.free(c);
+                                        const repeats_kill_ring = if (kill_ring.current()) |k|
+                                            std.mem.eql(u8, k, c)
+                                        else
+                                            false;
+                                        if (!repeats_kill_ring) {
+                                            buf.insertSlice(gpa, c) catch {};
+                                            // A clipboard paste is yankable
+                                            // too, and heads the kill ring
+                                            // like any fresh kill.
+                                            kill_ring.remember(gpa, c, false) catch {};
                                             yank_state = null;
                                             break :yank_clip;
                                         }

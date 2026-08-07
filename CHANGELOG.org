@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.50.0 — <2026-08-07>
+
+=C-y= pastes the system clipboard on Linux, and an outside copy wins over a stale kill-ring head.
+
+- Pasting (=C-y=) only worked through an OSC 52 round trip with the terminal — but several terminals ignore clipboard *reads* (alacritty defaults to =osc52 = "OnlyCopy"=, silently dropping the query), so nothing happened. On Linux, =C-y= now consults the system clipboard on every press, exactly like the Windows path already did: an external copy made since the last yank wins over the stale kill-ring head, while content that merely repeats the head falls through to a normal yank. The clipboard is read through the platform's tool — =wl-paste= on Wayland, =xsel= / =xclip= on X11 — since the terminal's OSC 52 query can't be relied on (and its async answer only works in terminals that answer reads); the OSC 52 request remains the fallback when no clipboard is readable or the tool is missing (e.g. over ssh). The pasted text is untrimmed, yankable, and heads the kill ring like any fresh kill. Paste with alacritty additionally needs =[terminal] osc52 = "CopyPaste"= in alacritty.toml for the OSC 52 fallback path to work.
+
 ** 0.49.0 — <2026-08-07>
 
 Pasting keeps the line breaks.
