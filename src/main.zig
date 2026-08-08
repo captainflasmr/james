@@ -944,6 +944,31 @@ fn resultsOpenMatch(
     grep_hl: *?GrepHl,
 ) void {
     const idx = openBufferOrDired(gpa, io, buffers, direds, recent, path) catch return;
+    resultsOpenAt(gpa, io, buffers, root, focused, current, undo, redo, idx, line, col, results_target, term, grep_hl);
+}
+
+/// Open an already-resolved buffer (a grep match's file, or the in-memory
+/// source of an occur over a file-less buffer like the home screen) in
+/// the target window: a lone results window splits to the right,
+/// otherwise the window last used for a jump is reused. Focus stays on
+/// the results buffer, so n/p + Enter — or F follow mode — steps through
+/// the results without the layout changing.
+fn resultsOpenAt(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    buffers: *std.ArrayList(*Buffer),
+    root: *Pane,
+    focused: **Pane,
+    current: usize,
+    undo: *std.ArrayList(WindowSnapshot),
+    redo: *std.ArrayList(WindowSnapshot),
+    idx: usize,
+    line: usize,
+    col: usize,
+    results_target: *?*Pane,
+    term: ?[]const u8,
+    grep_hl: *?GrepHl,
+) void {
     const tgt = buffers.items[idx];
     if (line > 0 and tgt.lines.items.len > 0) {
         tgt.cursor_row = @min(line -| 1, tgt.lines.items.len - 1);
@@ -995,10 +1020,14 @@ fn resultsOpenMatch(
 }
 
 /// Jump to the occur match at `row` in the target window (see
-/// resultsOpenMatch): the source file reopens at the match with a
-/// transient highlight of the term, focus staying on the *occur*
-/// buffer, so n/p + Enter — or F follow mode — steps through the
-/// matches without the layout changing.
+/// resultsOpenMatch): the source reopens at the match with a transient
+/// highlight of the term, focus staying on the *occur* buffer, so
+/// n/p + Enter — or F follow mode — steps through the matches without
+/// the layout changing. `source_buf` is the in-memory source buffer —
+/// always set after an occur run; it is used directly when it still
+/// exists in the buffer list, so an occur over a file-less buffer (the
+/// home screen) jumps to the matches all the same. `source` (the path)
+/// is the fallback for a closed file buffer, which reopens from disk.
 fn occurJump(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -1010,7 +1039,8 @@ fn occurJump(
     current: usize,
     undo: *std.ArrayList(WindowSnapshot),
     redo: *std.ArrayList(WindowSnapshot),
-    source: []const u8,
+    source: ?[]const u8,
+    source_buf: ?*Buffer,
     matches: []const OccurMatch,
     row: usize,
     results_target: *?*Pane,
@@ -1019,7 +1049,123 @@ fn occurJump(
 ) void {
     if (row >= matches.len) return;
     const m = matches[row];
-    resultsOpenMatch(gpa, io, buffers, direds, recent, root, focused, current, undo, redo, source, m.row + 1, m.col + 1, results_target, term, grep_hl);
+    if (source_buf) |sb| {
+        for (buffers.items, 0..) |b, idx| {
+            if (b == sb) {
+                resultsOpenAt(gpa, io, buffers, root, focused, current, undo, redo, idx, m.row + 1, m.col + 1, results_target, term, grep_hl);
+                return;
+            }
+        }
+    }
+    if (source) |s| {
+        resultsOpenMatch(gpa, io, buffers, direds, recent, root, focused, current, undo, redo, s, m.row + 1, m.col + 1, results_target, term, grep_hl);
+    }
+}
+
+/// Run an occur of `term` over `buf`: every line matching (case-
+/// insensitive) lands in a fresh "*occur*" buffer that becomes current,
+/// an old results buffer replaced on a re-run. Shared by the occur
+/// prompt's Enter and M-c in isearch, which runs it straight from the
+/// search string — the prompt only exists so a term can be edited
+/// before running. Any editing buffer works, named or not: the source
+/// buffer is remembered in memory (see occur_source_buf), so an occur
+/// over the file-less home screen works too — only the g re-run needs
+/// the path, to reopen a closed file. Returns the new current buffer
+/// index, or null when nothing ran (empty term, no matches, or an
+/// allocation failure — "No matches" is the only status set).
+fn occurRun(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    buffers: *std.ArrayList(*Buffer),
+    direds: *std.ArrayList(?Dired),
+    recent: *std.ArrayList([]u8),
+    root: *Pane,
+    focused: **Pane,
+    current: usize,
+    undo: *std.ArrayList(WindowSnapshot),
+    redo: *std.ArrayList(WindowSnapshot),
+    buf: *Buffer,
+    term: []const u8,
+    occur_source: *?[]u8,
+    occur_source_buf: *?*Buffer,
+    occur_last_term: *?[]u8,
+    occur_matches: *std.ArrayList(OccurMatch),
+    occur_buf_idx: *?usize,
+    results_target: *?*Pane,
+    results_follow: *bool,
+    grep_hl: *?GrepHl,
+    status_msg: *?[]const u8,
+) ?usize {
+    if (term.len == 0) return null;
+    // The source buffer: the remembered in-memory source on a re-run
+    // (edits made since are picked up; a file-less buffer like the home
+    // screen can only be re-run this way), else the re-opened source
+    // file, else the current buffer on a fresh M-c.
+    const src: *Buffer = blk: {
+        if (occur_source_buf.*) |sp| {
+            for (buffers.items) |b| if (b == sp) break :blk sp;
+        }
+        if (occur_source.*) |s| {
+            const idx = openBufferOrDired(gpa, io, buffers, direds, recent, s) catch break :blk buf;
+            break :blk buffers.items[idx];
+        }
+        break :blk buf;
+    };
+    if (occur_last_term.*) |t| gpa.free(t);
+    occur_last_term.* = gpa.dupe(u8, term) catch null;
+    // The path is only remembered for named sources, so a g re-run can
+    // reopen a file that was closed meanwhile.
+    if (occur_source.* == null) {
+        if (src.filename) |f| occur_source.* = gpa.dupe(u8, f) catch null;
+    }
+    if (occur_source_buf.* == null) {
+        occur_source_buf.* = src;
+    }
+    // One row per matching line: "N: text", the matches collected into
+    // a fresh list so a failed re-run leaves the old buffer intact.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    var fresh: std.ArrayList(OccurMatch) = .empty;
+    defer fresh.deinit(gpa);
+    var nbuf: [24]u8 = undefined;
+    for (src.lines.items, 0..) |line, row| {
+        if (std.ascii.findIgnoreCasePos(line.items, 0, term)) |c| {
+            const num = std.fmt.bufPrint(&nbuf, "{d}: ", .{row + 1}) catch continue;
+            text.appendSlice(gpa, num) catch break;
+            text.appendSlice(gpa, line.items) catch break;
+            text.append(gpa, '\n') catch break;
+            fresh.append(gpa, .{ .row = row, .col = c }) catch break;
+        }
+    }
+    if (fresh.items.len == 0) {
+        status_msg.* = "No matches";
+        return null;
+    }
+    // An old results buffer is replaced.
+    if (occur_buf_idx.*) |old| {
+        if (old < buffers.items.len) {
+            recordWindow(gpa, root, focused.*, current, undo, redo);
+            _ = closeBuffer(gpa, buffers, direds, root, focused.*, old, undo, redo);
+        }
+        occur_buf_idx.* = null;
+        results_target.* = null;
+        results_follow.* = false;
+        grep_hl.* = null;
+    }
+    occur_matches.clearRetainingCapacity();
+    occur_matches.appendSlice(gpa, fresh.items) catch return null;
+    const new_buf = gpa.create(Buffer) catch return null;
+    errdefer gpa.destroy(new_buf);
+    new_buf.* = Buffer.fromText(gpa, text.items) catch return null;
+    new_buf.display_name = gpa.dupe(u8, "*occur*") catch return null;
+    // Results always truncate: one match per row, however long the line.
+    new_buf.soft_wrap = false;
+    buffers.append(gpa, new_buf) catch return null;
+    direds.append(gpa, null) catch return null;
+    occur_buf_idx.* = buffers.items.len - 1;
+    recordWindow(gpa, root, focused.*, current, undo, redo);
+    focused.*.buf_idx = occur_buf_idx.*.?;
+    return occur_buf_idx.*;
 }
 
 /// Build the segments for `line` with the fuzzy matched characters (see
@@ -2321,8 +2467,9 @@ const welcome_tail =
 /// release date, and the last change, baked in at build time from
 /// CHANGELOG.org (see build.zig) — is centered under the art: the
 /// version line with the build time, the change description below it,
-/// then the greeting.
-fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer)) !void {
+/// then the greeting, then a line naming the terminal this instance is
+/// running in.
+fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer), environ_map: *std.process.Environ.Map) !void {
     const new_buf = try gpa.create(Buffer);
     errdefer gpa.destroy(new_buf);
 
@@ -2349,6 +2496,17 @@ fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer)) !void {
         try text.appendSlice(gpa, "\n\n");
     }
     try text.appendSlice(gpa, welcome_greeting);
+    // The terminal this instance is running in — TERM_PROGRAM where the
+    // terminal sets it (alacritty, kitty, wezterm, vscode, ...), the
+    // TERM value otherwise, so the console is easy to see and report.
+    try text.appendSlice(gpa, "\n         running in ");
+    try text.appendSlice(gpa, environ_map.get("TERM_PROGRAM") orelse environ_map.get("TERM") orelse "an unknown terminal");
+    if (environ_map.get("TERM_PROGRAM_VERSION")) |v| {
+        try text.appendSlice(gpa, " (");
+        try text.appendSlice(gpa, v);
+        try text.appendSlice(gpa, ")");
+    }
+    try text.appendSlice(gpa, "\n");
     try text.appendSlice(gpa, welcome_tail);
 
     new_buf.* = try Buffer.fromText(gpa, text.items);
@@ -3167,7 +3325,7 @@ pub fn main(init: std.process.Init) !void {
         // easy to navigate to something real. The scratch buffer and a
         // dired of the current directory join it in a three-pane layout:
         // welcome | (scratch / dired).
-        try openWelcome(gpa, &buffers);
+        try openWelcome(gpa, &buffers, init.environ_map);
         try direds.append(gpa, null);
 
         // The scratch buffer is tied to a real scratch.txt file (created
@@ -3407,7 +3565,9 @@ pub fn main(init: std.process.Init) !void {
     // exactly like *grep*: n/p move, Enter jumps to the match in the
     // source file, F follows, g re-runs (the prompt prefilled with the
     // last term), q / C-g closes. `occur_source` is the source file's
-    // path, so a g re-run scans it again.
+    // path, so a g re-run scans it again — and `occur_source_buf` the
+    // source buffer itself, so an occur over a file-less buffer (the
+    // home screen) can be re-run and jumped into all the same.
     var occur_prompt = false;
     var occur_prefill = false;
     var occur_query: std.ArrayList(u8) = .empty;
@@ -3417,6 +3577,7 @@ pub fn main(init: std.process.Init) !void {
     var occur_buf_idx: ?usize = null;
     var occur_source: ?[]u8 = null;
     defer if (occur_source) |s| gpa.free(s);
+    var occur_source_buf: ?*Buffer = null;
     var occur_matches: std.ArrayList(OccurMatch) = .empty;
     defer occur_matches.deinit(gpa);
     // C-c f: find files — the platform's file-finder (ripgrep --files,
@@ -3834,67 +3995,8 @@ pub fn main(init: std.process.Init) !void {
                         const term = std.mem.trim(u8, occur_query.items, " ");
                         occur_prompt = false;
                         occur_prefill = false;
-                        if (term.len > 0) run_blk: {
-                            // The source buffer: the current one on a fresh
-                            // M-c, the re-opened source file on a g re-run
-                            // (a re-run picks up any edits made since).
-                            const src: *Buffer = if (occur_source) |s| blk: {
-                                const idx = openBufferOrDired(gpa, io, &buffers, &direds, &recent, s) catch break :run_blk;
-                                break :blk buffers.items[idx];
-                            } else buf;
-                            const source = src.filename orelse break :run_blk;
-                            if (occur_last_term) |t| gpa.free(t);
-                            occur_last_term = gpa.dupe(u8, term) catch null;
-                            if (occur_source == null) {
-                                occur_source = gpa.dupe(u8, source) catch null;
-                            }
-                            // One row per matching line: "N: text", the
-                            // matches collected into a fresh list so a
-                            // failed re-run leaves the old buffer intact.
-                            var text: std.ArrayList(u8) = .empty;
-                            defer text.deinit(gpa);
-                            var fresh: std.ArrayList(OccurMatch) = .empty;
-                            defer fresh.deinit(gpa);
-                            var nbuf: [24]u8 = undefined;
-                            for (src.lines.items, 0..) |line, row| {
-                                if (std.ascii.findIgnoreCasePos(line.items, 0, term)) |c| {
-                                    const num = std.fmt.bufPrint(&nbuf, "{d}: ", .{row + 1}) catch continue;
-                                    text.appendSlice(gpa, num) catch break;
-                                    text.appendSlice(gpa, line.items) catch break;
-                                    text.append(gpa, '\n') catch break;
-                                    fresh.append(gpa, .{ .row = row, .col = c }) catch break;
-                                }
-                            }
-                            if (fresh.items.len == 0) {
-                                status_msg = "No matches";
-                                break :run_blk;
-                            }
-                            // An old results buffer is replaced.
-                            if (occur_buf_idx) |old| {
-                                if (old < buffers.items.len) {
-                                    recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                                    _ = closeBuffer(gpa, &buffers, &direds, root, focused, old, &window_undo, &window_redo);
-                                }
-                                occur_buf_idx = null;
-                                results_target = null;
-                                results_follow = false;
-                                grep_hl = null;
-                            }
-                            occur_matches.clearRetainingCapacity();
-                            occur_matches.appendSlice(gpa, fresh.items) catch break :run_blk;
-                            const new_buf = try gpa.create(Buffer);
-                            errdefer gpa.destroy(new_buf);
-                            new_buf.* = try Buffer.fromText(gpa, text.items);
-                            new_buf.display_name = try gpa.dupe(u8, "*occur*");
-                            // Results always truncate: one match per row,
-                            // however long the line.
-                            new_buf.soft_wrap = false;
-                            try buffers.append(gpa, new_buf);
-                            try direds.append(gpa, null);
-                            occur_buf_idx = buffers.items.len - 1;
-                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                            current = occur_buf_idx.?;
-                            focused.buf_idx = current;
+                        if (occurRun(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, buf, term, &occur_source, &occur_source_buf, &occur_last_term, &occur_matches, &occur_buf_idx, &results_target, &results_follow, &grep_hl, &status_msg)) |idx| {
+                            current = idx;
                         }
                     } else if (key.text) |t| {
                         if (occur_prefill) {
@@ -4132,19 +4234,18 @@ pub fn main(init: std.process.Init) !void {
                         if (key.matches('c', .{ .alt = true })) {
                             // M-c in isearch: occur from the search string,
                             // like the author's my/occur-from-isearch. The
-                            // search confirms (the match stays selected),
-                            // then the occur prompt opens prefilled with
-                            // the query. Editing buffers only.
+                            // search confirms and the matches land straight
+                            // in a *occur* buffer — no prompt, the query is
+                            // already in hand (the term is carried over for
+                            // the g re-run). Editing buffers only.
                             if (isearch_query.items.len > 0 and direds.items[current] == null) {
                                 syncDiredSelection(direds.items, current, buf);
+                                const term = std.mem.trim(u8, isearch_query.items, " ");
                                 isearch_active = false;
-                                occur_prompt = true;
-                                occur_query.clearRetainingCapacity();
-                                occur_query.appendSlice(gpa, isearch_query.items) catch {};
-                                // The carried query is a prefill: typing
-                                // replaces it (see occur_prefill).
-                                occur_prefill = true;
                                 isearch_query.clearRetainingCapacity();
+                                if (occurRun(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, buf, term, &occur_source, &occur_source_buf, &occur_last_term, &occur_matches, &occur_buf_idx, &results_target, &results_follow, &grep_hl, &status_msg)) |idx| {
+                                    current = idx;
+                                }
                             } else {
                                 isearch_active = false;
                             }
@@ -4673,6 +4774,7 @@ pub fn main(init: std.process.Init) !void {
                                     occur_buf_idx = null;
                                     if (occur_source) |s| gpa.free(s);
                                     occur_source = null;
+                                    occur_source_buf = null;
                                     if (occur_last_term) |t| gpa.free(t);
                                     occur_last_term = null;
                                     occur_matches.clearRetainingCapacity();
@@ -4698,9 +4800,7 @@ pub fn main(init: std.process.Init) !void {
                                     if (is_files) {
                                         resultsOpenMatch(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, find_paths.items[find_visible.items[buf.cursor_row]], 0, 0, &results_target, null, &grep_hl);
                                     } else if (is_occur) {
-                                        if (occur_source) |s| {
-                                            occurJump(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, s, occur_matches.items, buf.cursor_row, &results_target, occur_last_term, &grep_hl);
-                                        }
+                                        occurJump(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, occur_source, occur_source_buf, occur_matches.items, buf.cursor_row, &results_target, occur_last_term, &grep_hl);
                                     } else {
                                         const m = grep_matches.items[buf.cursor_row];
                                         resultsOpenMatch(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, m.path, m.line, m.col, &results_target, grep_last_term, &grep_hl);
@@ -4715,9 +4815,7 @@ pub fn main(init: std.process.Init) !void {
                                     if (is_files) {
                                         resultsOpenMatch(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, find_paths.items[find_visible.items[buf.cursor_row]], 0, 0, &results_target, null, &grep_hl);
                                     } else if (is_occur) {
-                                        if (occur_source) |s| {
-                                            occurJump(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, s, occur_matches.items, buf.cursor_row, &results_target, occur_last_term, &grep_hl);
-                                        }
+                                        occurJump(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, occur_source, occur_source_buf, occur_matches.items, buf.cursor_row, &results_target, occur_last_term, &grep_hl);
                                     } else {
                                         const m = grep_matches.items[buf.cursor_row];
                                         resultsOpenMatch(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, m.path, m.line, m.col, &results_target, grep_last_term, &grep_hl);
@@ -4766,9 +4864,7 @@ pub fn main(init: std.process.Init) !void {
                                     resultsOpenMatch(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, find_paths.items[find_visible.items[buf.cursor_row]], 0, 0, &results_target, null, &grep_hl);
                                 }
                             } else if (is_occur) {
-                                if (occur_source) |s| {
-                                    occurJump(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, s, occur_matches.items, buf.cursor_row, &results_target, occur_last_term, &grep_hl);
-                                }
+                                occurJump(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, occur_source, occur_source_buf, occur_matches.items, buf.cursor_row, &results_target, occur_last_term, &grep_hl);
                             } else {
                                 const sel = @min(buf.cursor_row, grep_matches.items.len -| 1);
                                 const m = grep_matches.items[sel];
@@ -5049,9 +5145,8 @@ pub fn main(init: std.process.Init) !void {
                         // of the current buffer matching a term lands in a
                         // *occur* buffer, exactly like *grep* but over the
                         // buffer itself. Editing buffers only: a results
-                        // buffer or dired has no text to scan, and the
-                        // home screen has no file to jump back to.
-                        if (editing and buf.filename != null) {
+                        // buffer or dired has no text to scan.
+                        if (editing) {
                             occur_prompt = true;
                             occur_query.clearRetainingCapacity();
                             if (buf.lines.items.len > 0) {
