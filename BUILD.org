@@ -1,0 +1,29 @@
+#+title: Installing Zig 0.16.0 (tarball)
+#+language: en
+#+options: ':t toc:nil num:nil
+
+The james project pins =Zig 0.16.0= exactly in =build.zig.zon= (libvaxis tracks
+this version closely and older/newer Zig will likely fail to compile it), so the
+official tarball is the safest way to install it.
+
+* Install from the official tarball
+
+#+begin_src sh
+cd /tmp
+curl -LO https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+tar xf zig-x86_64-linux-0.16.0.tar.xz
+sudo mv zig-x86_64-linux-0.16.0 /opt/zig
+sudo ln -s /opt/zig/zig /usr/local/bin/zig
+zig version   # should print 0.16.0
+#+end_src
+
+* Alternative: package manager
+
+On Arch-based systems (e.g. Garuda):
+
+#+begin_src sh
+sudo pacman -S zig
+#+end_src
+
+The package manager version may be newer than 0.16.0 — check with =zig version=
+and fall back to the tarball if it isn't =0.16.0=.
