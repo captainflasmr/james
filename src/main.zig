@@ -1906,6 +1906,125 @@ fn runTool(io: std.Io, argv: []const []const u8) bool {
     };
 }
 
+/// The base name and last extension of `name`, the way the author's
+/// Emacs config's file-name-base / file-name-extension see them — a
+/// leading dot is not an extension (".bashrc" is all base) — for the
+/// trash name-collision counter.
+fn trashNameParts(name: []const u8) struct { base: []const u8, ext: []const u8 } {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return .{ .base = name, .ext = "" };
+    if (dot == 0) return .{ .base = name, .ext = "" };
+    return .{ .base = name[0..dot], .ext = name[dot + 1 ..] };
+}
+
+/// "2026-08-09T14:30:00" — the current UTC time, ISO 8601, the
+/// DeletionDate of a trashinfo sidecar (the same epoch math the dired
+/// dates use).
+fn trashDeletionDate(buf: []u8, io: std.Io) []const u8 {
+    const now = std.Io.Timestamp.now(io, .real);
+    const secs: u64 = @intCast(@max(@divTrunc(now.nanoseconds, 1_000_000_000), 0));
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const day = es.getEpochDay();
+    const ds = es.getDaySeconds();
+    const yd = day.calculateYearDay();
+    const md = yd.calculateMonthDay();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
+        yd.year,
+        md.month.numeric(),
+        md.day_index + 1,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    }) catch "";
+}
+
+/// Move one file or directory to the platform trash — the Windows
+/// Recycle Bin via PowerShell's Microsoft.VisualBasic API (the author's
+/// Emacs config), or the freedesktop.org trash elsewhere: the file lands
+/// in XDG_DATA_HOME/Trash/files (or ~/.local/share/Trash/files) with a
+/// .trashinfo sidecar in Trash/info and a name-collision counter
+/// (foo.tar.gz → foo.tar.1.gz), exactly like the config's Linux branch.
+/// Returns true on success.
+fn trashFile(io: std.Io, gpa: std.mem.Allocator, environ_map: *std.process.Environ.Map, path: []const u8) bool {
+    if (comptime builtin.os.tag == .windows) {
+        // The same VisualBasic FileSystem API the config calls:
+        // DeleteFile / DeleteDirectory with SendToRecycleBin.
+        const q = psQuote(gpa, path) catch return false;
+        defer gpa.free(q);
+        const ps = std.fmt.allocPrint(
+            gpa,
+            "Add-Type -AssemblyName Microsoft.VisualBasic; $ErrorActionPreference='Stop'; $p={s}; try {{ if (Test-Path -LiteralPath $p -PathType Container) {{ [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p,'OnlyErrorDialogs','SendToRecycleBin') }} else {{ [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p,'OnlyErrorDialogs','SendToRecycleBin') }} }} catch {{ Write-Error $_; exit 1 }}",
+            .{q},
+        ) catch return false;
+        defer gpa.free(ps);
+        return runTool(io, &.{ "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps });
+    }
+
+    // freedesktop.org trash: XDG_DATA_HOME/Trash, or the default
+    // ~/.local/share/Trash.
+    const xdg = environ_map.get("XDG_DATA_HOME");
+    var owned_base: ?[]u8 = null;
+    defer if (owned_base) |b| gpa.free(b);
+    const base: []const u8 = if (xdg) |x|
+        x
+    else blk: {
+        const home = jumpHome(environ_map) orelse return false;
+        owned_base = std.fs.path.join(gpa, &.{ home, ".local", "share" }) catch return false;
+        break :blk owned_base.?;
+    };
+
+    const files_dir = std.fs.path.join(gpa, &.{ base, "Trash", "files" }) catch return false;
+    defer gpa.free(files_dir);
+    const info_dir = std.fs.path.join(gpa, &.{ base, "Trash", "info" }) catch return false;
+    defer gpa.free(info_dir);
+    std.Io.Dir.cwd().createDirPath(io, files_dir) catch return false;
+    std.Io.Dir.cwd().createDirPath(io, info_dir) catch return false;
+    var files = std.Io.Dir.cwd().openDir(io, files_dir, .{}) catch return false;
+    defer files.close(io);
+
+    // A trash name that doesn't already exist, with the config's
+    // counter. A broken symlink counts as free (like file-exists-p).
+    const parts = trashNameParts(std.fs.path.basename(path));
+    var trash_name: []u8 = if (parts.ext.len > 0)
+        (std.fmt.allocPrint(gpa, "{s}.{s}", .{ parts.base, parts.ext }) catch return false)
+    else
+        (gpa.dupe(u8, parts.base) catch return false);
+    defer gpa.free(trash_name);
+    var counter: usize = 1;
+    while (files.statFile(io, trash_name, .{ .follow_symlinks = true }) catch null) |_| {
+        const next = if (parts.ext.len > 0)
+            (std.fmt.allocPrint(gpa, "{s}.{d}.{s}", .{ parts.base, counter, parts.ext }) catch return false)
+        else
+            (std.fmt.allocPrint(gpa, "{s}.{d}", .{ parts.base, counter }) catch return false);
+        gpa.free(trash_name);
+        trash_name = next;
+        counter += 1;
+        if (counter > 10000) return false;
+    }
+
+    // The .trashinfo sidecar: the original path as-is (like the config),
+    // and the deletion time in UTC, ISO 8601.
+    const abs = Dired.absPathOf(gpa, io, path) catch return false;
+    defer gpa.free(abs);
+    var date_buf: [32]u8 = undefined;
+    const date = trashDeletionDate(&date_buf, io);
+    var info: std.ArrayList(u8) = .empty;
+    defer info.deinit(gpa);
+    info.appendSlice(gpa, "[Trash Info]\nPath=") catch return false;
+    info.appendSlice(gpa, abs) catch return false;
+    info.appendSlice(gpa, "\nDeletionDate=") catch return false;
+    info.appendSlice(gpa, date) catch return false;
+    info.append(gpa, '\n') catch return false;
+    const info_name = std.fmt.allocPrint(gpa, "{s}.trashinfo", .{trash_name}) catch return false;
+    defer gpa.free(info_name);
+    const info_full = std.fs.path.join(gpa, &.{ info_dir, info_name }) catch return false;
+    defer gpa.free(info_full);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = info_full, .data = info.items }) catch return false;
+
+    const trash_full = std.fs.path.join(gpa, &.{ files_dir, trash_name }) catch return false;
+    defer gpa.free(trash_full);
+    return runTool(io, &.{ "mv", path, trash_full });
+}
+
 /// Whether `argv` runs at all on this machine: spawned with both outputs
 /// captured, "yes" on any output (some tools --version to stderr). The
 /// probe for the compress menu — a format is only offered when its tool
@@ -2707,9 +2826,9 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
             .create_dir => fillPromptModeline(modeline_buf, "Create directory (C-g cancels): ", .{}, p.query),
             .create_file => fillPromptModeline(modeline_buf, "Create file (C-g cancels): ", .{}, p.query),
             .delete => if (diredMarkedCount(dired) > 1)
-                fillPromptModeline(modeline_buf, "Delete {d} entries? (y / n / C-g cancels)", .{diredMarkedCount(dired)}, "")
+                fillPromptModeline(modeline_buf, "Move {d} entries to the trash? (y / n / C-g cancels)", .{diredMarkedCount(dired)}, "")
             else
-                fillPromptModeline(modeline_buf, "{s}{s}? (y / n / C-g cancels)", .{ if (is_dir) "Recursively delete " else "Delete ", name }, ""),
+                fillPromptModeline(modeline_buf, "Move {s}{s} to the trash? (y / n / C-g cancels)", .{ if (is_dir) "directory " else "", name }, ""),
             .open => fillPromptModeline(modeline_buf, "Open {s} with {s}? (y / n / C-g cancels)", .{ name, p.detail }, ""),
         };
     } else if (status) |m| blk: {
@@ -4996,24 +5115,29 @@ pub fn main(init: std.process.Init) !void {
                     if (key.matches('y', .{}) or key.matches('Y', .{})) {
                         confirming_delete = false;
                         if (direds.items[current]) |*d| {
-                            // Delete every marked entry, or just the
-                            // selected one when nothing is marked.
+                            // Trash every marked entry, or just the
+                            // selected one when nothing is marked — the
+                            // Windows Recycle Bin via PowerShell, the
+                            // freedesktop.org trash elsewhere (like
+                            // delete-by-moving-to-trash in the author's
+                            // Emacs config), never a hard delete.
                             var idxs: std.ArrayList(usize) = .empty;
                             defer idxs.deinit(gpa);
                             diredOpIndices(gpa, d, &idxs);
                             var any = false;
+                            var failed = false;
                             for (idxs.items) |i| {
                                 const en = d.entries.items[i];
                                 const path = try std.fs.path.join(gpa, &.{ d.path.items, en.name });
                                 defer gpa.free(path);
-                                if (en.is_dir) {
-                                    std.Io.Dir.cwd().deleteTree(io, path) catch {};
+                                if (trashFile(io, gpa, init.environ_map, path)) {
+                                    any = true;
                                 } else {
-                                    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+                                    failed = true;
                                 }
-                                any = true;
                             }
                             if (any) refreshDired(gpa, io, &buffers, &direds, current);
+                            if (failed) status_msg = "Trash failed";
                         }
                     } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                         confirming_delete = false;
@@ -5991,9 +6115,12 @@ pub fn main(init: std.process.Init) !void {
                             dired_copy_prompt = true;
                             dired_copy_query.clearRetainingCapacity();
                         } else if (key.matches('D', .{})) {
-                            // D: delete the marked entries, or just the
-                            // selected one when nothing is marked (Emacs
-                            // dired-do-delete).
+                            // D: move the marked entries to the platform
+                            // trash — the Windows Recycle Bin via
+                            // PowerShell, the freedesktop.org trash
+                            // elsewhere — or just the selected one when
+                            // nothing is marked (Emacs dired-do-delete
+                            // with delete-by-moving-to-trash).
                             if (diredMarkedCount(d) > 0 or !std.mem.eql(u8, d.entries.items[d.selected].name, "..")) {
                                 confirming_delete = true;
                             }

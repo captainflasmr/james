@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.57.0 — <2026-08-09>
+
+=D= in dired moves files to the platform trash instead of deleting them.
+
+- Deleting in dired never hard-deletes: the confirm prompt now reads =Move X to the trash?= and the entries land in the platform trash, exactly like the author's Emacs =delete-by-moving-to-trash= / =my/dired-async-do-delete=. On Windows the file goes to the Recycle Bin through PowerShell's =Microsoft.VisualBasic= =FileSystem= API (=DeleteFile= / =DeleteDirectory= with =SendToRecycleBin=, the same calls the config's Windows branch makes). Everywhere else the freedesktop.org trash spec is followed: the entry moves into =XDG_DATA_HOME=/Trash/files (or the default =~/.local/share/Trash/files=) and a =.trashinfo= sidecar lands in =Trash/info= carrying the original path and the deletion time in UTC ISO 8601 — the config's format, with its name-collision counter too (=foo.tar.gz= → =foo.tar.1.gz=). A failed trash (e.g. the trash on another filesystem) leaves the file alone and reports =Trash failed=; the dired refreshes and the files are recoverable from the trash or Recycle Bin.
+
 ** 0.56.0 — <2026-08-09>
 
 Dired =z= compresses and decompresses the marked entries, using only the tools the platform actually has.
