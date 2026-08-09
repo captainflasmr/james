@@ -52,8 +52,9 @@ TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =to
 
 * Quick wins
 
-** TODO M-h mark block
+** DONE M-h mark block
 - Emacs: =my/mark-block= — mark the text between surrounding blank lines. Trivial in james (scan rows, set mark).
+- Done in 0.60.0: =M-h= (Emacs =mark-paragraph=) marks the block around the cursor — the run of non-blank lines bounded by blank lines, mark at the paragraph's start, cursor at its end, so the region is the whole paragraph for =M-w= / =C-w=; on a blank line the following paragraph is marked (falling back to the previous one).
 ** DONE Isearch lazy count
 - Emacs: =isearch-lazy-count= with the =(%s/%s)= format; show match position / total in the modeline while searching.
 - Done in 0.54.0: while searching, the modeline's =I-search:= prompt trails the query with = (N/M)= — the current match's 1-based position and the query's total, like Emacs's isearch-lazy-count. In buffers and direds the count covers the buffer's lines (the dired mirror included); in the pickers, the visible rows. A failing search shows =(0/0)=, and an empty query shows no count. The count is recomputed once per search keystroke, not per frame.
@@ -76,4 +77,4 @@ TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =to
 
 * Already in james
 
-=recentf= (=M-l l=), grep (=C-c g=), find files (=C-c f=), tabs (=M-l ==, =M-l -=, =M-1..9=, =M-i=, =M-u=), winner-mode window history (=C-c j= / =C-c k=) with sticky repeat (=j= / =k=, and =M-n= / =M-p= → =n= / =p=), dired sorting (3/4/5/6, =s=) and dwim-target copy/rename, dired compress (=z=), dired trash delete (=D=) and duplicate (=C-c d=), window resize (=C-M-h/j/k/l=), quarter-page and page scrolling (=M-j/k=, =M-J/K=), jump keys (=M-l= prefix), comment/uncomment (=C-;=), copy line / buffer / region (=M-w=, =C-c b=, =C-c w=), query-replace (=M-%=), shell drop (=C-x j= / =C-x c=).
+=recentf= (=M-l l=), grep (=C-c g=), find files (=C-c f=), tabs (=M-l ==, =M-l -=, =M-1..9=, =M-i=, =M-u=), winner-mode window history (=C-c j= / =C-c k=) with sticky repeat (=j= / =k=, and =M-n= / =M-p= / =C-x o= → =n= / =p= / =o=), dired sorting (3/4/5/6, =s=) and dwim-target copy/rename, dired compress (=z=), dired trash delete (=D=) and duplicate (=C-c d=), window resize (=C-M-h/j/k/l=), quarter-page and page scrolling (=M-j/k=, =M-J/K=), jump keys (=M-l= prefix), comment/uncomment (=C-;=), copy line / buffer / region (=M-w=, =C-c b=, =C-c w=), mark block (=M-h=), query-replace (=M-%=), shell drop (=C-x j= / =C-x c=).

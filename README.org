@@ -44,6 +44,7 @@ Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes 
 | Backspace | delete backward (or the region, when the mark is set) |
 | Enter / =C-j= | new line |
 | =C-space= | set mark |
+| =M-h= | mark the whole paragraph (block): the region becomes the text between the surrounding blank lines, ready for =M-w= / =C-w= |
 | =C-k= | kill to end of line (or kill the newline, at end of line) |
 | =C-w= | save buffer (=C-x C-s= alias) |
 | =M-w= | copy region (or the current line with its newline, with no mark) |
@@ -80,8 +81,8 @@ Window keys (mostly aliases of the =C-x= window commands, plus a few extras):
 |---+---|
 | =C-x 2= / =M-m= | split horizontally (stacked) — =M-m= also moves to the new window |
 | =C-x 3= / =M-;= | split vertically (side-by-side) — =M-;= also moves to the new window |
-| =C-x o= / =M-n= | move to the next window |
-| =M-p= | move to the previous window |
+| =C-x o= / =M-n= | move to the next window (=n= / =p= / =o= repeat: after any of the three move keys, the plain keys keep stepping windows) |
+| =M-p= | move to the previous window (repeat with =n= / =p= / =o=) |
 | =C-x 0= / =M-q= / =M-'= | delete the current window |
 | =C-x 1= / =M-a= | collapse back to a single window |
 | =C-x += | balance the window sizes (all windows equal, like Emacs) |

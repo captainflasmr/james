@@ -10,11 +10,17 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.60.0 — <2026-08-09>
+
+=M-h= marks the whole paragraph (block).
+
+- =M-h= (Emacs =mark-paragraph=) marks the block around the cursor: the run of non-blank lines bounded by blank lines, with the mark at the paragraph's start and the cursor at its end, so the region is the whole paragraph — ready for =M-w= / =C-w=. On a blank line the following paragraph is marked (falling back to the previous one), and the region highlights like any mark, so what will be copied or killed is visible at a glance.
+
 ** 0.59.0 — <2026-08-09>
 
 Window keys stick: =M-n= then =n= keeps moving between windows, =C-c j= then =j= keeps stepping window history.
 
-- The repeat-map pattern from the author's Emacs (=windmove-repeat-map=, =my/repeat-history=): after =M-n= / =M-p= the plain =n= / =p= keep moving to the next / previous window, and after =C-c j= / =C-c k= the plain =j= / =k= keep stepping back / forward through the window layouts. The map stays armed while a repeat key is pressed — =M-n= =n= =n= =p= =p= walks the windows freely — and any other key clears it and acts normally, so a repeat key can never hijack a prompt or a search (opening one always passes through a non-repeat key first).
+- The repeat-map pattern from the author's Emacs (=windmove-repeat-map=, =my/repeat-history=): after =M-n= / =M-p= / =C-x o= the plain =n= / =p= / =o= keep moving to the next / previous window (=o= repeats the forward step like M-n, matching Emacs's =other-window-repeat-map=), and after =C-c j= / =C-c k= the plain =j= / =k= keep stepping back / forward through the window layouts. The map stays armed while a repeat key is pressed — =M-n= =n= =n= =p= =p= walks the windows freely — and any other key clears it and acts normally, so a repeat key can never hijack a prompt or a search (opening one always passes through a non-repeat key first).
 
 ** 0.58.0 — <2026-08-09>
 
