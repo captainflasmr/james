@@ -2301,11 +2301,11 @@ fn renderTree(
 /// startup (see openWelcome), centered under the art so it's visible
 /// however short the terminal is.
 const welcome_head =
-    \\          _   _    __  __ _____ ____
-    \\         | | / \  |  \/  | ____/ ___|
-    \\      _  | |/ _ \ | |\/| |  _| \___ \
-    \\     | |_| / ___ \| |  | | |___ ___) |
-    \\      \___/_/   \_\_|  |_|_____|____/
+    \\      _   _    __  __ _____ ____
+    \\     | | / \  |  \/  | ____/ ___|
+    \\  _  | |/ _ \ | |\/| |  _| \___ \
+    \\ | |_| / ___ \| |  | | |___ ___) |
+    \\  \___/_/   \_\_|  |_|_____|____/
     \\
     \\
 ;
@@ -2463,12 +2463,12 @@ const welcome_tail =
 ;
 
 /// Add a fresh buffer containing the home screen to `buffers`. Used only
-/// at startup when no files were given. The version block — version,
+/// at startup when no files were given. The terminal this instance is
+/// running in sits right under the art, then the version block — version,
 /// release date, and the last change, baked in at build time from
-/// CHANGELOG.org (see build.zig) — is centered under the art: the
-/// version line with the build time, the change description below it,
-/// then the greeting, then a line naming the terminal this instance is
-/// running in.
+/// CHANGELOG.org (see build.zig) — centered under the art: the version
+/// line with the build time, the change description below it, then the
+/// greeting.
 fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer), environ_map: *std.process.Environ.Map) !void {
     const new_buf = try gpa.create(Buffer);
     errdefer gpa.destroy(new_buf);
@@ -2476,11 +2476,22 @@ fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer), environ
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
     try text.appendSlice(gpa, welcome_head);
+    // The terminal this instance is running in — TERM_PROGRAM where the
+    // terminal sets it (alacritty, kitty, wezterm, vscode, ...), the
+    // TERM value otherwise, so the console is easy to see and report.
+    try text.appendSlice(gpa, "   running in ");
+    try text.appendSlice(gpa, environ_map.get("TERM_PROGRAM") orelse environ_map.get("TERM") orelse "an unknown terminal");
+    if (environ_map.get("TERM_PROGRAM_VERSION")) |v| {
+        try text.appendSlice(gpa, " (");
+        try text.appendSlice(gpa, v);
+        try text.appendSlice(gpa, ")");
+    }
+    try text.appendSlice(gpa, "\n\n");
     if (build_options.version.len > 0) {
-        // The version line sits centered under the art (nine spaces of
-        // indent); the description is indented one more, so the two-line
-        // block hangs slightly to the right like a caption.
-        try text.appendSlice(gpa, "         ");
+        // The version line sits centered under the art (three spaces of
+        // indent, the art's J hook at two); the description shares the
+        // same margin, so the caption block lines up under the logo.
+        try text.appendSlice(gpa, "   ");
         try text.appendSlice(gpa, build_options.version);
         try text.appendSlice(gpa, " (");
         try text.appendSlice(gpa, build_options.date);
@@ -2490,23 +2501,12 @@ fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer), environ
         }
         try text.appendSlice(gpa, ")");
         if (build_options.theme.len > 0) {
-            try text.appendSlice(gpa, "\n          ");
+            try text.appendSlice(gpa, "\n   ");
             try text.appendSlice(gpa, build_options.theme);
         }
         try text.appendSlice(gpa, "\n\n");
     }
     try text.appendSlice(gpa, welcome_greeting);
-    // The terminal this instance is running in — TERM_PROGRAM where the
-    // terminal sets it (alacritty, kitty, wezterm, vscode, ...), the
-    // TERM value otherwise, so the console is easy to see and report.
-    try text.appendSlice(gpa, "\n         running in ");
-    try text.appendSlice(gpa, environ_map.get("TERM_PROGRAM") orelse environ_map.get("TERM") orelse "an unknown terminal");
-    if (environ_map.get("TERM_PROGRAM_VERSION")) |v| {
-        try text.appendSlice(gpa, " (");
-        try text.appendSlice(gpa, v);
-        try text.appendSlice(gpa, ")");
-    }
-    try text.appendSlice(gpa, "\n");
     try text.appendSlice(gpa, welcome_tail);
 
     new_buf.* = try Buffer.fromText(gpa, text.items);
