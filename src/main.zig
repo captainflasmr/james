@@ -1896,14 +1896,20 @@ fn clipboardGet(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) ?[
     return if (out.items.len > 0) gpa.dupe(u8, out.items) catch null else null;
 }
 
+/// Run `argv` to completion; the exit code, or null when it can't run.
+/// robocopy reports success as 0-7, so the raw code is needed there.
+fn runToolCode(io: std.Io, argv: []const []const u8) ?u8 {
+    var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return null;
+    const term = child.wait(io) catch return null;
+    return switch (term) {
+        .exited => |code| code,
+        else => null,
+    };
+}
+
 /// Run `argv` to completion, both outputs ignored; true when it exits 0.
 fn runTool(io: std.Io, argv: []const []const u8) bool {
-    var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
-    const term = child.wait(io) catch return false;
-    return switch (term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
+    return (runToolCode(io, argv) orelse return false) == 0;
 }
 
 /// The base name and last extension of `name`, the way the author's
@@ -2023,6 +2029,38 @@ fn trashFile(io: std.Io, gpa: std.mem.Allocator, environ_map: *std.process.Envir
     const trash_full = std.fs.path.join(gpa, &.{ files_dir, trash_name }) catch return false;
     defer gpa.free(trash_full);
     return runTool(io, &.{ "mv", path, trash_full });
+}
+
+/// The base name and extension (with its dot) of `name`, for the
+/// duplicate counter — the config's file-name-sans-extension /
+/// file-name-extension-with-dot pair: "foo.tar.gz" → ("foo.tar",
+/// ".gz"), ".bashrc" → (".bashrc", "").
+fn duplicateNameParts(name: []const u8) struct { base: []const u8, ext: []const u8 } {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return .{ .base = name, .ext = "" };
+    if (dot == 0) return .{ .base = name, .ext = "" };
+    return .{ .base = name[0..dot], .ext = name[dot..] };
+}
+
+/// Duplicate `path` to `new_path` — a file or a directory — like the
+/// author's my/dired-duplicate-file: cp -a (the built-in twin of its
+/// rsync -a) on POSIX, robocopy for directories and PowerShell's
+/// Copy-Item for files on Windows. Returns true on success (robocopy
+/// reports success as exit codes 0-7).
+fn diredDuplicateRun(io: std.Io, gpa: std.mem.Allocator, path: []const u8, new_path: []const u8, is_dir: bool) bool {
+    if (comptime builtin.os.tag == .windows) {
+        if (is_dir) {
+            const code = runToolCode(io, &.{ "robocopy", path, new_path, "/E", "/COPY:DAT", "/R:0", "/W:0", "/NP", "/NJH", "/NJS", "/NDL", "/NFL", "/BYTES", "/MT:8" }) orelse return false;
+            return code <= 7;
+        }
+        const qs = psQuote(gpa, path) catch return false;
+        defer gpa.free(qs);
+        const qd = psQuote(gpa, new_path) catch return false;
+        defer gpa.free(qd);
+        const ps = std.fmt.allocPrint(gpa, "Copy-Item -LiteralPath {s} -Destination {s}", .{ qs, qd }) catch return false;
+        defer gpa.free(ps);
+        return runTool(io, &.{ "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps });
+    }
+    return runTool(io, &.{ "cp", "-a", path, new_path });
 }
 
 /// Whether `argv` runs at all on this machine: spawned with both outputs
@@ -3009,6 +3047,7 @@ const welcome_tail =
     \\  C-c — kill ring and window history:
     \\
     \\    C-c b               copy the whole buffer
+    \\    C-c d               duplicate the selected entry in dired
     \\    C-c w               copy the region
     \\    C-c C-k             close the dired buffer
     \\    C-c o               open the bookmark list
@@ -4548,6 +4587,43 @@ pub fn main(init: std.process.Init) !void {
                         try buf.copyWholeBuffer(gpa, &kill_ring);
                         syncClipboard(&vx, &tty, gpa, kill_ring.current() orelse "");
                         kill_active = true;
+                    } else if (key.matches('d', .{})) {
+                        // C-c d: duplicate the selected entry with an
+                        // incremented counter (the author's
+                        // my/dired-duplicate-file): foo.txt → foo_001.txt,
+                        // the first free number (a prefix argument sets
+                        // the starting counter in Emacs; james always
+                        // starts at 1). Directories copy recursively. ".."
+                        // is skipped like C and D.
+                        if (direds.items[current]) |*d| {
+                            const en = d.entries.items[d.selected];
+                            if (!std.mem.eql(u8, en.name, "..")) blk: {
+                                const path = std.fs.path.join(gpa, &.{ d.path.items, en.name }) catch break :blk;
+                                defer gpa.free(path);
+                                const parts = duplicateNameParts(en.name);
+                                var counter: usize = 1;
+                                while (counter <= 9999) : (counter += 1) {
+                                    const new_name = if (parts.ext.len > 0)
+                                        (std.fmt.allocPrint(gpa, "{s}_{d:0>3}{s}", .{ parts.base, counter, parts.ext }) catch break :blk)
+                                    else
+                                        (std.fmt.allocPrint(gpa, "{s}_{d:0>3}", .{ parts.base, counter }) catch break :blk);
+                                    defer gpa.free(new_name);
+                                    const new_path = std.fs.path.join(gpa, &.{ d.path.items, new_name }) catch break :blk;
+                                    defer gpa.free(new_path);
+                                    const taken = std.Io.Dir.cwd().statFile(io, new_path, .{ .follow_symlinks = true }) catch null;
+                                    if (taken == null) {
+                                        if (diredDuplicateRun(io, gpa, path, new_path, en.is_dir)) {
+                                            refreshDired(gpa, io, &buffers, &direds, current);
+                                            const n = std.fmt.bufPrint(&status_buf, "Duplicated: {s}", .{new_name}) catch unreachable;
+                                            status_msg = status_buf[0..n.len];
+                                        } else {
+                                            status_msg = "Duplicate failed";
+                                        }
+                                        break :blk;
+                                    }
+                                }
+                            }
+                        }
                     } else if (key.matches('w', .{})) {
                         try buf.copyRegion(gpa, &kill_ring, false);
                         syncClipboard(&vx, &tty, gpa, kill_ring.current() orelse "");

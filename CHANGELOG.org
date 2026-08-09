@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.58.0 — <2026-08-09>
+
+=C-c d= in dired duplicates the selected entry, with the author's Emacs =my/dired-duplicate-file= naming.
+
+- =C-c d= in dired (the config's keybinding) duplicates the entry under point with the same name scheme: =foo.txt= becomes =foo_001.txt=, =foo.tar.gz= =foo.tar_001.gz= — the base name plus an incremented, zero-padded counter and the extension, the first number not already taken (Emacs lets a prefix argument set the starting counter; james always starts at 1). Directories copy recursively. The copy uses built-in tools: =cp -a= on POSIX (the twin of the config's =rsync -a=), =robocopy= for directories and PowerShell's =Copy-Item= for files on Windows — including the config's quirk that robocopy's exit codes 0-7 all count as success. The dired refreshes and the modeline reports =Duplicated: foo_001.txt= (or =Duplicate failed=).
+
 ** 0.57.0 — <2026-08-09>
 
 =D= in dired moves files to the platform trash instead of deleting them.
