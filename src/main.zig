@@ -3111,6 +3111,7 @@ const welcome_tail =
     \\    M-%                 query-replace (from a search too; y/n/q/!/./^)
     \\    C-l                 recenter the window
     \\    C-space             set the mark (C-@ too)
+    \\    M-h                 mark the whole paragraph (block)
     \\    C-g                 cancel the mark / a prompt
     \\
     \\  Kill ring, undo and redo:
@@ -6730,6 +6731,12 @@ pub fn main(init: std.process.Init) !void {
                         // the state. The buffer remembers its own
                         // setting.
                         buf.soft_wrap = !buf.soft_wrap;
+                    } else if (key.matches('h', .{ .alt = true })) {
+                        // M-h: mark the whole paragraph (Emacs
+                        // mark-paragraph): the region becomes the block
+                        // around the cursor — mark at its start, cursor
+                        // at its end — ready for M-w / C-w.
+                        buf.markParagraph();
                     } else if (key.matches(0x08, .{ .alt = true }) or key.matches('h', .{ .alt = true, .ctrl = true })) {
                         // C-M-h: resize width, matching the author's
                         // Emacs my/adaptive-resize — a window on the left

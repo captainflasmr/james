@@ -324,6 +324,38 @@ pub fn setMark(self: *Buffer) void {
     self.mark = .{ .row = self.cursor_row, .col = self.cursor_col };
 }
 
+/// M-h: mark the whole paragraph around the cursor (Emacs mark-paragraph)
+/// — the run of non-blank lines bounded by blank lines. The mark lands at
+/// the paragraph's start and the cursor at its end, so the region is the
+/// paragraph (the same shape as C-x h for the whole buffer). On a blank
+/// line the following paragraph is marked, falling back to the previous.
+pub fn markParagraph(self: *Buffer) void {
+    const n = self.lines.items.len;
+    if (n == 0) return;
+    const is_blank = struct {
+        fn f(line: []const u8) bool {
+            for (line) |c| if (!std.ascii.isWhitespace(c)) return false;
+            return true;
+        }
+    }.f;
+    var row = self.cursor_row;
+    if (is_blank(self.lines.items[row].items)) {
+        row += 1;
+        while (row < n and is_blank(self.lines.items[row].items)) row += 1;
+        if (row >= n) {
+            row = self.cursor_row;
+            while (row > 0 and is_blank(self.lines.items[row].items)) row -= 1;
+        }
+    }
+    var start = row;
+    while (start > 0 and !is_blank(self.lines.items[start - 1].items)) start -= 1;
+    var end = row;
+    while (end + 1 < n and !is_blank(self.lines.items[end + 1].items)) end += 1;
+    self.mark = .{ .row = start, .col = 0 };
+    self.cursor_row = end;
+    self.cursor_col = self.lines.items[end].items.len;
+}
+
 /// Start a new undo group, so the next edit records a fresh undo step
 /// instead of joining the previous run (recordUndo coalesces same-kind
 /// edits). Query-replace calls this once per session, so the whole
