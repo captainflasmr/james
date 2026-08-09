@@ -490,6 +490,13 @@ const ReplaceView = struct {
     match: ?Buffer.Pos,
 };
 
+/// Sticky keys / repeat-mode (Emacs windmove-repeat-map, the author's
+/// my/repeat-history): after C-c j / C-c k the plain j / k keep stepping
+/// window history, and after M-n / M-p the plain n / p keep moving
+/// between windows. The map stays armed while a repeat key is pressed;
+/// any other key clears it and acts normally.
+const RepeatMap = enum { window_history, window_move };
+
 const DiredPromptKind = enum { copy, rename, delete, create_dir, create_file, open };
 
 /// The dired compress formats (Z, Emacs dired-compress-file / the
@@ -3053,7 +3060,7 @@ const welcome_tail =
     \\    C-c o               open the bookmark list
     \\    C-c f               find files (fuzzy list)
     \\    C-c g               grep the current directory (Enter opens, F follows)
-    \\    C-c j / C-c k       step back / forward through window layouts
+    \\    C-c j / C-c k       step back / forward through window layouts (j / k repeat)
     \\
     \\  M-l — jumps and tabs (the my-jump prefix):
     \\
@@ -3073,7 +3080,7 @@ const welcome_tail =
     \\
     \\    M-1 .. M-9          select a tab by number
     \\    M-i / M-u           next / previous tab
-    \\    M-n / M-p           next / previous window
+    \\    M-n / M-p           next / previous window (n / p repeat)
     \\    M-; / M-m           split below / to the right
     \\    M-q / M-'           delete the window
     \\    M-a                 one window
@@ -4484,6 +4491,9 @@ pub fn main(init: std.process.Init) !void {
     var replace_active = false;
     var replace_match: ?Buffer.Pos = null;
     var replace_count: usize = 0;
+    // Sticky keys (see RepeatMap): the armed repeat map, cleared by any
+    // key that isn't a repeat key.
+    var repeat_map: ?RepeatMap = null;
 
     // The first frame renders before the first event: the input thread's
     // initial winsize event normally triggers the first draw, and if that
@@ -4521,7 +4531,7 @@ pub fn main(init: std.process.Init) !void {
                 }
                 yank_state = null;
             },
-            .key_press => |key| {
+            .key_press => |key| key_blk: {
                 // Windows delivers a bare modifier held alone (Ctrl/Alt/Shift)
                 // as its own .key_press with no text — the ~/ keypress arrives
                 // as a separate record after it. Linux never emits these, so
@@ -4546,6 +4556,37 @@ pub fn main(init: std.process.Init) !void {
                 if (!key.matches('w', .{})) pending_dired_0 = false;
                 status_msg = null;
                 const buf: *Buffer = buffers.items[current];
+
+                // Sticky keys / repeat-mode: while a repeat map is armed,
+                // its plain keys repeat the window action instead of their
+                // normal binding — j / k keep stepping window history
+                // after C-c j / C-c k, n / p keep moving between windows
+                // after M-n / M-p — and the map stays armed for the next
+                // repeat. Any other key clears the map and acts normally
+                // below (so the repeat keys never hijack a prompt: opening
+                // one always passes through a non-repeat key first).
+                if (repeat_map) |rm| {
+                    if (rm == .window_history and (key.matches('j', .{}) or key.matches('k', .{}))) {
+                        if (key.matches('j', .{})) {
+                            if (windowUndo(gpa, &root, &focused, current, &window_undo, &window_redo)) |_| {
+                                current = focused.buf_idx;
+                            }
+                        } else {
+                            if (windowRedo(gpa, &root, &focused, current, &window_undo, &window_redo)) |_| {
+                                current = focused.buf_idx;
+                            }
+                        }
+                        break :key_blk;
+                    }
+                    if (rm == .window_move and (key.matches('n', .{}) or key.matches('p', .{}))) {
+                        if (moveFocus(root, focused, if (key.matches('n', .{})) 1 else -1)) |nf| {
+                            focused = nf;
+                            current = focused.buf_idx;
+                        }
+                        break :key_blk;
+                    }
+                    repeat_map = null;
+                }
 
                 if (confirming_quit) {
                     if (key.matches('y', .{}) or key.matches('Y', .{})) {
@@ -4686,19 +4727,22 @@ pub fn main(init: std.process.Init) !void {
                         }
                     } else if (key.matches('j', .{})) {
                         // C-c j: step back through window layouts
-                        // (winner-mode undo).
+                        // (winner-mode undo). Sticky: the plain j / k
+                        // repeat (see RepeatMap).
                         if (windowUndo(gpa, &root, &focused, current, &window_undo, &window_redo)) |_| {
                             // Keys act on the pane the cursor is drawn in —
                             // take its buffer rather than the snapshot's
                             // recorded index so the two never disagree.
                             current = focused.buf_idx;
                         }
+                        repeat_map = .window_history;
                     } else if (key.matches('k', .{})) {
                         // C-c k: step forward through window layouts
-                        // (winner-mode redo).
+                        // (winner-mode redo). Sticky like C-c j.
                         if (windowRedo(gpa, &root, &focused, current, &window_undo, &window_redo)) |_| {
                             current = focused.buf_idx;
                         }
+                        repeat_map = .window_history;
                     }
                 } else if (switching_buffer) {
                     if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
@@ -6636,15 +6680,20 @@ pub fn main(init: std.process.Init) !void {
                         current = try openBufferOrDired(gpa, io, &buffers, &direds, &recent, start);
                         focused.buf_idx = current;
                     } else if (key.matches('n', .{ .alt = true })) {
+                        // M-n: move to the next window. Sticky: the plain
+                        // n / p repeat (see RepeatMap).
                         if (moveFocus(root, focused, 1)) |nf| {
                             focused = nf;
                             current = focused.buf_idx;
                         }
+                        repeat_map = .window_move;
                     } else if (key.matches('p', .{ .alt = true })) {
+                        // M-p: move to the previous window. Sticky like M-n.
                         if (moveFocus(root, focused, -1)) |nf| {
                             focused = nf;
                             current = focused.buf_idx;
                         }
+                        repeat_map = .window_move;
                     } else if (key.matches('j', .{ .alt = true })) {
                         buf.moveLines(5);
                     } else if (key.matches('k', .{ .alt = true })) {
