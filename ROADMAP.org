@@ -9,7 +9,10 @@ TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =to
 
 * Near term
 
-** TODO dired get full path / file
+** DONE dired get full path / file
+- Emacs: =dired-copy-filename-as-kill= on =w= (the names of the marked files, or the current line's when nothing is marked), and =0 w= — a prefix argument of 0 — copying the absolute file names.
+- Done in 0.53.0: =w= in dired copies the marked entries' file names to the kill ring (the selected one when nothing is marked, ".." never), so =C-y= pastes them anywhere; =0 w= copies the absolute file names instead — a leading =~= expands to the home directory and relative dired paths resolve against the process cwd, like Emacs's expand-file-name. Several names are newline-joined, a following kill appends like =C-k= after =M-w=, and the copied text is echoed on the modeline until the next keypress.
+- Effort: small.
 
 ** TODO M-/ word completion (dabbrev) and autosuggest
 - Emacs: =my/popup-completion-in-region= + =my/dabbrev-capf=, and =simple-autosuggest-mode=, which is *globally enabled* — the single most-used editor "feel" feature in the author's Emacs, and james has no completion at all.

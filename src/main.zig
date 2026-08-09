@@ -2432,6 +2432,8 @@ const welcome_tail =
     \\    m / u               mark / unmark the entry
     \\    U                   unmark everything
     \\    t                   toggle all marks
+    \\    w                   copy the names to the kill ring
+    \\    0 w                 copy the full paths to the kill ring
     \\    (                   hide / show the details
     \\    s                   toggle name / date sort
     \\    3 / 4 / 5 / 6       sort by size / date / name / extension
@@ -3224,6 +3226,22 @@ fn jumpHomePath(gpa: std.mem.Allocator, env_map: *std.process.Environ.Map, sub: 
     return std.fs.path.join(gpa, parts) catch null;
 }
 
+/// A leading `~` expanded to the user's home directory — the tilde
+/// expansion Emacs's expand-file-name performs. A bare `~` becomes the
+/// home directory itself, `~/...` the home directory joined with the
+/// rest. Paths with no leading tilde, and `~user` names (another user's
+/// home), are returned as-is. Caller must free.
+fn expandTilde(gpa: std.mem.Allocator, env_map: *std.process.Environ.Map, path: []const u8) ![]u8 {
+    if (path.len == 0 or path[0] != '~') return gpa.dupe(u8, path);
+    const home = jumpHome(env_map) orelse return gpa.dupe(u8, path);
+    if (path.len == 1) return gpa.dupe(u8, home);
+    if (path[1] == '/') {
+        if (path.len == 2) return gpa.dupe(u8, home);
+        return std.fs.path.join(gpa, &.{ home, path[2..] });
+    }
+    return gpa.dupe(u8, path);
+}
+
 /// M-l jump: open `path` (file or directory) in the focused window,
 /// recording the layout first so winner-mode can undo the jump. A path
 /// that can't be opened (e.g. ~/bin on a fresh machine) leaves the
@@ -3388,6 +3406,10 @@ pub fn main(init: std.process.Init) !void {
     // A transient status message for the modeline (e.g. a failed save);
     // shown until the next keypress.
     var status_msg: ?[]const u8 = null;
+    // Scratch space for a status message that carries text (dired w's
+    // "Copied: ..." echo): lives until the next keypress, so a fixed
+    // buffer — like the modeline's own — beats a per-copy allocation.
+    var status_buf: [2048]u8 = undefined;
 
     // The editor's foreground process group, remembered before the shell
     // swap ever happens so C-x j can hand the terminal back to it.
@@ -3446,6 +3468,10 @@ pub fn main(init: std.process.Init) !void {
     // M-l: the my-jump prefix keymap from the author's Emacs init.el — a
     // jump to a well-known directory is two keys, like every Emacs prefix.
     var pending_alt_l = false;
+    // The 0 prefix in dired (Emacs dired-copy-filename-as-kill with a
+    // prefix of 0): 0 w copies the absolute file name instead of the bare
+    // name. Armed by 0, cleared by any key other than w.
+    var pending_dired_0 = false;
     // Heap allocations made while rendering one frame (tab expansions),
     // freed after each vx.render.
     var frame_allocs: FrameAllocs = .{ .gpa = gpa };
@@ -3719,6 +3745,9 @@ pub fn main(init: std.process.Init) !void {
                 // C-/ disarms it again.
                 if (!key.matches('/', .{ .ctrl = true }) and !key.matches(0x1F, .{})) pending_ctrl_g = false;
                 if (key.matches('g', .{ .ctrl = true })) pending_ctrl_g = true;
+                // The dired 0 prefix (0 w copies the full path) lives until
+                // the w it arms; any other key clears it.
+                if (!key.matches('w', .{})) pending_dired_0 = false;
                 status_msg = null;
                 const buf: *Buffer = buffers.items[current];
 
@@ -4924,6 +4953,58 @@ pub fn main(init: std.process.Init) !void {
                             // full set is inverted. ".." is never marked.
                             for (d.entries.items) |*en| {
                                 if (!std.mem.eql(u8, en.name, "..")) en.marked = !en.marked;
+                            }
+                        } else if (key.matches('0', .{})) {
+                            // 0: the numeric prefix for w — 0 w copies the
+                            // absolute file name (Emacs
+                            // dired-copy-filename-as-kill with a prefix
+                            // argument of 0).
+                            pending_dired_0 = true;
+                        } else if (key.matches('w', .{})) {
+                            // w: copy the file names of the marked entries —
+                            // or just the selected one when nothing is
+                            // marked — to the kill ring (Emacs
+                            // dired-copy-filename-as-kill), so C-y pastes
+                            // them anywhere. 0 w copies the absolute file
+                            // name instead of the bare one — a leading ~
+                            // expands to the home directory and a relative
+                            // dired path resolves against the process cwd,
+                            // like Emacs's expand-file-name. Several names
+                            // are newline-joined, and a following kill
+                            // appends like C-k after M-w.
+                            const full_path = pending_dired_0;
+                            pending_dired_0 = false;
+                            var idxs: std.ArrayList(usize) = .empty;
+                            defer idxs.deinit(gpa);
+                            diredOpIndices(gpa, d, &idxs);
+                            if (idxs.items.len > 0) {
+                                var out: std.ArrayList(u8) = .empty;
+                                defer out.deinit(gpa);
+                                for (idxs.items, 0..) |i, n| {
+                                    const en = d.entries.items[i];
+                                    if (n > 0) out.appendSlice(gpa, "\n") catch break;
+                                    if (full_path) {
+                                        const exp = expandTilde(gpa, init.environ_map, d.path.items) catch break;
+                                        defer gpa.free(exp);
+                                        const joined = std.fs.path.join(gpa, &.{ exp, en.name }) catch break;
+                                        defer gpa.free(joined);
+                                        const abs = Dired.absPathOf(gpa, io, joined) catch break;
+                                        defer gpa.free(abs);
+                                        out.appendSlice(gpa, abs) catch break;
+                                    } else {
+                                        out.appendSlice(gpa, en.name) catch break;
+                                    }
+                                }
+                                kill_ring.remember(gpa, out.items, was_kill) catch {};
+                                syncClipboard(&vx, &tty, gpa, kill_ring.current() orelse "");
+                                kill_active = true;
+                                // Echo what was copied on the modeline until
+                                // the next keypress (the dired twin of Emacs
+                                // echoing the kill text in the minibuffer).
+                                const n = std.fmt.bufPrint(&status_buf, "Copied: {s}", .{out.items}) catch blk: {
+                                    break :blk std.fmt.bufPrint(&status_buf, "Copied {d} names", .{idxs.items.len}) catch unreachable;
+                                };
+                                status_msg = status_buf[0..n.len];
                             }
                         } else if (key.matches('(', .{})) {
                             // ( : toggle dired-hide-details-mode — hide

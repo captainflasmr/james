@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.53.0 — <2026-08-09>
+
+Dired =w= copies file names to the kill ring, and =0 w= the absolute paths.
+
+- =w= in dired (Emacs dired-copy-filename-as-kill) copies the file names of the marked entries — or just the selected one when nothing is marked, ".." never — to the kill ring, so =C-y= pastes them anywhere: a shell prompt, another buffer, wherever. =0 w= copies the absolute file names instead: a leading =~= expands to the home directory and a relative dired path resolves against the process's working directory, like Emacs's expand-file-name, so browsing =.= and pressing =0 w= yields =/home/me/projects/james/README.org= rather than =./README.org=. Several names are newline-joined, a following kill appends to the ring entry like =C-k= after =M-w=, and the copied text echoes on the modeline until the next keypress. Both the names and the paths mirror onto the system clipboard like every other copy.
+
 ** 0.52.0 — <2026-08-07>
 
 Typing at a prefilled =Grep:= / =Occur:= prompt replaces the prefill instead of appending to it.
