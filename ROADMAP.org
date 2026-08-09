@@ -9,6 +9,11 @@ TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =to
 
 * Near term
 
+** DONE query-replace — M-%
+- Emacs: =query-replace= on =M-%= — ask for the string to find, then its replacement, then walk the matches confirming each one — and =isearch-query-replace=, =M-%= inside a search using the search string.
+- Done in 0.55.0: =M-%= prompts =Query replace: = (prefilled with the word at point) then =Query replace foo with: =, and walks the matches asking =y= / =n= per match — = != replaces all the rest, =.= replaces this one and quits, =^= steps back, =q= / =C-g= / Esc quits, and the walk stops at the end of the buffer (it never re-asks about replaced text, so =a= → =aa= terminates). The current candidate highlights like an isearch match, the replacement carries the match's capitalization (FOO→BAR, Foo→Bar) like Emacs's case-replace, the whole session is one undo step, and =M-%= inside a search (=C-s= / =C-r=) starts from the search string. Editing buffers only.
+- Effort: medium.
+
 ** DONE dired get full path / file
 - Emacs: =dired-copy-filename-as-kill= on =w= (the names of the marked files, or the current line's when nothing is marked), and =0 w= — a prefix argument of 0 — copying the absolute file names.
 - Done in 0.53.0: =w= in dired copies the marked entries' file names to the kill ring (the selected one when nothing is marked, ".." never), so =C-y= pastes them anywhere; =0 w= copies the absolute file names instead — a leading =~= expands to the home directory and relative dired paths resolve against the process cwd, like Emacs's expand-file-name. Several names are newline-joined, a following kill appends like =C-k= after =M-w=, and the copied text is echoed on the modeline until the next keypress.

@@ -31,7 +31,7 @@ undo_group: UndoKind = .none,
 
 pub const Pos = struct { row: usize, col: usize };
 pub const Region = struct { start: Pos, end: Pos };
-const UndoKind = enum { none, typing, newline, backspace, delete_fwd, kill, yank };
+const UndoKind = enum { none, typing, newline, backspace, delete_fwd, kill, yank, replace };
 
 const Snapshot = struct {
     lines: std.ArrayList(std.ArrayList(u8)),
@@ -322,6 +322,34 @@ pub fn deleteForward(self: *Buffer, gpa: std.mem.Allocator) !void {
 
 pub fn setMark(self: *Buffer) void {
     self.mark = .{ .row = self.cursor_row, .col = self.cursor_col };
+}
+
+/// Start a new undo group, so the next edit records a fresh undo step
+/// instead of joining the previous run (recordUndo coalesces same-kind
+/// edits). Query-replace calls this once per session, so the whole
+/// replace — however many y's — undoes as one step, like Emacs.
+pub fn undoBoundary(self: *Buffer) void {
+    self.undo_group = .none;
+}
+
+/// M-% query-replace, one match: replace the `len` bytes starting at `at`
+/// (a match of the query, which never crosses a line boundary) with
+/// `with`, which may span lines. Returns where the replacement ends, so
+/// the next search starts past the fresh text — replacing "a" with "aa"
+/// mustn't re-match what was just inserted. The cursor lands there too.
+/// Every replacement of a session is one undo step (see undoBoundary).
+pub fn replaceAt(self: *Buffer, gpa: std.mem.Allocator, at: Pos, len: usize, with: []const u8) !Pos {
+    try self.recordUndo(gpa, .replace);
+    self.cursor_row = at.row;
+    self.cursor_col = at.col;
+    const line = &self.lines.items[at.row];
+    const del = @min(len, line.items.len -| at.col);
+    if (del > 0) {
+        line.replaceRange(gpa, at.col, del, &.{}) catch |e| return e;
+        self.dirty = true;
+    }
+    try self.insertTextRaw(gpa, with);
+    return .{ .row = self.cursor_row, .col = self.cursor_col };
 }
 
 /// Region bounds in document order (start <= end). Null if no mark is set.
@@ -868,5 +896,43 @@ pub fn findNext(self: Buffer, query: []const u8, from: Pos, dir: SearchDirection
             }
             return null;
         },
+    }
+}
+
+/// The next occurrence of `query` at or after `from`, searched to the end
+/// of the buffer without wrapping — the query-replace walk's search: it
+/// stops when the buffer has no more matches ahead, rather than asking
+/// again about the ones it already covered the way isearch's wrap-around
+/// does. Same matching as findNext.
+pub fn findNextEnd(self: Buffer, query: []const u8, from: Pos) ?Pos {
+    var row = from.row;
+    var col_start: usize = from.col;
+    while (row < self.lines.items.len) : (row += 1) {
+        const line = self.lines.items[row].items;
+        if (col_start <= line.len) {
+            if (std.ascii.findIgnoreCasePos(line, col_start, query)) |c| {
+                return .{ .row = row, .col = c };
+            }
+        }
+        col_start = 0;
+    }
+    return null;
+}
+
+/// The previous occurrence of `query` at or before `from`, searched to the
+/// start of the buffer without wrapping — the ^ (back) of the query-replace
+/// walk, and the backward twin of findNextEnd. Same matching as findNext.
+pub fn findPrevEnd(self: Buffer, query: []const u8, from: Pos) ?Pos {
+    var row = from.row;
+    var end_col: ?usize = from.col;
+    while (true) {
+        const line = self.lines.items[row].items;
+        const limit = @min(end_col orelse line.len, line.len);
+        if (lastIndexOfIgnoreCase(line[0..limit], query)) |c| {
+            return .{ .row = row, .col = c };
+        }
+        if (row == 0) return null;
+        row -= 1;
+        end_col = null;
     }
 }

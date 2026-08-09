@@ -475,6 +475,21 @@ const IsearchView = struct {
     pos: usize,
 };
 
+/// The query-replace prompt phase (M-%): which of the two prompts is
+/// showing — the string to find, then its replacement.
+const ReplacePhase = enum { query, with };
+
+/// The query-replace state (M-%), for rendering in the focused pane: the
+/// "Query replace:" prompt phase or the y / n walk, the current candidate
+/// highlighted like an isearch match. Null when no replace is active.
+const ReplaceView = struct {
+    /// The prompt phase, or null during the match walk.
+    prompt: ?ReplacePhase,
+    query: []const u8,
+    with: []const u8,
+    match: ?Buffer.Pos,
+};
+
 const DiredPromptKind = enum { copy, rename, delete, create_dir, create_file, open };
 
 /// An in-pane dired prompt (copy / rename target, delete confirmation):
@@ -548,6 +563,57 @@ fn isearchCountSuffix(buf: []u8, query: []const u8, pos: usize, count: usize) []
     return std.fmt.bufPrint(buf, " ({d}/{d})", .{ pos, count }) catch "";
 }
 
+/// M-% query-replace, one match: replace the match at `at` (a match of
+/// `query`, so `query.len` bytes, never crossing a line boundary) with
+/// `with`, carrying the match's capitalization like Emacs's case-replace.
+/// Returns where the replacement ends — the next search starts there.
+/// Null on an allocation failure (the match is left unreplaced).
+fn doReplace(gpa: std.mem.Allocator, buf: *Buffer, at: Buffer.Pos, query: []const u8, with: []const u8) ?Buffer.Pos {
+    const line = buf.lines.items[at.row].items;
+    const col = @min(at.col, line.len);
+    const len = @min(query.len, line.len - col);
+    if (len == 0) return null;
+    const repl = replaceWithCase(gpa, line[col .. col + len], with) catch return null;
+    defer gpa.free(repl);
+    return buf.replaceAt(gpa, .{ .row = at.row, .col = col }, len, repl) catch null;
+}
+
+/// The replacement `with` carrying the match's capitalization, like
+/// Emacs's case-replace (on by default): an all-caps match (FOO) uppercases
+/// the whole replacement, a match starting with a capital (Foo) capitalizes
+/// its first letter, anything else uses `with` verbatim. Only ASCII is
+/// folded, like the case-insensitive search itself. Caller must free.
+fn replaceWithCase(gpa: std.mem.Allocator, match: []const u8, with: []const u8) ![]u8 {
+    var has_letters = false;
+    var all_caps = true;
+    for (match) |c| {
+        if (std.ascii.isAlphabetic(c)) {
+            has_letters = true;
+            if (std.ascii.isLower(c)) all_caps = false;
+        }
+    }
+    if (!has_letters) return gpa.dupe(u8, with);
+    if (all_caps) return std.ascii.allocUpperString(gpa, with);
+    if (std.ascii.isUpper(match[0])) {
+        const out = try gpa.dupe(u8, with);
+        if (out.len > 0 and std.ascii.isLower(out[0])) out[0] = std.ascii.toUpper(out[0]);
+        return out;
+    }
+    return gpa.dupe(u8, with);
+}
+
+/// End a query-replace walk: leave the walk (the key dispatch must go back
+/// to normal editing!) and report how many replacements were made on the
+/// modeline (via the transient status slot, like every copy echo).
+fn endReplace(replace_active: *bool, status_msg: *?[]const u8, status_buf: *[2048]u8, count: usize) void {
+    replace_active.* = false;
+    const n = std.fmt.bufPrint(status_buf, "Replaced {d} occurrence{s}", .{ count, if (count == 1) "" else "s" }) catch {
+        status_msg.* = "Replaced";
+        return;
+    };
+    status_msg.* = status_buf[0..n.len];
+}
+
 /// Print a full-width modeline bar: the row in `buf` padded with spaces
 /// across `win`, the prompt label bold when one is active (see
 /// PromptModeline), the rest in the base `style`. The text lives in `buf`,
@@ -577,7 +643,7 @@ fn printModeline(win: vaxis.Window, buf: []u8, ml: PromptModeline, style: vaxis.
 /// may be the whole screen or one pane of a split. An active isearch shows
 /// its match highlight and prompt in this pane, exactly as if the pane were
 /// the whole screen.
-fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, grep_view: ?GrepView, files_view: ?FilesView, occur_view: ?GrepView, grep_hl: ?GrepHl, search: ?IsearchView, status: ?[]const u8) void {
+fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, grep_view: ?GrepView, files_view: ?FilesView, occur_view: ?GrepView, grep_hl: ?GrepHl, search: ?IsearchView, replace: ?ReplaceView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     const method = win.screen.width_method;
     scrollToCursorVisual(buf, text_height, win.width, method);
@@ -655,7 +721,16 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
         fillPromptModeline(modeline_buf, "Goto line (C-g cancels): ", .{}, g.query)
     else if (grep_prompt) |g|
         fillPromptModeline(modeline_buf, "{s}", .{g.label}, g.query)
-    else if (search) |s| blk: {
+    else if (replace) |r| blk: {
+        if (r.prompt) |phase| {
+            switch (phase) {
+                .query => break :blk fillPromptModeline(modeline_buf, "Query replace: ", .{}, r.query),
+                .with => break :blk fillPromptModeline(modeline_buf, "Query replace {s} with: ", .{r.query}, r.with),
+            }
+        }
+        const n = std.fmt.bufPrint(modeline_buf, "Replace {s} with {s}? (y / n / q / ! / . / ^)", .{ r.query, r.with }) catch break :blk .{ .len = 0, .label_len = 0 };
+        break :blk .{ .len = n.len, .label_len = n.len };
+    } else if (search) |s| blk: {
         const label = if (s.failed)
             (if (s.backward) "Failing I-search backward" else "Failing I-search")
         else
@@ -2086,7 +2161,11 @@ fn armSizeWatchdog(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event)) void {
 /// taking over the whole screen; when a file is chosen it's simply
 /// replaced by the newly opened buffer. An active isearch shows its prompt
 /// in the modeline; the match is the selected entry.
-fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, grep_view: ?GrepView, files_view: ?FilesView, occur_view: ?GrepView, grep_hl: ?GrepHl, search: ?IsearchView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
+fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, grep_view: ?GrepView, files_view: ?FilesView, occur_view: ?GrepView, grep_hl: ?GrepHl, search: ?IsearchView, replace: ?ReplaceView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
+    // Query-replace never runs in a dired (editing buffers only), so the
+    // replace view is ignored here; the parameter keeps the call chain
+    // uniform with renderPane.
+    _ = replace;
     // The results buffers never render through a dired pane; the
     // parameters exist so both leaf renderers share the renderTree
     // signature.
@@ -2263,6 +2342,7 @@ fn renderTree(
     occur_view: ?GrepView,
     grep_hl: ?GrepHl,
     search: ?IsearchView,
+    replace: ?ReplaceView,
     dired_prompt: ?DiredPromptView,
     status: ?[]const u8,
     focused_h: *usize,
@@ -2285,6 +2365,7 @@ fn renderTree(
         // to every pane would highlight the wrong window and could slice
         // past a shorter line in a neighbouring buffer.
         const pane_search: ?IsearchView = if (pane == focused) search else null;
+        const pane_replace: ?ReplaceView = if (pane == focused) replace else null;
         const pane_prompt: ?DiredPromptView = if (pane == focused) dired_prompt else null;
         const pane_find_file: ?FindFileView = if (pane == focused) find_file else null;
         const pane_bookmark_prompt: ?BookmarkPromptView = if (pane == focused) bookmark_prompt else null;
@@ -2297,9 +2378,9 @@ fn renderTree(
         const pane_status: ?[]const u8 = if (pane == focused) status else null;
         const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
         if (direds[pane.buf_idx]) |*d| {
-            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_prompt, pane_status);
+            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_prompt, pane_status);
         } else {
-            renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_status);
+            renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_status);
         }
         return;
     }
@@ -2311,8 +2392,8 @@ fn renderTree(
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             // The one blank column between the panes gets the separator.
             drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
-            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, dired_prompt, status, focused_h, focused_w);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
@@ -2320,8 +2401,8 @@ fn renderTree(
             // a blank row between the panes for the separator (mirroring
             // the one blank column of a vertical split).
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
-            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, dired_prompt, status, focused_h, focused_w);
         },
     }
 }
@@ -2437,6 +2518,7 @@ const welcome_tail =
     \\    Backspace           delete backward (or the region)
     \\    C-;                 comment / uncomment the line
     \\    M-z                 toggle soft wrap (truncate)
+    \\    M-%                 query-replace (from a search too; y/n/q/!/./^)
     \\    C-l                 recenter the window
     \\    C-space             set the mark (C-@ too)
     \\    C-g                 cancel the mark / a prompt
@@ -3777,6 +3859,21 @@ pub fn main(init: std.process.Init) !void {
     var isearch_count: usize = 0;
     var isearch_pos: usize = 0;
 
+    // Query-replace (M-%, Emacs query-replace): a two-prompt modal — the
+    // string to find, then its replacement — followed by a match-by-match
+    // confirmation walk over the buffer. `replace_prompt` names the phase;
+    // `replace_active` is the walk itself, asking y / n / q / ! / . / ^
+    // per match, the current candidate highlighted like an isearch match.
+    var replace_prompt: ?ReplacePhase = null;
+    var replace_query: std.ArrayList(u8) = .empty;
+    defer replace_query.deinit(gpa);
+    var replace_with: std.ArrayList(u8) = .empty;
+    defer replace_with.deinit(gpa);
+    var replace_prefill = false;
+    var replace_active = false;
+    var replace_match: ?Buffer.Pos = null;
+    var replace_count: usize = 0;
+
     while (true) {
         const event = try loop.nextEvent();
         switch (event) {
@@ -4122,6 +4219,137 @@ pub fn main(init: std.process.Init) !void {
                         occur_prompt = false;
                         occur_prefill = false;
                     }
+                } else if (replace_prompt) |phase| {
+                    if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        replace_prompt = null;
+                        replace_prefill = false;
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        switch (phase) {
+                            .query => if (replace_query.items.len > 0) {
+                                _ = replace_query.pop();
+                            },
+                            .with => if (replace_with.items.len > 0) {
+                                _ = replace_with.pop();
+                            },
+                        }
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
+                        switch (phase) {
+                            .query => {
+                                // Enter on the query moves to the
+                                // replacement prompt; an empty query cancels.
+                                const term = std.mem.trim(u8, replace_query.items, " ");
+                                if (term.len == 0) {
+                                    replace_prompt = null;
+                                } else {
+                                    replace_query.clearRetainingCapacity();
+                                    replace_query.appendSlice(gpa, term) catch {};
+                                    replace_prompt = .with;
+                                }
+                                replace_prefill = false;
+                            },
+                            .with => {
+                                const term = std.mem.trim(u8, replace_with.items, " ");
+                                replace_prompt = null;
+                                replace_prefill = false;
+                                // An empty replacement deletes the matches,
+                                // like Emacs.
+                                replace_with.clearRetainingCapacity();
+                                replace_with.appendSlice(gpa, term) catch {};
+                                // The walk starts from point, replacing
+                                // forward — the cursor hasn't moved since
+                                // M-% (the prompts don't move it).
+                                replace_count = 0;
+                                replace_match = buf.findNextEnd(replace_query.items, .{ .row = buf.cursor_row, .col = buf.cursor_col });
+                                if (replace_match) |m| {
+                                    buf.cursor_row = m.row;
+                                    buf.cursor_col = m.col;
+                                    replace_active = true;
+                                } else {
+                                    status_msg = "No matches";
+                                }
+                            },
+                        }
+                    } else if (key.text) |t| {
+                        if (replace_prefill) {
+                            // The query prompt started prefilled (the word
+                            // at point, or the isearch query): the first
+                            // typed character replaces the prefill.
+                            replace_prefill = false;
+                            replace_query.clearRetainingCapacity();
+                        }
+                        switch (phase) {
+                            .query => try replace_query.appendSlice(gpa, t),
+                            .with => try replace_with.appendSlice(gpa, t),
+                        }
+                    } else {
+                        replace_prompt = null;
+                        replace_prefill = false;
+                    }
+                } else if (replace_active) {
+                    if (key.matches('y', .{}) or key.matches(' ', .{})) {
+                        // y / SPC: replace this match and move on.
+                        if (replace_match) |m| {
+                            const after = doReplace(gpa, buf, m, replace_query.items, replace_with.items) orelse
+                                Buffer.Pos{ .row = m.row, .col = m.col + replace_query.items.len };
+                            replace_count += 1;
+                            replace_match = buf.findNextEnd(replace_query.items, after);
+                        } else {
+                            replace_match = buf.findNextEnd(replace_query.items, .{ .row = buf.cursor_row, .col = buf.cursor_col + 1 });
+                        }
+                        if (replace_match) |m| {
+                            buf.cursor_row = m.row;
+                            buf.cursor_col = m.col;
+                        } else {
+                            endReplace(&replace_active, &status_msg, &status_buf, replace_count);
+                        }
+                    } else if (key.matches('n', .{}) or key.matches(vaxis.Key.backspace, .{})) {
+                        // n / DEL: skip this match and move on.
+                        if (replace_match) |m| {
+                            const from = Buffer.Pos{ .row = m.row, .col = m.col + replace_query.items.len };
+                            replace_match = buf.findNextEnd(replace_query.items, from);
+                        }
+                        if (replace_match) |m| {
+                            buf.cursor_row = m.row;
+                            buf.cursor_col = m.col;
+                        } else {
+                            endReplace(&replace_active, &status_msg, &status_buf, replace_count);
+                        }
+                    } else if (key.matches('q', .{}) or key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        // q / C-g / Esc: quit without replacing the rest.
+                        endReplace(&replace_active, &status_msg, &status_buf, replace_count);
+                    } else if (key.matches('!', .{})) {
+                        // !: replace every remaining match, no more asking.
+                        var m = replace_match;
+                        var guard: usize = 0;
+                        while (m) |mm| : (guard += 1) {
+                            if (guard > 1_000_000) break;
+                            const after = doReplace(gpa, buf, mm, replace_query.items, replace_with.items) orelse
+                                Buffer.Pos{ .row = mm.row, .col = mm.col + replace_query.items.len };
+                            replace_count += 1;
+                            m = buf.findNextEnd(replace_query.items, after);
+                        }
+                        endReplace(&replace_active, &status_msg, &status_buf, replace_count);
+                    } else if (key.matches('.', .{})) {
+                        // .: replace this match, then quit.
+                        if (replace_match) |m| {
+                            _ = doReplace(gpa, buf, m, replace_query.items, replace_with.items);
+                            replace_count += 1;
+                        }
+                        endReplace(&replace_active, &status_msg, &status_buf, replace_count);
+                    } else if (key.matches('^', .{})) {
+                        // ^: back to the previous match, to the start of
+                        // the buffer (the walk never wraps). At the first
+                        // match the current one stays.
+                        if (replace_match) |m| {
+                            if (buf.findPrevEnd(replace_query.items, .{ .row = m.row, .col = m.col })) |pm| {
+                                replace_match = pm;
+                                buf.cursor_row = pm.row;
+                                buf.cursor_col = pm.col;
+                            }
+                        }
+                    }
+                    // Any other key is ignored — stay in the prompt rather
+                    // than risk a stray keystroke replacing the wrong thing.
                 } else if (dired_copy_prompt) {
                     if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                         dired_copy_prompt = false;
@@ -4356,6 +4584,27 @@ pub fn main(init: std.process.Init) !void {
                                 if (occurRun(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, buf, term, &occur_source, &occur_source_buf, &occur_last_term, &occur_matches, &occur_buf_idx, &results_target, &results_follow, &grep_hl, &status_msg)) |idx| {
                                     current = idx;
                                 }
+                            } else {
+                                isearch_active = false;
+                            }
+                        } else if (key.matches('%', .{ .alt = true })) {
+                            // M-% in isearch: query-replace from the search
+                            // string (Emacs isearch-query-replace) — the
+                            // search confirms and the replacement prompt
+                            // opens with the query already in hand. Editing
+                            // buffers only.
+                            const term = std.mem.trim(u8, isearch_query.items, " ");
+                            if (term.len > 0 and direds.items[current] == null) {
+                                syncDiredSelection(direds.items, current, buf);
+                                buf.undoBoundary();
+                                isearch_active = false;
+                                isearch_match = null;
+                                isearch_query.clearRetainingCapacity();
+                                replace_prompt = .with;
+                                replace_prefill = false;
+                                replace_query.clearRetainingCapacity();
+                                replace_query.appendSlice(gpa, term) catch {};
+                                replace_with.clearRetainingCapacity();
                             } else {
                                 isearch_active = false;
                             }
@@ -5342,6 +5591,29 @@ pub fn main(init: std.process.Init) !void {
                                 occur_prefill = e > s;
                             }
                         }
+                    } else if (key.matches('%', .{ .alt = true })) {
+                        // M-%: query-replace (Emacs query-replace) — prompt
+                        // for the string to find (prefilled with the word at
+                        // point), then its replacement, then walk the
+                        // matches asking y / n / q / ! / . / ^, like Emacs.
+                        // Editing buffers only: a results buffer or dired has
+                        // no text to rewrite. Each session is one undo step.
+                        if (editing) {
+                            buf.undoBoundary();
+                            replace_prompt = .query;
+                            replace_query.clearRetainingCapacity();
+                            replace_with.clearRetainingCapacity();
+                            if (buf.lines.items.len > 0) {
+                                const line = buf.lines.items[buf.cursor_row].items;
+                                const col = @min(buf.cursor_col, line.len);
+                                var s = col;
+                                while (s > 0 and (std.ascii.isAlphanumeric(line[s - 1]) or line[s - 1] == '_')) s -= 1;
+                                var e = col;
+                                while (e < line.len and (std.ascii.isAlphanumeric(line[e]) or line[e] == '_')) e += 1;
+                                if (e > s) replace_query.appendSlice(gpa, line[s..e]) catch {};
+                                replace_prefill = e > s;
+                            }
+                        }
                     } else if (key.matches('y', .{ .ctrl = true })) {
                         if (editing) {
                             yank_clip: {
@@ -5688,6 +5960,17 @@ pub fn main(init: std.process.Init) !void {
 
         const search_view: ?IsearchView = if (isearch_active)
             .{ .failed = isearch_failed, .match = isearch_match, .query = isearch_query.items, .backward = isearch_dir == .backward, .count = isearch_count, .pos = isearch_pos }
+        else if (replace_active)
+            // The query-replace walk highlights the current candidate like
+            // an isearch match.
+            .{ .failed = false, .match = replace_match, .query = replace_query.items, .backward = false, .count = 0, .pos = 0 }
+        else
+            null;
+
+        const replace_view: ?ReplaceView = if (replace_prompt) |phase|
+            .{ .prompt = phase, .query = replace_query.items, .with = replace_with.items, .match = null }
+        else if (replace_active)
+            .{ .prompt = null, .query = replace_query.items, .with = replace_with.items, .match = replace_match }
         else
             null;
 
@@ -5755,7 +6038,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;
@@ -5898,7 +6181,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal) {
             if (direds.items[current]) |*d| {
                 var modeline_buf: [2048]u8 = undefined;
-                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, dired_prompt_view, status_msg);
+                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, dired_prompt_view, status_msg);
                 try vx.render(tty.writer());
                 frame_allocs.reset();
                 continue;
@@ -5987,6 +6270,14 @@ pub fn main(init: std.process.Init) !void {
             break :blk fillPromptModeline(&modeline_buf, "Grep: ", .{}, grep_query.items);
         } else if (occur_prompt) blk: {
             break :blk fillPromptModeline(&modeline_buf, "Occur: ", .{}, occur_query.items);
+        } else if (replace_prompt) |phase| blk: {
+            switch (phase) {
+                .query => break :blk fillPromptModeline(&modeline_buf, "Query replace: ", .{}, replace_query.items),
+                .with => break :blk fillPromptModeline(&modeline_buf, "Query replace {s} with: ", .{replace_query.items}, replace_with.items),
+            }
+        } else if (replace_active) blk: {
+            const n = std.fmt.bufPrint(&modeline_buf, "Replace {s} with {s}? (y / n / q / ! / . / ^)", .{ replace_query.items, replace_with.items }) catch break :blk .{ .len = 0, .label_len = 0 };
+            break :blk .{ .len = n.len, .label_len = n.len };
         } else if (isearch_active) blk: {
             const label = if (isearch_failed)
                 (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")

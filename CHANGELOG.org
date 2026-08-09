@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.55.0 — <2026-08-09>
+
+=M-%= query-replaces: ask for the string, then its replacement, and walk the matches one by one.
+
+- =M-%= (Emacs query-replace) prompts =Query replace: = — prefilled with the word at point, like the grep prompt — then =Query replace foo with: =, and walks every match asking =y= / =n= with the candidate highlighted like an isearch match: =y= (or SPC) replaces it, =n= (or DEL) skips it, = != replaces every remaining match without asking, =.= replaces this one and quits, =^= steps back a match, and =q= / =C-g= / Esc quits. The walk stops at the end of the buffer rather than wrapping, so it never re-asks about text it has already replaced (=a= → =aa= terminates instead of growing forever). The replacement carries the match's capitalization, like Emacs's case-replace: =FOO= → =BAR=, =Foo= → =Bar=. The whole session is a single undo step (=C-/= reverts all of it), and the modeline reports =Replaced N occurrences= when the walk ends. =M-%= inside a search (=C-s= / =C-r=) starts from the search string (Emacs isearch-query-replace). Editing buffers only — a results buffer or dired has nothing to rewrite. An empty replacement deletes the matches; an empty query cancels.
+
 ** 0.54.0 — <2026-08-09>
 
 Isearch shows how far you are: =I-search: term (3/12)= on the modeline.
