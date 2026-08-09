@@ -347,10 +347,16 @@ fn extensionOf(name: []const u8) []const u8 {
 
 /// Order the listing by `mode`, keeping ".." pinned first. Size sorts
 /// largest first (`ls -S`), date newest first (`ls -t`); ties fall back
-/// to the name.
+/// to the name. The comparison is reflexive — an entry never sorts
+/// before itself — which the sort's internal binary search relies on
+/// (it compares elements against themselves while probing ranges).
 fn lessThan(mode: SortMode, a: Entry, b: Entry) bool {
-    if (std.mem.eql(u8, a.name, "..")) return true;
-    if (std.mem.eql(u8, b.name, "..")) return false;
+    const a_up = std.mem.eql(u8, a.name, "..");
+    const b_up = std.mem.eql(u8, b.name, "..");
+    if (a_up or b_up) {
+        if (a_up == b_up) return false;
+        return a_up;
+    }
     switch (mode) {
         .name => return std.ascii.lessThanIgnoreCase(a.name, b.name),
         .size => {
