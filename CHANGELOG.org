@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.56.0 — <2026-08-09>
+
+Dired =z= compresses and decompresses the marked entries, using only the tools the platform actually has.
+
+- =z= in dired (Emacs dired-compress-file, the author's my/dired-compress-transient) compresses the marked entries — or just the selected one when nothing is marked — and a file that already carries a compression suffix (=.gz=, =.tar.gz=, =.zip=, =.7z=, ...) is decompressed instead. Everything else opens a one-key format menu in the modeline, and the menu offers *only the tools that exist on this machine*: a single file gets the gzip-style tools (=g= gzip, =z= xz, =b= bzip2, =s= zstd, =l= lzip, =p= zip, =7= 7z), a directory or several marked files the tar-style ones (=t= tar.gz, =z= tar.xz, =b= tar.bz2, =s= tar.zst, =l= tar.lz, =p= zip, =7= 7z — the letters of the author's transient). Single-file tools replace the file, like =gzip -9=; an archive is named after the entry (=foo= → =foo.tar.gz=); several files prompt for the archive name, defaulting to the directory name. Windows ships tar.exe (bsdtar) and PowerShell but no gzip, so there the menu is =p= zip (Compress-Archive) / =t= tar.gz / =z= tar.xz / =b= tar.bz2 (tar -a) / =7= 7z when installed, decompression through Expand-Archive and =tar -xf= — and a bare =.gz=, which Windows has no standard tool for, reports a failure instead of a menu entry. The dired refreshes after every operation and the modeline reports the result with the archive's size, =Compressed foo.tar.gz (1.2K)=, or =Decompressed 3 files=.
+
 ** 0.55.0 — <2026-08-09>
 
 =M-%= query-replaces: ask for the string, then its replacement, and walk the matches one by one.

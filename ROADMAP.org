@@ -30,23 +30,20 @@ TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =to
 - Done in 0.51.0: every matching line of the current buffer lands in an =*occur*= buffer built on the =*grep*= machinery — =n= / =p= step, Enter jumps to the match in the source (split to the right when alone, window reused otherwise, transient highlight on the term), =F= follows, =g= re-runs over the source picking up edits, =q= / =C-g= closes; =M-c= during isearch starts from the search string.
 - Effort: small-to-medium (clone of the results-buffer path).
 
-** TODO Dired: disk usage, compress, file clipboard
-- Emacs: =my/dired-du= (=du = sort = awk = column= into a =*dired-du*= buffer, largest first), the =my/dired-compress-transient= formats (xz / gzip / tar.gz / bzip2 / zstd / lzip / 7z) with async progress, and =my-dired-clipboard-mode= (=M-w= copy files, =C-y= paste, conflict renaming). Dired is the most-developed area of the author's Emacs (~800 lines in =Emacs-vanilla= alone).
-- james dired already has =C= / =R= / =D=, marks, and dwim-target; the file *clipboard* (=C-y= pastes marked files, not text) is the standout — Emacs muscle memory =C-y= in dired.
-- =du= is a one-shot =runCapture= over the current directory into a listing buffer; compress is the same with a format picker (reuse the modeline prompt pattern).
-- Effort: small (=du=), medium (compress), small (clipboard).
+** DONE Dired: compress
+- Emacs: =my/dired-compress-transient= formats (xz / gzip / tar.gz / bzip2 / zstd / lzip / 7z) with async progress.
+- Done in 0.56.0: =z= in dired compresses the marked entries (or the selected one, ".." never) — a file that already carries a compression suffix is decompressed instead. Anything else opens a one-key format menu in the modeline offering *only the tools this platform actually has*: a single file gets gzip / xz / bzip2 / zstd / lzip / zip / 7z, a directory or several files the tar-style tar.gz / tar.xz / tar.bz2 / tar.zst / tar.lz / zip / 7z (several files prompt for the archive name, defaulting to the directory name). The single-file tools replace the file like =gzip -9=; archives are named after the entry. Windows — which ships =tar.exe= (bsdtar) and PowerShell's =Compress-Archive= / =Expand-Archive= but no gzip — sees zip / tar.gz / tar.xz / tar.bz2 / 7z, and decompresses through those same tools; suffixes with no standard tool on the platform (a bare =gz= on Windows) report failure. The dired refreshes and the modeline reports =Compressed foo.tar.gz (1.2K)=.
+- Effort: medium.
 
-** TODO Sticky keys / repeat-mode
-- Emacs: =windmove-repeat-map= (h/j/k/l keep moving windows after one press) and =my/repeat-history= (=C-c j= then =j= / =k= keeps stepping winner-mode history).
-- For james: after =C-c j= / =C-c k=, =j= / =k= repeat; after a window-motion key (=M-n= / =M-p=), the direction repeats. The =pending_*= pattern already in =main.zig= (C-g arms redo) is the same plumbing.
-- Effort: small.
+** TODO Sticky Keys
+
+- Implement the classic sticky keys offered built-in by Windows and also which can be enabled in linux by the use of an xkb file.  Basically no more key chords, but hitting the sequence of chord keys in sequential order.  This can be achieved also by using tools like AutoHotKey, but ideally I would want it built in to this text editor.  By default Emacs and this application would be using key chords, but that can be tiring and stressful on the fingers and as this application is designed to be portable and no config and to be able to run on any system with just a single executable having an internal sticky key switch to this application would be useful.
+
+** TODO Deleted files to trash
+
+- Put deleted files into the Trash folder.
 
 * Medium term
-
-** TODO Spell-check the word at point — M-$
-- Emacs: =flyspell= / =ispell= with en_GB hunspell and a personal dictionary; spelling-menu on =C-c s=, =M-4= ispell-word.
-- Shell out to hunspell/aspell for the word at point, show suggestions in a picker, replace on selection. Personal-dictionary appending fits the bookmarks/recent files persistence pattern.
-- Effort: medium.
 
 ** TODO Quick window jump — M-o
 - Emacs: =my/quick-window-jump= — each window gets a one-char label (j/k/l/;/a/s/d/f), typing it jumps; direct jump when two windows.
@@ -55,8 +52,6 @@ TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =to
 
 * Quick wins
 
-** TODO Flash on copy
-- Emacs: =my/kill-ring-save= flashes the copied text; james already has the transient highlight from grep jumps — reuse it for =M-w= / =C-c w=.
 ** TODO M-h mark block
 - Emacs: =my/mark-block= — mark the text between surrounding blank lines. Trivial in james (scan rows, set mark).
 ** DONE Isearch lazy count
@@ -77,4 +72,4 @@ TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =to
 
 * Already in james
 
-=recentf= (=M-l l=), grep (=C-c g=), find files (=C-c f=), tabs (=M-l ==, =M-l -=, =M-1..9=, =M-i=, =M-u=), winner-mode window history (=C-c j= / =C-c k=), dired sorting (3/4/5/6, =s=) and dwim-target copy/rename, window resize (=C-M-h/j/k/l=), quarter-page and page scrolling (=M-j/k=, =M-J/K=), jump keys (=M-l= prefix), comment/uncomment (=C-;=), copy line / buffer / region (=M-w=, =C-c b=, =C-c w=), shell drop (=C-x j= / =C-x c=).
+=recentf= (=M-l l=), grep (=C-c g=), find files (=C-c f=), tabs (=M-l ==, =M-l -=, =M-1..9=, =M-i=, =M-u=), winner-mode window history (=C-c j= / =C-c k=), dired sorting (3/4/5/6, =s=) and dwim-target copy/rename, dired compress (=z=), window resize (=C-M-h/j/k/l=), quarter-page and page scrolling (=M-j/k=, =M-J/K=), jump keys (=M-l= prefix), comment/uncomment (=C-;=), copy line / buffer / region (=M-w=, =C-c b=, =C-c w=), query-replace (=M-%=), shell drop (=C-x j= / =C-x c=).

@@ -492,6 +492,24 @@ const ReplaceView = struct {
 
 const DiredPromptKind = enum { copy, rename, delete, create_dir, create_file, open };
 
+/// The dired compress formats (Z, Emacs dired-compress-file / the
+/// author's my/dired-compress-transient): the single-file tools replace
+/// the file in place (gzip -9 style); the archive formats build a new
+/// archive, named after the entry (or prompted for, when several entries
+/// are marked).
+const CompressFmt = enum { gzip, xz, bzip2, zstd, lzip, tar_gz, tar_xz, tar_bz2, tar_zst, tar_lz, zip, seven_z };
+
+/// One choice of the one-key compress menu: the letter that runs it.
+const CompressChoice = struct { key: u8, fmt: CompressFmt };
+
+/// The Z format menu, for the dired's modeline: the label ("Compress foo
+/// as: ") and the choices ("g gzip, z xz, ..."). Both slices point into
+/// fixed buffers that outlive the frame.
+const CompressMenuView = struct {
+    label: []const u8,
+    choices: []const u8,
+};
+
 /// An in-pane dired prompt (copy / rename target, delete confirmation):
 /// the listing stays in its window and the prompt text appears in that
 /// pane's modeline, so the layout never changes.
@@ -1878,6 +1896,404 @@ fn clipboardGet(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) ?[
     return if (out.items.len > 0) gpa.dupe(u8, out.items) catch null else null;
 }
 
+/// Run `argv` to completion, both outputs ignored; true when it exits 0.
+fn runTool(io: std.Io, argv: []const []const u8) bool {
+    var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
+    const term = child.wait(io) catch return false;
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+/// Whether `argv` runs at all on this machine: spawned with both outputs
+/// captured, "yes" on any output (some tools --version to stderr). The
+/// probe for the compress menu — a format is only offered when its tool
+/// actually exists, so the menu is honest (and Windows, which ships
+/// tar.exe and PowerShell but no gzip, sees zip / tar.gz / tar.xz /
+/// tar.bz2 / 7z).
+fn toolRuns(io: std.Io, argv: []const []const u8) bool {
+    var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .pipe, .stderr = .pipe }) catch return false;
+    var any = false;
+    if (child.stdout) |f| {
+        var buf: [256]u8 = undefined;
+        var r = f.reader(io, &buf);
+        var chunk: [256]u8 = undefined;
+        while (true) {
+            const n = r.interface.readSliceShort(&chunk) catch break;
+            if (n == 0) break;
+            if (n > 0) any = true;
+        }
+    }
+    if (child.stderr) |f| {
+        var buf: [256]u8 = undefined;
+        var r = f.reader(io, &buf);
+        var chunk: [256]u8 = undefined;
+        while (true) {
+            const n = r.interface.readSliceShort(&chunk) catch break;
+            if (n == 0) break;
+            if (n > 0) any = true;
+        }
+    }
+    _ = child.wait(io) catch null;
+    return any;
+}
+
+/// Whether a standard tool named `name` exists, probed with --version.
+fn toolAvailable(io: std.Io, name: []const u8) bool {
+    return toolRuns(io, &.{ name, "--version" });
+}
+
+/// The one-key format choices for this platform and target — `archive`
+/// when the target is a directory or several files (tar-style formats),
+/// a single plain file getting the gzip-style tools instead. Only tools
+/// that actually exist are offered. The letter keys mirror the author's
+/// my/dired-compress-transient (z g t b s l 7), with p for zip.
+fn compressChoices(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList(CompressChoice), archive: bool) void {
+    out.clearRetainingCapacity();
+    if (comptime builtin.os.tag == .windows) {
+        // zip: PowerShell's Compress-Archive, present on every Windows
+        // since 10; tar.exe (bsdtar) with -a picking the compressor from
+        // the suffix; 7z when installed.
+        out.append(gpa, .{ .key = 'p', .fmt = .zip }) catch {};
+        if (toolAvailable(io, "tar")) {
+            out.append(gpa, .{ .key = 't', .fmt = .tar_gz }) catch {};
+            out.append(gpa, .{ .key = 'z', .fmt = .tar_xz }) catch {};
+            out.append(gpa, .{ .key = 'b', .fmt = .tar_bz2 }) catch {};
+        }
+        if (toolRuns(io, &.{ "7z", "i" })) out.append(gpa, .{ .key = '7', .fmt = .seven_z }) catch {};
+        return;
+    }
+    if (!archive) {
+        if (toolAvailable(io, "gzip")) out.append(gpa, .{ .key = 'g', .fmt = .gzip }) catch {};
+        if (toolAvailable(io, "xz")) out.append(gpa, .{ .key = 'z', .fmt = .xz }) catch {};
+        if (toolAvailable(io, "bzip2")) out.append(gpa, .{ .key = 'b', .fmt = .bzip2 }) catch {};
+        if (toolAvailable(io, "zstd")) out.append(gpa, .{ .key = 's', .fmt = .zstd }) catch {};
+        if (toolAvailable(io, "lzip")) out.append(gpa, .{ .key = 'l', .fmt = .lzip }) catch {};
+    } else {
+        if (toolAvailable(io, "tar")) out.append(gpa, .{ .key = 't', .fmt = .tar_gz }) catch {};
+        if (toolAvailable(io, "xz")) out.append(gpa, .{ .key = 'z', .fmt = .tar_xz }) catch {};
+        if (toolAvailable(io, "bzip2")) out.append(gpa, .{ .key = 'b', .fmt = .tar_bz2 }) catch {};
+        if (toolAvailable(io, "zstd")) out.append(gpa, .{ .key = 's', .fmt = .tar_zst }) catch {};
+        if (toolAvailable(io, "lzip")) out.append(gpa, .{ .key = 'l', .fmt = .tar_lz }) catch {};
+    }
+    if (toolAvailable(io, "zip")) out.append(gpa, .{ .key = 'p', .fmt = .zip }) catch {};
+    if (toolRuns(io, &.{ "7z", "i" })) out.append(gpa, .{ .key = '7', .fmt = .seven_z }) catch {};
+}
+
+fn compressFmtName(fmt: CompressFmt) []const u8 {
+    return switch (fmt) {
+        .gzip => "gzip",
+        .xz => "xz",
+        .bzip2 => "bzip2",
+        .zstd => "zstd",
+        .lzip => "lzip",
+        .tar_gz => "tar.gz",
+        .tar_xz => "tar.xz",
+        .tar_bz2 => "tar.bz2",
+        .tar_zst => "tar.zst",
+        .tar_lz => "tar.lz",
+        .zip => "zip",
+        .seven_z => "7z",
+    };
+}
+
+fn compressFmtSuffix(fmt: CompressFmt) []const u8 {
+    return switch (fmt) {
+        .gzip => ".gz",
+        .xz => ".xz",
+        .bzip2 => ".bz2",
+        .zstd => ".zst",
+        .lzip => ".lz",
+        .tar_gz => ".tar.gz",
+        .tar_xz => ".tar.xz",
+        .tar_bz2 => ".tar.bz2",
+        .tar_zst => ".tar.zst",
+        .tar_lz => ".tar.lz",
+        .zip => ".zip",
+        .seven_z => ".7z",
+    };
+}
+
+/// Whether `fmt` builds an archive (tar / zip / 7z) rather than
+/// compressing a single file in place.
+fn compressFmtArchives(fmt: CompressFmt) bool {
+    return switch (fmt) {
+        .gzip, .xz, .bzip2, .zstd, .lzip => false,
+        else => true,
+    };
+}
+
+/// "g gzip, z xz, ..." — the choice list for the modeline menu.
+fn compressMenuText(buf: []u8, choices: []const CompressChoice) []const u8 {
+    var pos: usize = 0;
+    for (choices, 0..) |c, i| {
+        const piece = if (i == 0)
+            (std.fmt.bufPrint(buf[pos..], "{c} {s}", .{ c.key, compressFmtName(c.fmt) }) catch return buf[0..pos])
+        else
+            (std.fmt.bufPrint(buf[pos..], ", {c} {s}", .{ c.key, compressFmtName(c.fmt) }) catch return buf[0..pos]);
+        pos += piece.len;
+    }
+    return buf[0..pos];
+}
+
+/// `s` single-quoted for the shell, embedded single quotes escaped as
+/// '\'' — the argument quoting for the tar pipelines james builds.
+fn shellQuote(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try out.append(gpa, '\'');
+    for (s) |c| {
+        if (c == '\'') try out.appendSlice(gpa, "'\\''")
+        else try out.append(gpa, c);
+    }
+    try out.append(gpa, '\'');
+    return out.toOwnedSlice(gpa);
+}
+
+/// `s` single-quoted for PowerShell, embedded single quotes doubled.
+fn psQuote(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try out.append(gpa, '\'');
+    for (s) |c| {
+        if (c == '\'') try out.appendSlice(gpa, "''")
+        else try out.append(gpa, c);
+    }
+    try out.append(gpa, '\'');
+    return out.toOwnedSlice(gpa);
+}
+
+/// The POSIX pipeline for a tar.* format — "tar --force-local -cf - <opds>
+/// | <tool> <flag> > <out>" through /bin/sh (spawn can't express a pipe).
+fn tarPipeline(gpa: std.mem.Allocator, fmt: CompressFmt, opds: []const []const u8, out: []const u8) ![]const []const u8 {
+    var cmd: std.ArrayList(u8) = .empty;
+    defer cmd.deinit(gpa);
+    try cmd.appendSlice(gpa, "tar --force-local -cf -");
+    for (opds) |p| {
+        try cmd.append(gpa, ' ');
+        const q = try shellQuote(gpa, p);
+        defer gpa.free(q);
+        try cmd.appendSlice(gpa, q);
+    }
+    const tool: []const u8 = switch (fmt) {
+        .tar_xz => "xz",
+        .tar_bz2 => "bzip2",
+        .tar_zst => "zstd",
+        .tar_lz => "lzip",
+        else => unreachable,
+    };
+    const flag: []const u8 = switch (fmt) {
+        .tar_xz => "-9e",
+        else => "-9",
+    };
+    try cmd.appendSlice(gpa, " | ");
+    try cmd.appendSlice(gpa, tool);
+    try cmd.append(gpa, ' ');
+    try cmd.appendSlice(gpa, flag);
+    try cmd.appendSlice(gpa, " > ");
+    const qout = try shellQuote(gpa, out);
+    defer gpa.free(qout);
+    try cmd.appendSlice(gpa, qout);
+    const sh_cmd = try gpa.dupe(u8, cmd.items);
+    return &.{ "sh", "-c", sh_cmd };
+}
+
+/// Run the chosen compression on `opds` (full paths). Archive formats
+/// create `out` (the full output path); the single-file tools compress
+/// each operand in place, replacing it. Returns true on success.
+fn diredCompressRun(io: std.Io, gpa: std.mem.Allocator, fmt: CompressFmt, opds: []const []const u8, out: ?[]const u8) bool {
+    // The argv james builds itself (the PowerShell command, the tar
+    // pipeline string, the archive argv arrays) is freed after the run.
+    var owned: []const u8 = &.{};
+    defer if (owned.len > 0) gpa.free(owned);
+    var owned_argv: ?[]const []const u8 = null;
+    defer if (owned_argv) |a| gpa.free(a);
+    const argv: ?[]const []const u8 = if (comptime builtin.os.tag == .windows)
+        switch (fmt) {
+            .zip => blk: {
+                // PowerShell's Compress-Archive: a comma-separated list of
+                // single-quoted paths, then the destination.
+                var ps: std.ArrayList(u8) = .empty;
+                ps.appendSlice(gpa, "Compress-Archive -Path ") catch break :blk null;
+                for (opds, 0..) |p, i| {
+                    if (i > 0) ps.append(gpa, ',') catch break :blk null;
+                    ps.append(gpa, '\'') catch break :blk null;
+                    const q = psQuote(gpa, p) catch break :blk null;
+                    ps.appendSlice(gpa, q) catch break :blk null;
+                    gpa.free(q);
+                    ps.append(gpa, '\'') catch break :blk null;
+                }
+                ps.appendSlice(gpa, " -DestinationPath '") catch break :blk null;
+                const qout = psQuote(gpa, out orelse break :blk null) catch break :blk null;
+                ps.appendSlice(gpa, qout) catch break :blk null;
+                gpa.free(qout);
+                ps.appendSlice(gpa, "'") catch break :blk null;
+                owned = ps.toOwnedSlice(gpa) catch break :blk null;
+                break :blk &.{ "powershell.exe", "-NoProfile", "-Command", owned };
+            },
+            .tar_gz, .tar_xz, .tar_bz2 => blk: {
+                // tar.exe (bsdtar): -a picks the compressor from the
+                // output suffix, so one command serves all three.
+                const n = 3 + opds.len;
+                const argv2 = gpa.alloc([]const u8, n) catch break :blk null;
+                argv2[0] = "tar";
+                argv2[1] = "-acf";
+                argv2[2] = out orelse break :blk null;
+                @memcpy(argv2[3..], opds);
+                owned_argv = argv2;
+                break :blk argv2;
+            },
+            .seven_z => blk: {
+                const n = 3 + opds.len;
+                const argv2 = gpa.alloc([]const u8, n) catch break :blk null;
+                argv2[0] = "7z";
+                argv2[1] = "a";
+                argv2[2] = out orelse break :blk null;
+                @memcpy(argv2[3..], opds);
+                owned_argv = argv2;
+                break :blk argv2;
+            },
+            else => null,
+        }
+    else
+        switch (fmt) {
+            .gzip => &.{ "gzip", "-9", opds[0] },
+            .xz => &.{ "xz", "-9e", opds[0] },
+            .bzip2 => &.{ "bzip2", "-9", opds[0] },
+            .zstd => &.{ "zstd", "-19", opds[0] },
+            .lzip => &.{ "lzip", "-9", opds[0] },
+            .tar_gz => blk: {
+                const n = 4 + opds.len;
+                const argv2 = gpa.alloc([]const u8, n) catch break :blk null;
+                argv2[0] = "tar";
+                argv2[1] = "--force-local";
+                argv2[2] = "-czf";
+                argv2[3] = out orelse break :blk null;
+                @memcpy(argv2[4..], opds);
+                owned_argv = argv2;
+                break :blk argv2;
+            },
+            .tar_xz, .tar_bz2, .tar_zst, .tar_lz => blk: {
+                // A pipeline ("tar -cf - <opds> | xz -9e > <out>"), through
+                // the shell; the command string is freed after the run.
+                const cmd = tarPipeline(gpa, fmt, opds, out orelse return false) catch return false;
+                owned = cmd[2];
+                break :blk cmd;
+            },
+            .zip => blk: {
+                const n = 3 + opds.len;
+                const argv2 = gpa.alloc([]const u8, n) catch break :blk null;
+                argv2[0] = "zip";
+                argv2[1] = "-r";
+                argv2[2] = out orelse break :blk null;
+                @memcpy(argv2[3..], opds);
+                owned_argv = argv2;
+                break :blk argv2;
+            },
+            .seven_z => blk: {
+                const n = 3 + opds.len;
+                const argv2 = gpa.alloc([]const u8, n) catch break :blk null;
+                argv2[0] = "7z";
+                argv2[1] = "a";
+                argv2[2] = out orelse break :blk null;
+                @memcpy(argv2[3..], opds);
+                owned_argv = argv2;
+                break :blk argv2;
+            },
+        };
+    const a = argv orelse return false;
+    return runTool(io, a);
+}
+
+/// Ends with `suffix`, ASCII case-insensitive (the compressed-file suffix
+/// check: ".TAR.GZ" counts).
+fn endsWithIgnoreCase(s: []const u8, suffix: []const u8) bool {
+    if (s.len < suffix.len) return false;
+    return std.ascii.eqlIgnoreCase(s[s.len - suffix.len ..], suffix);
+}
+
+/// The compression kind a file name carries (case-insensitive), or null.
+const CompressedKind = enum { gzip, bzip2, xz, zstd, lzip, seven_z, zip, tar, tgz, tar_gz, tar_bz2, tar_xz, tar_zst, tar_lz };
+
+fn compressedKindOf(name: []const u8) ?CompressedKind {
+    if (endsWithIgnoreCase(name, ".tar.gz")) return .tar_gz;
+    if (endsWithIgnoreCase(name, ".tar.bz2")) return .tar_bz2;
+    if (endsWithIgnoreCase(name, ".tar.xz")) return .tar_xz;
+    if (endsWithIgnoreCase(name, ".tar.zst")) return .tar_zst;
+    if (endsWithIgnoreCase(name, ".tar.lz")) return .tar_lz;
+    if (endsWithIgnoreCase(name, ".tgz")) return .tgz;
+    if (endsWithIgnoreCase(name, ".gz")) return .gzip;
+    if (endsWithIgnoreCase(name, ".bz2")) return .bzip2;
+    if (endsWithIgnoreCase(name, ".xz")) return .xz;
+    if (endsWithIgnoreCase(name, ".zst")) return .zstd;
+    if (endsWithIgnoreCase(name, ".lz")) return .lzip;
+    if (endsWithIgnoreCase(name, ".7z")) return .seven_z;
+    if (endsWithIgnoreCase(name, ".zip")) return .zip;
+    if (endsWithIgnoreCase(name, ".tar")) return .tar;
+    return null;
+}
+
+/// Decompress one file: the single-file formats replace the file in place
+/// (foo.tar.gz's .gz stripped), the archives extract into the file's
+/// directory. True on success; a suffix with no standard tool on this
+/// platform (e.g. a bare .gz on Windows) reports failure.
+fn diredDecompressRun(io: std.Io, gpa: std.mem.Allocator, path: []const u8) bool {
+    const kind = compressedKindOf(path) orelse return false;
+    const dir = std.fs.path.dirname(path) orelse ".";
+    // The argv james builds itself (the -o and PowerShell command
+    // strings) is freed after the run.
+    var owned: []const u8 = &.{};
+    defer if (owned.len > 0) gpa.free(owned);
+    const cmd: ?[]const []const u8 = switch (kind) {
+        .gzip => if (comptime builtin.os.tag == .windows) null else &.{ "gzip", "-d", path },
+        .bzip2 => if (comptime builtin.os.tag == .windows) null else &.{ "bzip2", "-d", path },
+        .xz => if (comptime builtin.os.tag == .windows) null else &.{ "xz", "-d", path },
+        .zstd => if (comptime builtin.os.tag == .windows) null else &.{ "zstd", "-d", path },
+        .lzip => if (comptime builtin.os.tag == .windows) null else &.{ "lzip", "-d", path },
+        .seven_z => if (toolRuns(io, &.{ "7z", "i" })) blk: {
+            owned = std.fmt.allocPrint(gpa, "-o{s}", .{dir}) catch break :blk null;
+            break :blk &.{ "7z", "x", path, owned };
+        } else null,
+        .zip => if (comptime builtin.os.tag == .windows) blk: {
+            const qp = psQuote(gpa, path) catch break :blk null;
+            defer gpa.free(qp);
+            const qd = psQuote(gpa, dir) catch break :blk null;
+            defer gpa.free(qd);
+            owned = std.fmt.allocPrint(gpa, "Expand-Archive -Path {s} -DestinationPath {s} -Force", .{ qp, qd }) catch break :blk null;
+            break :blk &.{ "powershell.exe", "-NoProfile", "-Command", owned };
+        } else if (toolAvailable(io, "unzip")) &.{ "unzip", path, "-d", dir } else null,
+        .tar, .tgz, .tar_gz, .tar_bz2, .tar_xz, .tar_zst, .tar_lz => &.{ "tar", "-xf", path, "-C", dir },
+    };
+    const a = cmd orelse return false;
+    return runTool(io, a);
+}
+
+/// "1.2K", "34M" — `bytes` humanized, into `buf`.
+fn humanSize(bytes: u64, buf: []u8) []const u8 {
+    const units = "KMGT";
+    if (bytes < 1024) return std.fmt.bufPrint(buf, "{d}B", .{bytes}) catch "";
+    var v: f64 = @floatFromInt(bytes);
+    var u: usize = 0;
+    while (v >= 1024 and u < units.len) : (u += 1) v /= 1024;
+    return std.fmt.bufPrint(buf, "{d:.1}{c}", .{ v, units[u - 1] }) catch "";
+}
+
+/// The transient status for a finished compression: "Compressed
+/// foo.tar.gz (1.2K)", the size from a stat of `result` when it exists.
+fn compressStatus(io: std.Io, status_msg: *?[]const u8, status_buf: *[2048]u8, result: []const u8) void {
+    var size_buf: [16]u8 = undefined;
+    var size_str: []const u8 = "";
+    if (std.Io.Dir.cwd().statFile(io, result, .{ .follow_symlinks = false })) |st| {
+        size_str = humanSize(st.size, &size_buf);
+    } else |_| {}
+    const n = if (size_str.len > 0)
+        (std.fmt.bufPrint(status_buf, "Compressed {s} ({s})", .{ std.fs.path.basename(result), size_str }) catch unreachable)
+    else
+        (std.fmt.bufPrint(status_buf, "Compressed {s}", .{std.fs.path.basename(result)}) catch unreachable);
+    status_msg.* = status_buf[0..n.len];
+}
+
 // --- C-c g grep (my/grep) ----------------------------------------------
 //
 // Mirrors the author's Emacs my/grep: ripgrep when it's on the PATH
@@ -2161,7 +2577,7 @@ fn armSizeWatchdog(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event)) void {
 /// taking over the whole screen; when a file is chosen it's simply
 /// replaced by the newly opened buffer. An active isearch shows its prompt
 /// in the modeline; the match is the selected entry.
-fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, grep_view: ?GrepView, files_view: ?FilesView, occur_view: ?GrepView, grep_hl: ?GrepHl, search: ?IsearchView, replace: ?ReplaceView, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
+fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, grep_view: ?GrepView, files_view: ?FilesView, occur_view: ?GrepView, grep_hl: ?GrepHl, search: ?IsearchView, replace: ?ReplaceView, compress_menu: ?CompressMenuView, archive_query: ?[]const u8, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
     // Query-replace never runs in a dired (editing buffers only), so the
     // replace view is ignored here; the parameter keeps the call chain
     // uniform with renderPane.
@@ -2269,6 +2685,11 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
         else
             s.query;
         break :blk fillPromptModeline(modeline_buf, "{s}: ", .{label}, query_with_count);
+    } else if (compress_menu) |m| blk: {
+        // Z's format menu: the label bold, the one-key choices plain.
+        break :blk fillPromptModeline(modeline_buf, "{s}", .{m.label}, m.choices);
+    } else if (archive_query) |q| blk: {
+        break :blk fillPromptModeline(modeline_buf, "Archive name (C-g cancels): ", .{}, q);
     } else if (dired_prompt) |p| blk: {
         const is_dir = dired.selected < dired.entries.items.len and dired.entries.items[dired.selected].is_dir;
         const name = if (dired.selected < dired.entries.items.len) dired.entries.items[dired.selected].name else "";
@@ -2343,6 +2764,8 @@ fn renderTree(
     grep_hl: ?GrepHl,
     search: ?IsearchView,
     replace: ?ReplaceView,
+    compress_menu: ?CompressMenuView,
+    archive_query: ?[]const u8,
     dired_prompt: ?DiredPromptView,
     status: ?[]const u8,
     focused_h: *usize,
@@ -2367,6 +2790,8 @@ fn renderTree(
         const pane_search: ?IsearchView = if (pane == focused) search else null;
         const pane_replace: ?ReplaceView = if (pane == focused) replace else null;
         const pane_prompt: ?DiredPromptView = if (pane == focused) dired_prompt else null;
+        const pane_compress_menu: ?CompressMenuView = if (pane == focused) compress_menu else null;
+        const pane_archive_query: ?[]const u8 = if (pane == focused) archive_query else null;
         const pane_find_file: ?FindFileView = if (pane == focused) find_file else null;
         const pane_bookmark_prompt: ?BookmarkPromptView = if (pane == focused) bookmark_prompt else null;
         const pane_goto_prompt: ?GotoPromptView = if (pane == focused) goto_prompt else null;
@@ -2378,7 +2803,7 @@ fn renderTree(
         const pane_status: ?[]const u8 = if (pane == focused) status else null;
         const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
         if (direds[pane.buf_idx]) |*d| {
-            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_prompt, pane_status);
+            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_compress_menu, pane_archive_query, pane_prompt, pane_status);
         } else {
             renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_status);
         }
@@ -2392,8 +2817,8 @@ fn renderTree(
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             // The one blank column between the panes gets the separator.
             drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
-            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
@@ -2401,8 +2826,8 @@ fn renderTree(
             // a blank row between the panes for the separator (mirroring
             // the one blank column of a vertical split).
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
-            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
         },
     }
 }
@@ -2559,6 +2984,7 @@ const welcome_tail =
     \\    +                   create a directory
     \\    _                   create a file
     \\    W                   open externally
+    \\    z                   compress / decompress the marked entries
     \\    q / C-g             close the dired
     \\
     \\  Pickers (buffers, bookmarks and recent files):
@@ -3821,6 +4247,33 @@ pub fn main(init: std.process.Init) !void {
     defer dired_copy_query.deinit(gpa);
     var confirming_delete = false;
 
+    // z in dired: compress / decompress the marked entries (Emacs
+    // dired-compress-file, the author's my/dired-compress-transient
+    // simplified). Already-compressed entries are decompressed straight
+    // away; anything else opens a one-key format menu in the modeline,
+    // offering only the tools this platform actually has.
+    var dired_compress_menu = false;
+    var dired_compress_multi = false; // several operands: ask for the archive name
+    var dired_compress_fmt: CompressFmt = .gzip; // the format the archive prompt will run
+    var dired_compress_opds: std.ArrayList([]u8) = .empty;
+    defer {
+        for (dired_compress_opds.items) |p| gpa.free(p);
+        dired_compress_opds.deinit(gpa);
+    }
+    var dired_compress_choices: std.ArrayList(CompressChoice) = .empty;
+    defer dired_compress_choices.deinit(gpa);
+    // The menu's modeline text lives in fixed buffers (like status_buf):
+    // slices into them stay valid until the next keypress.
+    var dired_compress_label_buf: [192]u8 = undefined;
+    var dired_compress_menu_buf: [256]u8 = undefined;
+    var dired_compress_label: []const u8 = &.{};
+    var dired_compress_menu_text: []const u8 = &.{};
+    // Multi-file archive name prompt (the copy prompt's shape): the query
+    // starts prefilled with the directory name plus the format's suffix.
+    var dired_archive_prompt = false;
+    var dired_archive_query: std.ArrayList(u8) = .empty;
+    defer dired_archive_query.deinit(gpa);
+
     // W in dired: confirm opening the selected entry externally. The
     // joined path (and the looked-up handler name, if one was found) is
     // held here until y / n settles the prompt.
@@ -3874,9 +4327,16 @@ pub fn main(init: std.process.Init) !void {
     var replace_match: ?Buffer.Pos = null;
     var replace_count: usize = 0;
 
+    // The first frame renders before the first event: the input thread's
+    // initial winsize event normally triggers the first draw, and if that
+    // thread dies (a terminal it can't negotiate with, say) the screen
+    // must not stay blank forever waiting for an event that never comes —
+    // draw once with the startup size, then events keep the frames coming.
+    var first_frame = true;
     while (true) {
-        const event = try loop.nextEvent();
-        switch (event) {
+        const event: ?Event = if (first_frame) null else try loop.nextEvent();
+        first_frame = false;
+        if (event) |ev| switch (ev) {
             .winsize => |ws| {
                 // Trust the kernel's ioctl size over the reported one: some
                 // terminals emit a stale "CSI 48;...t" in-band report (e.g.
@@ -4456,6 +4916,81 @@ pub fn main(init: std.process.Init) !void {
                         try dired_copy_query.appendSlice(gpa, t);
                     } else {
                         dired_copy_prompt = false;
+                    }
+                } else if (dired_compress_menu) {
+                    // Z's one-key format menu: the letters shown in the
+                    // modeline run the format, C-g / Esc cancels, any
+                    // other key is ignored.
+                    if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        dired_compress_menu = false;
+                    } else if (key.text) |t| {
+                        const ch = t[0];
+                        for (dired_compress_choices.items) |c| {
+                            if (c.key != ch) continue;
+                            dired_compress_menu = false;
+                            if (compressFmtArchives(c.fmt) and dired_compress_multi) {
+                                // Several files: ask for the archive name,
+                                // defaulting to the directory name plus the
+                                // suffix (like the copy prompt's prefill).
+                                dired_compress_fmt = c.fmt;
+                                dired_archive_query.clearRetainingCapacity();
+                                if (direds.items[current]) |*dd| {
+                                    dired_archive_query.appendSlice(gpa, std.fs.path.basename(dd.display_path.items)) catch {};
+                                    dired_archive_query.appendSlice(gpa, compressFmtSuffix(c.fmt)) catch {};
+                                }
+                                dired_archive_prompt = true;
+                            } else {
+                                // One entry: single-file tools compress it
+                                // in place; an archive is named after it
+                                // (foo → foo.tar.gz), sitting beside it.
+                                const out: ?[]u8 = if (compressFmtArchives(c.fmt)) blk: {
+                                    const o = std.fmt.allocPrint(gpa, "{s}{s}", .{ dired_compress_opds.items[0], compressFmtSuffix(c.fmt) }) catch break :blk null;
+                                    break :blk o;
+                                } else null;
+                                defer if (out) |o| gpa.free(o);
+                                const ok = diredCompressRun(io, gpa, c.fmt, dired_compress_opds.items, out);
+                                refreshDired(gpa, io, &buffers, &direds, current);
+                                if (ok) {
+                                    const result = if (out) |o| o else blk: {
+                                        const r = std.fmt.allocPrint(gpa, "{s}{s}", .{ dired_compress_opds.items[0], compressFmtSuffix(c.fmt) }) catch "";
+                                        break :blk r;
+                                    };
+                                    defer if (out == null) gpa.free(result);
+                                    compressStatus(io, &status_msg, &status_buf, result);
+                                } else {
+                                    status_msg = "Compression failed";
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    // Any other key is ignored — stay in the menu.
+                } else if (dired_archive_prompt) {
+                    if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        dired_archive_prompt = false;
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        if (dired_archive_query.items.len > 0) _ = dired_archive_query.pop();
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
+                        const name = std.mem.trim(u8, dired_archive_query.items, " ");
+                        dired_archive_prompt = false;
+                        if (name.len > 0 and direds.items[current] != null) {
+                            const d = &direds.items[current].?;
+                            const out = if (std.fs.path.isAbsolute(name))
+                                try gpa.dupe(u8, name)
+                            else
+                                try std.fs.path.join(gpa, &.{ d.path.items, name });
+                            defer gpa.free(out);
+                            if (diredCompressRun(io, gpa, dired_compress_fmt, dired_compress_opds.items, out)) {
+                                refreshDired(gpa, io, &buffers, &direds, current);
+                                compressStatus(io, &status_msg, &status_buf, out);
+                            } else {
+                                status_msg = "Compression failed";
+                            }
+                        }
+                    } else if (key.text) |t| {
+                        try dired_archive_query.appendSlice(gpa, t);
+                    } else {
+                        dired_archive_prompt = false;
                     }
                 } else if (confirming_delete) {
                     if (key.matches('y', .{}) or key.matches('Y', .{})) {
@@ -5479,6 +6014,71 @@ pub fn main(init: std.process.Init) !void {
                                     confirming_open = true;
                                 }
                             }
+                        } else if (key.matches('z', .{})) {
+                            // z: compress or decompress the marked entries,
+                            // or just the selected one when nothing is
+                            // marked (Emacs dired-compress-file, the
+                            // author's my/dired-compress-transient
+                            // simplified to this platform's tools).
+                            // Entries that already carry a compression
+                            // suffix are decompressed straight away;
+                            // anything else opens the one-key format menu.
+                            var idxs: std.ArrayList(usize) = .empty;
+                            defer idxs.deinit(gpa);
+                            diredOpIndices(gpa, d, &idxs);
+                            if (idxs.items.len > 0) blk: {
+                                for (dired_compress_opds.items) |p| gpa.free(p);
+                                dired_compress_opds.clearRetainingCapacity();
+                                var all_compressed = true;
+                                for (idxs.items) |i| {
+                                    const name = d.entries.items[i].name;
+                                    if (compressedKindOf(name) == null) all_compressed = false;
+                                    const full = std.fs.path.join(gpa, &.{ d.path.items, name }) catch break :blk;
+                                    dired_compress_opds.append(gpa, full) catch {
+                                        gpa.free(full);
+                                        break :blk;
+                                    };
+                                }
+                                if (dired_compress_opds.items.len < idxs.items.len) break :blk;
+                                if (all_compressed) {
+                                    var failed = false;
+                                    for (dired_compress_opds.items) |p| {
+                                        if (!diredDecompressRun(io, gpa, p)) failed = true;
+                                    }
+                                    refreshDired(gpa, io, &buffers, &direds, current);
+                                    if (failed) {
+                                        status_msg = "Decompression failed";
+                                    } else {
+                                        const n = std.fmt.bufPrint(&status_buf, "Decompressed {d} file{s}", .{ dired_compress_opds.items.len, if (dired_compress_opds.items.len == 1) "" else "s" }) catch unreachable;
+                                        status_msg = status_buf[0..n.len];
+                                    }
+                                } else {
+                                    // The menu's formats depend on the
+                                    // target: a single plain file gets the
+                                    // gzip-style tools, a directory or
+                                    // several files the tar-style ones.
+                                    const single_dir = idxs.items.len == 1 and d.entries.items[idxs.items[0]].is_dir;
+                                    dired_compress_multi = idxs.items.len > 1;
+                                    compressChoices(io, gpa, &dired_compress_choices, dired_compress_multi or single_dir);
+                                    if (dired_compress_choices.items.len == 0) {
+                                        status_msg = "No compression tools found";
+                                    } else {
+                                        var names: std.ArrayList(u8) = .empty;
+                                        defer names.deinit(gpa);
+                                        for (dired_compress_opds.items, 0..) |p, i| {
+                                            if (i > 0) names.appendSlice(gpa, ", ") catch {};
+                                            names.appendSlice(gpa, std.fs.path.basename(p)) catch {};
+                                            if (names.items.len > 60) {
+                                                names.appendSlice(gpa, "...") catch {};
+                                                break;
+                                            }
+                                        }
+                                        dired_compress_label = std.fmt.bufPrint(&dired_compress_label_buf, "Compress {s} as: ", .{names.items}) catch "";
+                                        dired_compress_menu_text = compressMenuText(&dired_compress_menu_buf, dired_compress_choices.items);
+                                        dired_compress_menu = true;
+                                    }
+                                }
+                            }
                         } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches('f', .{})) {
                             // Enter / C-j / C-m, or "f" (the dirlst-find-file
                             // key from the Jasspa setup): open the selected
@@ -5913,7 +6513,7 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
             },
-        }
+        };
 
         // Resize anchor: re-check the kernel's ioctl size every frame. A
         // terminal that fails to deliver its resize notification (a missed
@@ -6035,10 +6635,16 @@ pub fn main(init: std.process.Init) !void {
         else
             null;
 
+        const compress_menu_view: ?CompressMenuView = if (dired_compress_menu)
+            .{ .label = dired_compress_label, .choices = dired_compress_menu_text }
+        else
+            null;
+        const archive_query_view: ?[]const u8 = if (dired_archive_prompt) dired_archive_query.items else null;
+
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;
@@ -6181,7 +6787,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal) {
             if (direds.items[current]) |*d| {
                 var modeline_buf: [2048]u8 = undefined;
-                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, dired_prompt_view, status_msg);
+                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg);
                 try vx.render(tty.writer());
                 frame_allocs.reset();
                 continue;
