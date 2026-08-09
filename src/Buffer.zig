@@ -791,6 +791,41 @@ fn lastIndexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
+/// How many times `query` occurs in the buffer — case-insensitive (ASCII),
+/// counting one match per line without crossing a line boundary, exactly
+/// like findNext. The total for isearch's lazy count (Emacs
+/// isearch-lazy-count).
+pub fn matchCount(self: Buffer, query: []const u8) usize {
+    var n: usize = 0;
+    if (query.len == 0) return 0;
+    for (self.lines.items) |line| {
+        var col: usize = 0;
+        while (std.ascii.findIgnoreCasePos(line.items, col, query)) |c| {
+            n += 1;
+            col = c + query.len;
+        }
+    }
+    return n;
+}
+
+/// The 1-based position of `at` among the buffer's matches of `query`, in
+/// buffer order (row, then column) — the "current" half of isearch's lazy
+/// count. `at` must be a match start, as findNext returns.
+pub fn matchIndex(self: Buffer, query: []const u8, at: Pos) usize {
+    var n: usize = 0;
+    if (query.len == 0) return 0;
+    for (self.lines.items, 0..) |line, row| {
+        if (row > at.row) break;
+        var col: usize = 0;
+        while (std.ascii.findIgnoreCasePos(line.items, col, query)) |c| {
+            if (row == at.row and c >= at.col) return n + 1;
+            n += 1;
+            col = c + query.len;
+        }
+    }
+    return n;
+}
+
 /// Find the next occurrence of `query` from `from`, wrapping around the
 /// buffer if needed. Search never crosses a line boundary within a single
 /// match. Returns the position of the start of the match.

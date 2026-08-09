@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.54.0 — <2026-08-09>
+
+Isearch shows how far you are: =I-search: term (3/12)= on the modeline.
+
+- While searching (=C-s= / =C-r=), the modeline's search prompt trails the query with the lazy count — the current match's 1-based position and the query's total, the =(%s/%s)= format of Emacs's isearch-lazy-count: =I-search: todo (3/12)= means the third of twelve =todo= matches. In a file buffer the count covers the whole buffer; in a dired, the entry names (the search's own mirror); in the pickers, the visible rows. A failing search shows =(0/0)=; an empty query shows no count yet. The count is recomputed once per search keystroke, not on every frame, so a slow render never slows the search.
+
 ** 0.53.0 — <2026-08-09>
 
 Dired =w= copies file names to the kill ring, and =0 w= the absolute paths.

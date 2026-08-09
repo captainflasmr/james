@@ -468,6 +468,11 @@ const IsearchView = struct {
     match: ?Buffer.Pos,
     query: []const u8,
     backward: bool,
+    /// isearch-lazy-count: the 1-based position of the current match and
+    /// the total number of matches for the query, shown as (N/M) in the
+    /// modeline while searching.
+    count: usize,
+    pos: usize,
 };
 
 const DiredPromptKind = enum { copy, rename, delete, create_dir, create_file, open };
@@ -532,6 +537,15 @@ fn fillPromptModeline(out: []u8, comptime label_fmt: []const u8, label_args: any
     const label = std.fmt.bufPrint(out, label_fmt, label_args) catch return .{ .len = 0, .label_len = 0 };
     const tail = std.fmt.bufPrint(out[label.len..], "{s}", .{query}) catch return .{ .len = label.len, .label_len = label.len };
     return .{ .len = label.len + tail.len, .label_len = label.len };
+}
+
+/// The isearch lazy-count suffix — " (3/12)" — formatted into `buf`, the
+/// twin of Emacs's isearch-lazy-count (%s/%s): the current match's
+/// position and the query's total, shown after the query while searching.
+/// Empty when the query is empty (a count has nothing to say yet).
+fn isearchCountSuffix(buf: []u8, query: []const u8, pos: usize, count: usize) []const u8 {
+    if (query.len == 0) return "";
+    return std.fmt.bufPrint(buf, " ({d}/{d})", .{ pos, count }) catch "";
 }
 
 /// Print a full-width modeline bar: the row in `buf` padded with spaces
@@ -646,7 +660,16 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
             (if (s.backward) "Failing I-search backward" else "Failing I-search")
         else
             (if (s.backward) "I-search backward" else "I-search");
-        break :blk fillPromptModeline(modeline_buf, "{s}: ", .{label}, s.query);
+        // The lazy count ("I-search: term (3/12)", like Emacs) trails the
+        // query in the same plain style.
+        var count_buf: [32]u8 = undefined;
+        const suffix = isearchCountSuffix(&count_buf, s.query, s.pos, s.count);
+        var query_buf: [2048]u8 = undefined;
+        const query_with_count = if (suffix.len > 0)
+            (std.fmt.bufPrint(&query_buf, "{s}{s}", .{ s.query, suffix }) catch s.query)
+        else
+            s.query;
+        break :blk fillPromptModeline(modeline_buf, "{s}: ", .{label}, query_with_count);
     } else if (status) |m| blk: {
         const n = std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch break :blk .{ .len = 0, .label_len = 0 };
         break :blk .{ .len = n.len, .label_len = 0 };
@@ -2157,7 +2180,16 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
             (if (s.backward) "Failing I-search backward" else "Failing I-search")
         else
             (if (s.backward) "I-search backward" else "I-search");
-        break :blk fillPromptModeline(modeline_buf, "{s}: ", .{label}, s.query);
+        // The lazy count ("I-search: term (3/12)", like Emacs) trails the
+        // query in the same plain style.
+        var count_buf: [32]u8 = undefined;
+        const suffix = isearchCountSuffix(&count_buf, s.query, s.pos, s.count);
+        var query_buf: [2048]u8 = undefined;
+        const query_with_count = if (suffix.len > 0)
+            (std.fmt.bufPrint(&query_buf, "{s}{s}", .{ s.query, suffix }) catch s.query)
+        else
+            s.query;
+        break :blk fillPromptModeline(modeline_buf, "{s}: ", .{label}, query_with_count);
     } else if (dired_prompt) |p| blk: {
         const is_dir = dired.selected < dired.entries.items.len and dired.entries.items[dired.selected].is_dir;
         const name = if (dired.selected < dired.entries.items.len) dired.entries.items[dired.selected].name else "";
@@ -2717,6 +2749,50 @@ fn pickerFindNext(
         i = if (forward) (i + 1) % count else (i + count - 1) % count;
     }
     return null;
+}
+
+/// How many of `visible`'s rows contain `query` — the lazy-count total for
+/// list isearch, matching rows the same way pickerFindNext does
+/// (case-insensitive substring of the row's text).
+fn pickerMatchCount(
+    kind: PickerKind,
+    buffers: []*Buffer,
+    bookmarks: []const Bookmark,
+    recent: []const []const u8,
+    visible: []const usize,
+    query: []const u8,
+) usize {
+    var n: usize = 0;
+    if (query.len == 0) return 0;
+    for (visible) |full| {
+        const row_text = pickerRowName(kind, buffers, bookmarks, recent, full);
+        if (std.ascii.indexOfIgnoreCase(row_text, query) != null) n += 1;
+    }
+    return n;
+}
+
+/// The 1-based position of `match_row` among `visible`'s rows containing
+/// `query`, in list order — the "current" half of the list-isearch lazy
+/// count.
+fn pickerMatchIndex(
+    kind: PickerKind,
+    buffers: []*Buffer,
+    bookmarks: []const Bookmark,
+    recent: []const []const u8,
+    visible: []const usize,
+    query: []const u8,
+    match_row: usize,
+) usize {
+    var n: usize = 0;
+    if (query.len == 0) return 0;
+    for (visible) |full| {
+        const row_text = pickerRowName(kind, buffers, bookmarks, recent, full);
+        if (std.ascii.indexOfIgnoreCase(row_text, query) != null) {
+            n += 1;
+            if (full == match_row) return n;
+        }
+    }
+    return n;
 }
 
 /// Fuzzy-match `query` against `text`: a case-insensitive subsequence
@@ -3695,6 +3771,11 @@ pub fn main(init: std.process.Init) !void {
     var isearch_origin: Buffer.Pos = .{ .row = 0, .col = 0 };
     var isearch_match: ?Buffer.Pos = null;
     var isearch_failed = false;
+    // isearch-lazy-count (Emacs): the current match's 1-based position and
+    // the query's total match count, shown as (N/M) in the modeline while
+    // searching. Recomputed on every isearch keystroke.
+    var isearch_count: usize = 0;
+    var isearch_pos: usize = 0;
 
     while (true) {
         const event = try loop.nextEvent();
@@ -4351,6 +4432,26 @@ pub fn main(init: std.process.Init) !void {
                         } else {
                             isearch_active = false;
                         }
+                    }
+                    // isearch-lazy-count: recompute the match position and
+                    // total for the modeline's (N/M) — a full scan once per
+                    // search keystroke, like Emacs. The buffer search runs
+                    // over the buffer's own lines (the dired mirror
+                    // included); the list search over the picker's rows.
+                    if (isearch_active and isearch_query.items.len > 0) {
+                        if (picker_kind) |kind| {
+                            isearch_count = pickerMatchCount(kind, buffers.items, bookmarks.items, recent.items, picker_visible.items, isearch_query.items);
+                            isearch_pos = if (isearch_match) |m|
+                                pickerMatchIndex(kind, buffers.items, bookmarks.items, recent.items, picker_visible.items, isearch_query.items, m.row)
+                            else
+                                0;
+                        } else {
+                            isearch_count = buf.matchCount(isearch_query.items);
+                            isearch_pos = if (isearch_match) |m| buf.matchIndex(isearch_query.items, m) else 0;
+                        }
+                    } else {
+                        isearch_count = 0;
+                        isearch_pos = 0;
                     }
                 } else if (picker_kind) |kind| {
                     // C-g (or Esc): clear the filter first; a second one
@@ -5586,7 +5687,7 @@ pub fn main(init: std.process.Init) !void {
         const is_modal = confirming_quit or confirming_kill or picker_kind != null;
 
         const search_view: ?IsearchView = if (isearch_active)
-            .{ .failed = isearch_failed, .match = isearch_match, .query = isearch_query.items, .backward = isearch_dir == .backward }
+            .{ .failed = isearch_failed, .match = isearch_match, .query = isearch_query.items, .backward = isearch_dir == .backward, .count = isearch_count, .pos = isearch_pos }
         else
             null;
 
@@ -5755,7 +5856,16 @@ pub fn main(init: std.process.Init) !void {
                     (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")
                 else
                     (if (isearch_dir == .backward) "I-search backward" else "I-search");
-                const ml = fillPromptModeline(&list_ml_buf, "{s}: ", .{search_label}, isearch_query.items);
+                // The lazy count ("I-search: term (3/12)", like Emacs)
+                // trails the query in the same plain style.
+                var count_buf: [32]u8 = undefined;
+                const suffix = isearchCountSuffix(&count_buf, isearch_query.items, isearch_pos, isearch_count);
+                var query_buf: [2048]u8 = undefined;
+                const query_with_count = if (suffix.len > 0)
+                    (std.fmt.bufPrint(&query_buf, "{s}{s}", .{ isearch_query.items, suffix }) catch isearch_query.items)
+                else
+                    isearch_query.items;
+                const ml = fillPromptModeline(&list_ml_buf, "{s}: ", .{search_label}, query_with_count);
                 _ = body.printSegment(.{ .text = list_ml_buf[0..ml.label_len], .style = .{ .bold = true } }, .{ .row_offset = body.height -| 1 });
                 if (ml.label_len < ml.len) {
                     _ = body.printSegment(.{ .text = list_ml_buf[ml.label_len..ml.len], .style = .{} }, .{ .row_offset = body.height -| 1, .col_offset = body.gwidth(list_ml_buf[0..ml.label_len]) });
@@ -5882,7 +5992,15 @@ pub fn main(init: std.process.Init) !void {
                 (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")
             else
                 (if (isearch_dir == .backward) "I-search backward" else "I-search");
-            break :blk fillPromptModeline(&modeline_buf, "{s}: ", .{label}, isearch_query.items);
+            // The lazy count ("I-search: term (3/12)", like Emacs) trails
+            // the query in the same plain style.
+            const suffix = isearchCountSuffix(&count_buf, isearch_query.items, isearch_pos, isearch_count);
+            var query_buf: [2048]u8 = undefined;
+            const query_with_count = if (suffix.len > 0)
+                (std.fmt.bufPrint(&query_buf, "{s}{s}", .{ isearch_query.items, suffix }) catch isearch_query.items)
+            else
+                isearch_query.items;
+            break :blk fillPromptModeline(&modeline_buf, "{s}: ", .{label}, query_with_count);
         } else blk: {
             // The results buffers show their position and keys in the
             // modeline instead of the L:C readout.

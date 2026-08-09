@@ -54,8 +54,10 @@ TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =to
 - Emacs: =my/kill-ring-save= flashes the copied text; james already has the transient highlight from grep jumps — reuse it for =M-w= / =C-c w=.
 ** TODO M-h mark block
 - Emacs: =my/mark-block= — mark the text between surrounding blank lines. Trivial in james (scan rows, set mark).
-** TODO Isearch lazy count
+** DONE Isearch lazy count
 - Emacs: =isearch-lazy-count= with the =(%s/%s)= format; show match position / total in the modeline while searching.
+- Done in 0.54.0: while searching, the modeline's =I-search:= prompt trails the query with = (N/M)= — the current match's 1-based position and the query's total, like Emacs's isearch-lazy-count. In buffers and direds the count covers the buffer's lines (the dired mirror included); in the pickers, the visible rows. A failing search shows =(0/0)=, and an empty query shows no count. The count is recomputed once per search keystroke, not per frame.
+- Effort: small.
 ** TODO Dired duplicate file and trash delete
 - Emacs: =my/dired-duplicate-file= (=_NNN= incremented names, async) and =my/dired-async-do-delete= (trash instead of =D='s hard delete, with a confirm prompt like james's existing y/n).
 
