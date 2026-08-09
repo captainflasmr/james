@@ -492,9 +492,9 @@ const ReplaceView = struct {
 
 /// Sticky keys / repeat-mode (Emacs windmove-repeat-map, the author's
 /// my/repeat-history): after C-c j / C-c k the plain j / k keep stepping
-/// window history, and after M-n / M-p the plain n / p keep moving
-/// between windows. The map stays armed while a repeat key is pressed;
-/// any other key clears it and acts normally.
+/// window history, and after M-n / M-p / C-x o the plain n / p / o keep
+/// moving between windows. The map stays armed while a repeat key is
+/// pressed; any other key clears it and acts normally.
 const RepeatMap = enum { window_history, window_move };
 
 const DiredPromptKind = enum { copy, rename, delete, create_dir, create_file, open };
@@ -3045,7 +3045,7 @@ const welcome_tail =
     \\    C-x 1               one window
     \\    C-x 0               delete the focused window
     \\    C-x +               balance the windows
-    \\    C-x o               move to the next window
+    \\    C-x o               move to the next window (n / p / o repeat)
     \\    C-x j / C-x c       drop to a shell (C-z suspends, C-x j resumes)
     \\    C-x r m             set a bookmark at point
     \\    C-x r b             jump to a bookmark
@@ -3080,7 +3080,7 @@ const welcome_tail =
     \\
     \\    M-1 .. M-9          select a tab by number
     \\    M-i / M-u           next / previous tab
-    \\    M-n / M-p           next / previous window (n / p repeat)
+    \\    M-n / M-p           next / previous window (n / p / o repeat)
     \\    M-; / M-m           split below / to the right
     \\    M-q / M-'           delete the window
     \\    M-a                 one window
@@ -4578,8 +4578,10 @@ pub fn main(init: std.process.Init) !void {
                         }
                         break :key_blk;
                     }
-                    if (rm == .window_move and (key.matches('n', .{}) or key.matches('p', .{}))) {
-                        if (moveFocus(root, focused, if (key.matches('n', .{})) 1 else -1)) |nf| {
+                    if (rm == .window_move and (key.matches('n', .{}) or key.matches('p', .{}) or key.matches('o', .{}))) {
+                        // o repeats the forward step like M-n (Emacs's
+                        // other-window-repeat-map); n / p move either way.
+                        if (moveFocus(root, focused, if (key.matches('p', .{})) -1 else 1)) |nf| {
                             focused = nf;
                             current = focused.buf_idx;
                         }
@@ -5667,10 +5669,13 @@ pub fn main(init: std.process.Init) !void {
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         root.balance();
                     } else if (key.matches('o', .{})) {
+                        // C-x o: move to the next window. Sticky: the plain
+                        // n / p repeat (see RepeatMap), like M-n / M-p.
                         if (moveFocus(root, focused, 1)) |nf| {
                             focused = nf;
                             current = focused.buf_idx;
                         }
+                        repeat_map = .window_move;
                     } else if (key.matches('j', .{}) or key.matches('c', .{})) {
                         // C-x j / C-x c: drop out of the editor into a real
                         // shell on the terminal. The shell takes over the
