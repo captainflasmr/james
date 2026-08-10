@@ -6,6 +6,11 @@ lines: std.ArrayList(std.ArrayList(u8)),
 cursor_row: usize = 0,
 cursor_col: usize = 0,
 top_line: usize = 0,
+/// Horizontal scroll offset in display columns, for truncated
+/// (soft-wrap-off) lines: how far the view has scrolled right so the
+/// cursor stays on screen at the end of a wide line. Soft-wrapped
+/// lines never scroll horizontally, so this stays 0.
+hscroll: usize = 0,
 filename: ?[]const u8 = null,
 /// Name shown in the modeline for buffers with no real file (e.g. the
 /// home screen), since there's nothing to visit.
@@ -28,6 +33,12 @@ undo_group: UndoKind = .none,
     /// visual-line-mode); when off they truncate and movement steps
     /// logical lines (Emacs toggle-truncate-lines).
     soft_wrap: bool = true,
+    /// C-x l toggles scroll lock (Emacs scroll-lock-mode, the same
+    /// binding): the cursor stays on its locked screen row while the
+    /// text scrolls under it, up to the ends of the buffer.
+    scroll_lock: bool = false,
+    /// The screen row the cursor is locked to while scroll_lock is on.
+    scroll_row: usize = 0,
 
 pub const Pos = struct { row: usize, col: usize };
 pub const Region = struct { start: Pos, end: Pos };

@@ -62,6 +62,7 @@ Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes 
 | =C-x d= / =C-x m= | open directory browser (dired) |
 | =C-x g= | re-read the file from disk, discarding in-memory changes |
 | =C-x h= | select the whole buffer (mark at start, point at end) |
+| =C-x l= | toggle scroll lock: the cursor stays on its screen row while the text scrolls under it (Emacs =scroll-lock-mode=) |
 | =C-x r m= | bookmark the current position (name prompt, defaults to the file name; persisted to =~/.james-bookmarks=, =%USERPROFILE%\.james-bookmarks= on Windows) |
 | =C-x r b= | jump to a bookmark |
 | =C-x r l= / =C-c o= | list bookmarks (type to filter, C-s searches, Enter/C-m jumps, arrows move, C-g/Esc closes) |

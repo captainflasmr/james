@@ -246,6 +246,25 @@ fn byteAtVisualCol(line: []const u8, start: usize, target: usize, width: usize, 
     return line.len;
 }
 
+/// The byte offset in `line` of the first grapheme at or after display
+/// column `target` — the cut where a horizontally scrolled view starts
+/// drawing (the hscroll offset). Unlike byteAtVisualCol there is no
+/// width clamp: the scroll can reach past one windowful. Tabs are
+/// already expanded in the caller's line, so the columns count straight
+/// graphemes.
+fn byteAtColumn(line: []const u8, target: usize, method: vaxis.gwidth.Method) usize {
+    var vis_col: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(line);
+    while (it.next()) |g| {
+        const s = g.bytes(line);
+        const w = vaxis.gwidth.gwidth(s, method);
+        if (w == 0) continue;
+        if (vis_col + w > target) return g.start;
+        vis_col += w;
+    }
+    return line.len;
+}
+
 /// Heap allocations made while rendering one frame (the tab expansions):
 /// vaxis keeps grapheme slices of printed text until the frame renders,
 /// so the expansions must outlive the print calls; they're freed after
@@ -415,9 +434,39 @@ fn visualRowOfCursor(buf: *const Buffer, top: usize, width: usize, method: vaxis
 }
 
 /// Keep the cursor's visual row within [0, height): raise top_line while
-/// the cursor's wrapped line falls below the window's bottom.
+/// the cursor's wrapped line falls below the window's bottom. With scroll
+/// lock on (C-x l) the cursor instead stays on its locked screen row — the
+/// text scrolls under it (Emacs scroll-lock-mode) — up to the ends of the
+/// buffer.
 fn scrollToCursorVisual(buf: *Buffer, height: usize, width: usize, method: vaxis.gwidth.Method) void {
     if (height == 0) return;
+    if (buf.scroll_lock) {
+        // The smallest top_line whose cursor visual row is still at or
+        // above the locked row, clamped to the last screenful so the
+        // window never runs past the end of the buffer. visualRowOfCursor
+        // falls as top_line rises, so the predicate is monotone and the
+        // binary search is exact.
+        const max_top = buf.lines.items.len -| height;
+        var lo: usize = 0;
+        var hi = max_top;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (visualRowOfCursor(buf, mid, width, method) <= buf.scroll_row) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        buf.top_line = lo;
+        // At the ends of the buffer (or on a line wrapped taller than the
+        // window) the locked row is unreachable and the search leaves the
+        // cursor where the text can go; if that is off the bottom of the
+        // window, bring it back like a plain scroll.
+        if (visualRowOfCursor(buf, buf.top_line, width, method) >= height) {
+            buf.top_line = @min(buf.cursor_row -| (height - 1), max_top);
+        }
+        return;
+    }
     if (buf.cursor_row < buf.top_line) {
         buf.top_line = buf.cursor_row;
         return;
@@ -441,8 +490,32 @@ fn scrollToCursorVisual(buf: *Buffer, height: usize, width: usize, method: vaxis
     buf.top_line = lo;
 }
 
-/// C-l: recenter the window on the cursor's visual line, cycling middle →
-/// top → bottom like Emacs recenter-top-bottom.
+/// Keep the cursor's display column within [hscroll, hscroll + width) —
+/// the horizontal twin of scrollToCursorVisual, for truncated
+/// (soft-wrap-off) lines. The view scrolls right as the cursor walks
+/// past the pane edge, so C-e lands the cursor at the right edge with
+/// the line's tail on screen, and back left when the cursor returns to
+/// earlier columns. Soft-wrapped lines never scroll horizontally.
+fn scrollToCursorHorizontal(buf: *Buffer, width: usize, method: vaxis.gwidth.Method) void {
+    if (width == 0 or buf.soft_wrap) return;
+    const cv = cursorVisual(buf, width, method);
+    if (cv.col < buf.hscroll) {
+        buf.hscroll = cv.col;
+    } else if (cv.col >= buf.hscroll + width) {
+        buf.hscroll = cv.col - width + 1;
+    }
+    // A line that fits in the window starts at the left edge — don't
+    // leave the view scrolled past it (the cursor at the very end of a
+    // line sits one column past its last character, so keep that one
+    // spot even if it shows a blank column after the text).
+    const line = buf.lines.items[buf.cursor_row].items;
+    const line_width = tabAwareWidth(line, 0, line.len, method);
+    const clamped = @min(buf.hscroll, line_width -| width);
+    if (cv.col -| clamped < width) buf.hscroll = clamped;
+}
+
+/// C-l: recenter the window on the cursor's visual line, cycling middle
+/// → top → bottom like Emacs recenter-top-bottom.
 fn recenterVisual(buf: *Buffer, height: usize, width: usize, method: vaxis.gwidth.Method, cycling: bool) void {
     if (height == 0) return;
     const pos: u8 = if (cycling) (buf.recenter_pos + 1) % 3 else 0;
@@ -455,6 +528,11 @@ fn recenterVisual(buf: *Buffer, height: usize, width: usize, method: vaxis.gwidt
         }
     }
     buf.top_line = tl;
+    // C-l with scroll lock on re-anchors the lock to the recentered row,
+    // so the next movement keeps the cursor where C-l put it.
+    if (buf.scroll_lock) {
+        buf.scroll_row = @min(visualRowOfCursor(buf, tl, width, method), height - 1);
+    }
 }
 
 /// Switch to the buffer visiting `path` if one is already open, otherwise
@@ -672,6 +750,7 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
     const text_height: usize = if (height > 1) height - 1 else height;
     const method = win.screen.width_method;
     scrollToCursorVisual(buf, text_height, win.width, method);
+    scrollToCursorHorizontal(buf, win.width, method);
 
     const searching = search != null;
     const match: ?Buffer.Pos = if (search) |s| (if (s.failed) null else s.match) else null;
@@ -726,10 +805,25 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
         } else {
             // Soft wrap off (M-z): the line truncates at the pane edge —
             // each segment is clipped to the remaining width, one row.
+            // The view scrolls right with the cursor (Buffer.hscroll),
+            // so the tail of a wide line — and the cursor on it — stays
+            // on screen.
             var col: u16 = 0;
+            var seg_off: usize = 0;
+            const skip = if (buf.hscroll > 0) byteAtColumn(line, buf.hscroll, method) else 0;
             for (segs) |seg| {
                 if (col >= win.width) break;
-                const clipped = clipToWidth(seg.text, win.width - col, method);
+                // Cut the segment at the scroll boundary: the segments
+                // tile the line in byte order, so a running offset picks
+                // out the part after the scrolled-off columns.
+                const rest = if (seg_off < skip)
+                    seg.text[@min(skip - seg_off, seg.text.len)..]
+                else
+                    seg.text;
+                seg_off += seg.text.len;
+                if (rest.len == 0) continue;
+                const clipped = clipToWidth(rest, win.width - col, method);
+                if (clipped.len == 0) continue;
                 _ = win.printSegment(.{ .text = clipped, .style = seg.style }, .{ .row_offset = row_base + row, .col_offset = col });
                 col += win.gwidth(clipped);
             }
@@ -778,12 +872,13 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
         // modeline instead of the L:C readout.
         if (grep_view) |gv| {
             if (buf == gv.buf) {
-                const n = std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}   (n/p move, Enter opens, F follows, g rerun, q close)", .{
+                const n = std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}{s}   (n/p move, Enter opens, F follows, g rerun, q close)", .{
                     gv.buf.display_name orelse "?",
                     if (gv.follow) " [follow]" else "",
                     buf.cursor_row + 1,
                     gv.count,
                     if (!buf.soft_wrap) " [truncate]" else "",
+                    if (buf.scroll_lock) " [scroll-lock]" else "",
                 }) catch break :blk .{ .len = 0, .label_len = 0 };
                 break :blk .{ .len = n.len, .label_len = 0 };
             }
@@ -791,38 +886,41 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
         if (files_view) |fv| {
             if (buf == fv.buf) {
                 const n = if (fv.filter.len > 0)
-                    std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}   filter: {s}   (C-g/Esc clears, Enter opens, F follows, g rerun)", .{
+                    std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}{s}   filter: {s}   (C-g/Esc clears, Enter opens, F follows, g rerun)", .{
                         fv.buf.display_name orelse "?",
                         if (fv.follow) " [follow]" else "",
                         buf.cursor_row + 1,
                         fv.count,
                         if (!buf.soft_wrap) " [truncate]" else "",
+                        if (buf.scroll_lock) " [scroll-lock]" else "",
                         fv.filter,
                     }) catch break :blk .{ .len = 0, .label_len = 0 }
                 else
-                    std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}   (type to filter, C-s searches, Enter opens, F follows, g rerun, C-g/Esc closes)", .{
+                    std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}{s}   (type to filter, C-s searches, Enter opens, F follows, g rerun, C-g/Esc closes)", .{
                         fv.buf.display_name orelse "?",
                         if (fv.follow) " [follow]" else "",
                         buf.cursor_row + 1,
                         fv.count,
                         if (!buf.soft_wrap) " [truncate]" else "",
+                        if (buf.scroll_lock) " [scroll-lock]" else "",
                     }) catch break :blk .{ .len = 0, .label_len = 0 };
                 break :blk .{ .len = n.len, .label_len = 0 };
             }
         }
         if (occur_view) |ov| {
             if (buf == ov.buf) {
-                const n = std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}   (n/p move, Enter jumps, F follows, g rerun, q close)", .{
+                const n = std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}{s}   (n/p move, Enter jumps, F follows, g rerun, q close)", .{
                     ov.buf.display_name orelse "?",
                     if (ov.follow) " [follow]" else "",
                     buf.cursor_row + 1,
                     ov.count,
                     if (!buf.soft_wrap) " [truncate]" else "",
+                    if (buf.scroll_lock) " [scroll-lock]" else "",
                 }) catch break :blk .{ .len = 0, .label_len = 0 };
                 break :blk .{ .len = n.len, .label_len = 0 };
             }
         }
-        const n = std.fmt.bufPrint(modeline_buf, "{s}{s}{s}{s}  L{d}:C{d}", .{
+        const n = std.fmt.bufPrint(modeline_buf, "{s}{s}{s}{s}{s}  L{d}:C{d}", .{
             // Emacs-style modified marker in the bottom-left corner of the
             // modeline.
             if (buf.dirty) "*" else "",
@@ -831,6 +929,10 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
             // M-z: soft wrap off (truncated lines) shows like Emacs's
             // Truncate mode-line marker; its absence means wrap is on.
             if (!buf.soft_wrap) " [truncate]" else "",
+            // C-x l: scroll lock shows like Emacs's Scroll-Lock
+            // mode-line marker; its absence means the cursor scrolls
+            // with the text.
+            if (buf.scroll_lock) " [scroll-lock]" else "",
             buf.cursor_row + 1,
             buf.cursor_col + 1,
         }) catch break :blk .{ .len = 0, .label_len = 0 };
@@ -850,7 +952,9 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
         // The cursor sits on the cursor's visual line, at its display
         // column within that wrapped segment — past the number column.
         const cv = cursorVisual(buf, win.width, method);
-        win.showCursor(@intCast(cv.col), @intCast(visualRowOfCursor(buf, buf.top_line, win.width, method)));
+        // In truncate mode the view may have scrolled right (hscroll), so
+        // the cursor's display column counts from the scrolled edge.
+        win.showCursor(@intCast(if (buf.soft_wrap) cv.col else cv.col -| buf.hscroll), @intCast(visualRowOfCursor(buf, buf.top_line, win.width, method)));
     }
 }
 
@@ -3039,6 +3143,7 @@ const welcome_tail =
     \\    C-x C-f             open or create a file
     \\    C-x g               re-read the file from disk
     \\    C-x h               mark the whole buffer
+    \\    C-x l               toggle scroll lock (cursor stays put, text scrolls)
     \\    C-x C-k             kill the region
     \\    C-x d / C-x m       browse the file's directory
     \\    C-x 2 / C-x 3       split the window (below / to the right)
@@ -5641,6 +5746,19 @@ pub fn main(init: std.process.Init) !void {
                         buf.moveBufStart();
                         buf.setMark();
                         buf.moveBufEnd();
+                    } else if (key.matches('l', .{})) {
+                        // C-x l: toggle scroll lock (Emacs
+                        // scroll-lock-mode, the same binding). On, the
+                        // cursor stays on its current screen row and the
+                        // text scrolls under it; the modeline's
+                        // [scroll-lock] shows the state. The buffer
+                        // remembers its own setting.
+                        if (buf.scroll_lock) {
+                            buf.scroll_lock = false;
+                        } else {
+                            buf.scroll_lock = true;
+                            buf.scroll_row = visualRowOfCursor(buf, buf.top_line, focused_text_width, vx.screen.width_method);
+                        }
                     } else if (key.matches('k', .{ .ctrl = true })) {
                         try buf.killRegion(gpa, &kill_ring, kill_active);
                         syncClipboard(&vx, &tty, gpa, kill_ring.current() orelse "");
@@ -7063,6 +7181,7 @@ pub fn main(init: std.process.Init) !void {
         // it does in a file buffer. isearch is handled natively above.
 
         scrollToCursorVisual(buf, text_height, body.width, vx.screen.width_method);
+        scrollToCursorHorizontal(buf, body.width, vx.screen.width_method);
         var row: u16 = 0;
         var i = buf.top_line;
         while (i < buf.lines.items.len and row < text_height) : (i += 1) {
@@ -7104,11 +7223,21 @@ pub fn main(init: std.process.Init) !void {
                 _ = body.print(segs, .{ .row_offset = row });
             } else {
                 // Soft wrap off (M-z): the line truncates at the window
-                // edge (see renderPane).
+                // edge, scrolled right with the cursor when it walks past
+                // the edge (see renderPane).
                 var col: u16 = 0;
+                var seg_off: usize = 0;
+                const skip = if (buf.hscroll > 0) byteAtColumn(line, buf.hscroll, vx.screen.width_method) else 0;
                 for (segs) |seg| {
                     if (col >= body.width) break;
-                    const clipped = clipToWidth(seg.text, body.width - col, vx.screen.width_method);
+                    const rest = if (seg_off < skip)
+                        seg.text[@min(skip - seg_off, seg.text.len)..]
+                    else
+                        seg.text;
+                    seg_off += seg.text.len;
+                    if (rest.len == 0) continue;
+                    const clipped = clipToWidth(rest, body.width - col, vx.screen.width_method);
+                    if (clipped.len == 0) continue;
                     _ = body.printSegment(.{ .text = clipped, .style = seg.style }, .{ .row_offset = row, .col_offset = col });
                     col += body.gwidth(clipped);
                 }
@@ -7167,12 +7296,13 @@ pub fn main(init: std.process.Init) !void {
             // modeline instead of the L:C readout.
             if (grep_view) |gv| {
                 if (buf == gv.buf) {
-                    const n = std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}   (n/p move, Enter opens, F follows, g rerun, q close) --", .{
+                    const n = std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}{s}   (n/p move, Enter opens, F follows, g rerun, q close) --", .{
                         gv.buf.display_name orelse "?",
                         if (gv.follow) " [follow]" else "",
                         buf.cursor_row + 1,
                         gv.count,
                         if (!buf.soft_wrap) " [truncate]" else "",
+                    if (buf.scroll_lock) " [scroll-lock]" else "",
                     }) catch break :blk .{ .len = 0, .label_len = 0 };
                     break :blk .{ .len = n.len, .label_len = 0 };
                 }
@@ -7180,33 +7310,36 @@ pub fn main(init: std.process.Init) !void {
             if (files_view) |fv| {
                 if (buf == fv.buf) {
                     const n = if (fv.filter.len > 0)
-                        std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}   filter: {s}   (C-g/Esc clears, Enter opens, F follows, g rerun) --", .{
+                        std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}{s}   filter: {s}   (C-g/Esc clears, Enter opens, F follows, g rerun) --", .{
                             fv.buf.display_name orelse "?",
                             if (fv.follow) " [follow]" else "",
                             buf.cursor_row + 1,
                             fv.count,
                             if (!buf.soft_wrap) " [truncate]" else "",
+                            if (buf.scroll_lock) " [scroll-lock]" else "",
                             fv.filter,
                         }) catch break :blk .{ .len = 0, .label_len = 0 }
                     else
-                        std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}   (type to filter, C-s searches, Enter opens, F follows, g rerun, C-g/Esc closes) --", .{
+                        std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}{s}   (type to filter, C-s searches, Enter opens, F follows, g rerun, C-g/Esc closes) --", .{
                             fv.buf.display_name orelse "?",
                             if (fv.follow) " [follow]" else "",
                             buf.cursor_row + 1,
                             fv.count,
                             if (!buf.soft_wrap) " [truncate]" else "",
+                            if (buf.scroll_lock) " [scroll-lock]" else "",
                         }) catch break :blk .{ .len = 0, .label_len = 0 };
                     break :blk .{ .len = n.len, .label_len = 0 };
                 }
             }
             if (occur_view) |ov| {
                 if (buf == ov.buf) {
-                    const n = std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}   (n/p move, Enter jumps, F follows, g rerun, q close) --", .{
+                    const n = std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}{s}   (n/p move, Enter jumps, F follows, g rerun, q close) --", .{
                         ov.buf.display_name orelse "?",
                         if (ov.follow) " [follow]" else "",
                         buf.cursor_row + 1,
                         ov.count,
                         if (!buf.soft_wrap) " [truncate]" else "",
+                    if (buf.scroll_lock) " [scroll-lock]" else "",
                     }) catch break :blk .{ .len = 0, .label_len = 0 };
                     break :blk .{ .len = n.len, .label_len = 0 };
                 }
@@ -7215,7 +7348,7 @@ pub fn main(init: std.process.Init) !void {
                 (std.fmt.bufPrint(&count_buf, "  ({d}/{d})", .{ current + 1, buffers.items.len }) catch "")
             else
                 "";
-            const n = std.fmt.bufPrint(&modeline_buf, "{s}-- {s}{s}{s}{s}{s}  L{d}:C{d} --", .{
+            const n = std.fmt.bufPrint(&modeline_buf, "{s}-- {s}{s}{s}{s}{s}{s}  L{d}:C{d} --", .{
                 // Emacs-style modified marker in the bottom-left corner of
                 // the modeline.
                 if (buf.dirty) "*" else "",
@@ -7225,6 +7358,10 @@ pub fn main(init: std.process.Init) !void {
                 // M-z: soft wrap off (truncated lines) shows like Emacs's
                 // Truncate mode-line marker; its absence means wrap is on.
                 if (!buf.soft_wrap) " [truncate]" else "",
+                // C-x l: scroll lock shows like Emacs's Scroll-Lock
+                // mode-line marker; its absence means the cursor scrolls
+                // with the text.
+                if (buf.scroll_lock) " [scroll-lock]" else "",
                 buf_count,
                 buf.cursor_row + 1,
                 buf.cursor_col + 1,
@@ -7238,7 +7375,7 @@ pub fn main(init: std.process.Init) !void {
 
         const cv = cursorVisual(buf, body.width, vx.screen.width_method);
         body.showCursor(
-            @intCast(cv.col),
+            @intCast(if (buf.soft_wrap) cv.col else cv.col -| buf.hscroll),
             @intCast(visualRowOfCursor(buf, buf.top_line, body.width, vx.screen.width_method)),
         );
 

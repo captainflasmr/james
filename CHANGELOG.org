@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.61.0 — <2026-08-10>
+
+=C-x l= toggles scroll lock: the cursor stays on its screen row while the text scrolls under it.
+
+- =C-x l= (Emacs =scroll-lock-mode=, the same binding) locks the cursor to its current screen row: =C-n= / =C-p=, arrows, page and line moves scroll the text under a stationary cursor until the ends of the buffer — no more chasing the cursor off the bottom of the window when reading through a file. =C-l= re-anchors the lock to the recentered row, the mode is per-buffer and remembered like soft wrap, and the modeline shows =[scroll-lock]= while it is on (Emacs's =Scroll-Lock= mode-line marker).
+
 ** 0.60.0 — <2026-08-09>
 
 =M-h= marks the whole paragraph (block).
