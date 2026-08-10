@@ -10,11 +10,18 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.62.0 — <2026-08-10>
+
+The pickers stay in the window: =C-x b=, the bookmark list and the recent-files list render inside the current pane instead of taking over the whole screen.
+
+- The buffer picker (=C-x b=), the bookmark list (=C-x r l= / =C-c o= / =M-l o=) and the recent-files list (=M-l l=) no longer take over the whole screen: the list now renders inside the focused window — the whole screen for a lone window, the focused pane of a split — so the rest of the split layout stays visible while you pick, and Enter confirms without the view ever changing shape. Everything else is unchanged: typing filters the rows (the matched characters highlighting as you type), arrows / =C-n= / =C-p= move the selection, =C-s= / =C-r= search the rows, =C-g= / Esc clear the filter first then close, and the selection replaces the current buffer in the same window.
+
 ** 0.61.0 — <2026-08-10>
 
 =C-x l= toggles scroll lock: the cursor stays on its screen row while the text scrolls under it.
 
 - =C-x l= (Emacs =scroll-lock-mode=, the same binding) locks the cursor to its current screen row: =C-n= / =C-p=, arrows, page and line moves scroll the text under a stationary cursor until the ends of the buffer — no more chasing the cursor off the bottom of the window when reading through a file. =C-l= re-anchors the lock to the recentered row, the mode is per-buffer and remembered like soft wrap, and the modeline shows =[scroll-lock]= while it is on (Emacs's =Scroll-Lock= mode-line marker).
+- With soft wrap off (=M-z=), wide lines now scroll horizontally with the cursor (Emacs's automatic hscrolling): =C-e= on a long line used to park the cursor beyond the window's right edge, invisible. The view now scrolls right as the cursor walks past the edge — the line's tail, and the cursor on it, stay on screen — and back left when the cursor returns to earlier columns; a line that fits the window always starts at the left edge.
 
 ** 0.60.0 — <2026-08-09>
 

@@ -3007,8 +3007,153 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
 /// window at its computed rect and renders through `renderPane`; the focused
 /// pane is the one showing the cursor. `modeline_bufs` gives every leaf
 /// somewhere scratchy to format its modeline. While dired is open it takes
-/// over the focused pane (via `renderDiredPane`) and every other pane keeps
-/// showing its buffer.
+/// over the focused pane (via `renderDiredPane`), the list picker renders
+/// inside it too (via `renderPicker`), and every other pane keeps showing
+/// its buffer.
+/// Render the list picker (buffers / bookmarks / recent files) into
+/// `win`: one row per visible entry with the filter's matched characters
+/// highlighted, the modeline naming the list and the filter, the block
+/// cursor on the selection. `win` is the whole window for a lone pane,
+/// the focused pane of a split otherwise, so the layout stays intact
+/// while picking. The modeline text is built in `modeline_buf`, which
+/// the caller keeps alive until after the frame — vaxis stores grapheme
+/// slices, not copies.
+fn renderPicker(
+    win: vaxis.Window,
+    io: std.Io,
+    view: PickerView,
+    buffers: []*Buffer,
+    bookmarks: []const Bookmark,
+    recent: []const []const u8,
+    modeline_buf: []u8,
+    search: ?IsearchView,
+) void {
+    const text_height: usize = if (win.height > 1) win.height - 1 else win.height;
+    const sel_pos = pickerSelectionPos(view.visible, view.selected);
+    if (text_height > 0) {
+        if (sel_pos < view.top.*) {
+            view.top.* = sel_pos;
+        } else if (sel_pos >= view.top.* + text_height) {
+            view.top.* = sel_pos - text_height + 1;
+        }
+    }
+    const label = switch (view.kind) {
+        .buffers => "Buffers",
+        .bookmarks => "Bookmarks",
+        .recent => "Recent files",
+    };
+    var list_row: u16 = 0;
+    var i = view.top.*;
+    while (i < view.visible.len and list_row < text_height) : (i += 1) {
+        const full = view.visible[i];
+        const name = pickerRowName(view.kind, buffers, bookmarks, recent, full);
+        // For bookmarks and recent files the base directory is dimmed
+        // after the name (a dired bookmark's path is a directory, so it
+        // shows itself; otherwise the parent).
+        const dir: ?[]const u8 = switch (view.kind) {
+            .bookmarks => blk: {
+                const b = bookmarks[full];
+                break :blk if (isDirectory(io, b.path)) b.path else std.fs.path.dirname(b.path);
+            },
+            .recent => std.fs.path.dirname(recent[full]),
+            .buffers => null,
+        };
+        // An active isearch highlights the matched part of the name,
+        // like the dired and file-buffer match highlights; otherwise an
+        // active filter highlights the characters the fuzzy match hit,
+        // so the rows show why they're there.
+        const hl: ?Highlight = if (search != null and !search.?.failed) blk: {
+            if (search.?.match) |m| {
+                if (full == m.row) {
+                    const start = @min(m.col, name.len);
+                    const end = @min(m.col + search.?.query.len, name.len);
+                    if (end > start) break :blk .{ .start = start, .end = end };
+                }
+            }
+            break :blk null;
+        } else null;
+        const fuzzy_hl: ?FuzzyHl = if (hl == null and view.query.len > 0 and i < view.hl.len) view.hl[i] else null;
+        if (hl) |h| {
+            var col: u16 = 0;
+            if (h.start > 0) {
+                _ = win.printSegment(.{ .text = name[0..h.start], .style = .{} }, .{ .row_offset = list_row });
+                col += win.gwidth(name[0..h.start]);
+            }
+            _ = win.printSegment(.{ .text = name[h.start..h.end], .style = highlight_style }, .{ .row_offset = list_row, .col_offset = col });
+            col += win.gwidth(name[h.start..h.end]);
+            if (h.end < name.len) {
+                _ = win.printSegment(.{ .text = name[h.end..], .style = .{} }, .{ .row_offset = list_row, .col_offset = col });
+            }
+        } else if (fuzzy_hl) |fh| {
+            // The filter's matched characters, highlighted one grapheme
+            // at a time (the positions are byte offsets, and a match can
+            // land mid-UTF-8).
+            var seg_start: usize = 0;
+            var col: u16 = 0;
+            for (fh.positions[0..fh.len]) |p| {
+                if (p >= name.len) break;
+                var e = p + 1;
+                while (e < name.len and (name[e] & 0xC0) == 0x80) e += 1;
+                if (p > seg_start) {
+                    _ = win.printSegment(.{ .text = name[seg_start..p], .style = .{} }, .{ .row_offset = list_row, .col_offset = col });
+                    col += win.gwidth(name[seg_start..p]);
+                }
+                _ = win.printSegment(.{ .text = name[p..e], .style = highlight_style }, .{ .row_offset = list_row, .col_offset = col });
+                col += win.gwidth(name[p..e]);
+                seg_start = e;
+            }
+            if (seg_start < name.len) {
+                _ = win.printSegment(.{ .text = name[seg_start..], .style = .{} }, .{ .row_offset = list_row, .col_offset = col });
+            }
+        } else {
+            _ = win.printSegment(.{ .text = name, .style = .{} }, .{ .row_offset = list_row });
+        }
+        if (dir) |d| {
+            _ = win.printSegment(.{ .text = d, .style = .{ .dim = true } }, .{ .row_offset = list_row, .col_offset = win.gwidth(name) + 2 });
+        }
+        list_row += 1;
+    }
+    if (search) |s| {
+        const search_label = if (s.failed)
+            (if (s.backward) "Failing I-search backward" else "Failing I-search")
+        else
+            (if (s.backward) "I-search backward" else "I-search");
+        // The lazy count ("I-search: term (3/12)", like Emacs) trails
+        // the query in the same plain style.
+        var count_buf: [32]u8 = undefined;
+        const suffix = isearchCountSuffix(&count_buf, s.query, s.pos, s.count);
+        var query_buf: [2048]u8 = undefined;
+        const query_with_count = if (suffix.len > 0)
+            (std.fmt.bufPrint(&query_buf, "{s}{s}", .{ s.query, suffix }) catch s.query)
+        else
+            s.query;
+        const ml = fillPromptModeline(modeline_buf, "{s}: ", .{search_label}, query_with_count);
+        _ = win.printSegment(.{ .text = modeline_buf[0..ml.label_len], .style = .{ .bold = true } }, .{ .row_offset = win.height -| 1 });
+        if (ml.label_len < ml.len) {
+            _ = win.printSegment(.{ .text = modeline_buf[ml.label_len..ml.len], .style = .{} }, .{ .row_offset = win.height -| 1, .col_offset = win.gwidth(modeline_buf[0..ml.label_len]) });
+        }
+    } else if (view.query.len > 0) {
+        const shown = if (view.visible.len > 0) sel_pos + 1 else 0;
+        const list_ml = std.fmt.bufPrint(modeline_buf, "{s} ({d}/{d})   filter: {s}   (C-g/Esc closes, Enter opens, arrows move)", .{
+            label,
+            shown,
+            view.visible.len,
+            view.query,
+        }) catch label;
+        _ = win.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = win.height -| 1 });
+    } else {
+        const count = pickerRowCount(view.kind, buffers, bookmarks, recent);
+        const list_ml = std.fmt.bufPrint(modeline_buf, "{s} ({d}/{d})   (type to filter, C-s searches, Enter opens, arrows move, C-g/Esc closes)", .{
+            label,
+            sel_pos + 1,
+            count,
+        }) catch label;
+        _ = win.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = win.height -| 1 });
+    }
+    // No highlights: the block cursor marks the selection.
+    win.showCursor(0, if (text_height > 0) @intCast(sel_pos - view.top.*) else 0);
+}
+
 fn renderTree(
     win: vaxis.Window,
     frame: *FrameAllocs,
@@ -3017,11 +3162,15 @@ fn renderTree(
     y_off: u16,
     width: u16,
     height: u16,
-    modeline_bufs: *[MAX_PANES][1024]u8,
+    modeline_bufs: *[MAX_PANES][2048]u8,
     slot_counter: *usize,
     buffers: []*Buffer,
     direds: []?Dired,
     focused: *Pane,
+    io: std.Io,
+    picker: ?PickerView,
+    bookmarks: []const Bookmark,
+    recent: []const []const u8,
     find_file: ?FindFileView,
     bookmark_prompt: ?BookmarkPromptView,
     goto_prompt: ?GotoPromptView,
@@ -3070,7 +3219,12 @@ fn renderTree(
         const pane_grep_hl: ?GrepHl = if (grep_hl) |gh| (if (buffers[pane.buf_idx] == gh.buf) gh else null) else null;
         const pane_status: ?[]const u8 = if (pane == focused) status else null;
         const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
-        if (direds[pane.buf_idx]) |*d| {
+        if (pane == focused and picker != null) {
+            // The list picker renders inside the focused pane, leaving
+            // the split layout visible; a lone window shows it
+            // full-screen (the single pane covers the whole window).
+            renderPicker(child, io, picker.?, buffers, bookmarks, recent, &modeline_bufs[slot % MAX_PANES], pane_search);
+        } else if (direds[pane.buf_idx]) |*d| {
             renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_compress_menu, pane_archive_query, pane_prompt, pane_status);
         } else {
             renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_status);
@@ -3085,8 +3239,8 @@ fn renderTree(
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             // The one blank column between the panes gets the separator.
             drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
-            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
@@ -3094,8 +3248,8 @@ fn renderTree(
             // a blank row between the panes for the separator (mirroring
             // the one blank column of a vertical split).
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
-            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
         },
     }
 }
@@ -3479,6 +3633,21 @@ fn syncDiredSelection(direds: []?Dired, current: usize, buf: *Buffer) void {
 /// The row source of the modal picker: the open buffers (C-x b), the
 /// bookmark list (C-x r l / C-c o / M-l o), or the recent files (M-l l).
 const PickerKind = enum { buffers, bookmarks, recent };
+
+/// The picker state for rendering: the row kind, the visible rows
+/// (positions into the full row list, see pickerFilter), the selection,
+/// the first visible row (adjusted each frame so the selection stays on
+/// screen), the filter query, and the per-row fuzzy-match highlights.
+/// The picker renders inside the focused pane — a lone window shows it
+/// full-screen, a split keeps the rest of the layout visible.
+const PickerView = struct {
+    kind: PickerKind,
+    visible: []const usize,
+    selected: usize,
+    top: *usize,
+    query: []const u8,
+    hl: []const FuzzyHl,
+};
 
 /// The number of rows in a picker of `kind`.
 fn pickerRowCount(kind: PickerKind, buffers: []*Buffer, bookmarks: []const Bookmark, paths: []const []const u8) usize {
@@ -6935,10 +7104,11 @@ pub fn main(init: std.process.Init) !void {
         // recenter and wrap within the right window.
         focused_text_height = text_height;
         focused_text_width = body.width;
-        // Dired and isearch are not modal: they render inside whichever
-        // pane they apply to, leaving the window layout untouched. Only the
-        // prompt-style modes take over the whole screen.
-        const is_modal = confirming_quit or confirming_kill or picker_kind != null;
+        // Dired, isearch and the picker are not modal: they render inside
+        // whichever pane they apply to, leaving the window layout
+        // untouched. Only the prompt-style modes take over the whole
+        // screen.
+        const is_modal = confirming_quit or confirming_kill;
 
         const search_view: ?IsearchView = if (isearch_active)
             .{ .failed = isearch_failed, .match = isearch_match, .query = isearch_query.items, .backward = isearch_dir == .backward, .count = isearch_count, .pos = isearch_pos }
@@ -7023,144 +7193,28 @@ pub fn main(init: std.process.Init) !void {
             null;
         const archive_query_view: ?[]const u8 = if (dired_archive_prompt) dired_archive_query.items else null;
 
+        const picker_view: ?PickerView = if (picker_kind) |kind|
+            .{ .kind = kind, .visible = picker_visible.items, .selected = picker_selected, .top = &picker_top, .query = picker_query.items, .hl = picker_hl.items }
+        else
+            null;
+
         if (!is_modal and !root.isLeaf()) {
-            var modeline_bufs: [MAX_PANES][1024]u8 = undefined;
+            var modeline_bufs: [MAX_PANES][2048]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, io, picker_view, bookmarks.items, recent.items, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;
         }
 
-        if (picker_kind) |kind| {
+        if (picker_kind) |_| {
             // The picker (buffers / bookmarks / recent files): one row per
             // entry, Enter opens the selection. Typing filters the rows
             // (see pickerFilter) — the block cursor marks the selection
-            // among the visible ones.
-            const sel_pos = pickerSelectionPos(picker_visible.items, picker_selected);
-            if (text_height > 0) {
-                if (sel_pos < picker_top) {
-                    picker_top = sel_pos;
-                } else if (sel_pos >= picker_top + text_height) {
-                    picker_top = sel_pos - text_height + 1;
-                }
-            }
-            const label = switch (kind) {
-                .buffers => "Buffers",
-                .bookmarks => "Bookmarks",
-                .recent => "Recent files",
-            };
-            var list_row: u16 = 0;
-            var i = picker_top;
-            while (i < picker_visible.items.len and list_row < text_height) : (i += 1) {
-                const full = picker_visible.items[i];
-                const name = pickerRowName(kind, buffers.items, bookmarks.items, recent.items, full);
-                // For bookmarks and recent files the base directory is
-                // dimmed after the name (a dired bookmark's path is a
-                // directory, so it shows itself; otherwise the parent).
-                const dir: ?[]const u8 = switch (kind) {
-                    .bookmarks => blk: {
-                        const b = bookmarks.items[full];
-                        break :blk if (isDirectory(io, b.path)) b.path else std.fs.path.dirname(b.path);
-                    },
-                    .recent => std.fs.path.dirname(recent.items[full]),
-                    .buffers => null,
-                };
-                // An active isearch highlights the matched part of the
-                // name, like the dired and file-buffer match highlights;
-                // otherwise an active filter highlights the characters the
-                // fuzzy match hit, so the rows show why they're there.
-                const hl: ?Highlight = if (isearch_active and !isearch_failed) blk: {
-                    if (isearch_match) |m| {
-                        if (full == m.row) {
-                            const start = @min(m.col, name.len);
-                            const end = @min(m.col + isearch_query.items.len, name.len);
-                            if (end > start) break :blk .{ .start = start, .end = end };
-                        }
-                    }
-                    break :blk null;
-                } else null;
-                const fuzzy_hl: ?FuzzyHl = if (hl == null and picker_query.items.len > 0 and i < picker_hl.items.len) picker_hl.items[i] else null;
-                if (hl) |h| {
-                    var col: u16 = 0;
-                    if (h.start > 0) {
-                        _ = body.printSegment(.{ .text = name[0..h.start], .style = .{} }, .{ .row_offset = list_row });
-                        col += body.gwidth(name[0..h.start]);
-                    }
-                    _ = body.printSegment(.{ .text = name[h.start..h.end], .style = highlight_style }, .{ .row_offset = list_row, .col_offset = col });
-                    col += body.gwidth(name[h.start..h.end]);
-                    if (h.end < name.len) {
-                        _ = body.printSegment(.{ .text = name[h.end..], .style = .{} }, .{ .row_offset = list_row, .col_offset = col });
-                    }
-                } else if (fuzzy_hl) |fh| {
-                    // The filter's matched characters, highlighted one
-                    // grapheme at a time (the positions are byte offsets,
-                    // and a match can land mid-UTF-8).
-                    var seg_start: usize = 0;
-                    var col: u16 = 0;
-                    for (fh.positions[0..fh.len]) |p| {
-                        if (p >= name.len) break;
-                        var e = p + 1;
-                        while (e < name.len and (name[e] & 0xC0) == 0x80) e += 1;
-                        if (p > seg_start) {
-                            _ = body.printSegment(.{ .text = name[seg_start..p], .style = .{} }, .{ .row_offset = list_row, .col_offset = col });
-                            col += body.gwidth(name[seg_start..p]);
-                        }
-                        _ = body.printSegment(.{ .text = name[p..e], .style = highlight_style }, .{ .row_offset = list_row, .col_offset = col });
-                        col += body.gwidth(name[p..e]);
-                        seg_start = e;
-                    }
-                    if (seg_start < name.len) {
-                        _ = body.printSegment(.{ .text = name[seg_start..], .style = .{} }, .{ .row_offset = list_row, .col_offset = col });
-                    }
-                } else {
-                    _ = body.printSegment(.{ .text = name, .style = .{} }, .{ .row_offset = list_row });
-                }
-                if (dir) |d| {
-                    _ = body.printSegment(.{ .text = d, .style = .{ .dim = true } }, .{ .row_offset = list_row, .col_offset = body.gwidth(name) + 2 });
-                }
-                list_row += 1;
-            }
-            var list_ml_buf: [2048]u8 = undefined;
-            if (isearch_active) {
-                const search_label = if (isearch_failed)
-                    (if (isearch_dir == .backward) "Failing I-search backward" else "Failing I-search")
-                else
-                    (if (isearch_dir == .backward) "I-search backward" else "I-search");
-                // The lazy count ("I-search: term (3/12)", like Emacs)
-                // trails the query in the same plain style.
-                var count_buf: [32]u8 = undefined;
-                const suffix = isearchCountSuffix(&count_buf, isearch_query.items, isearch_pos, isearch_count);
-                var query_buf: [2048]u8 = undefined;
-                const query_with_count = if (suffix.len > 0)
-                    (std.fmt.bufPrint(&query_buf, "{s}{s}", .{ isearch_query.items, suffix }) catch isearch_query.items)
-                else
-                    isearch_query.items;
-                const ml = fillPromptModeline(&list_ml_buf, "{s}: ", .{search_label}, query_with_count);
-                _ = body.printSegment(.{ .text = list_ml_buf[0..ml.label_len], .style = .{ .bold = true } }, .{ .row_offset = body.height -| 1 });
-                if (ml.label_len < ml.len) {
-                    _ = body.printSegment(.{ .text = list_ml_buf[ml.label_len..ml.len], .style = .{} }, .{ .row_offset = body.height -| 1, .col_offset = body.gwidth(list_ml_buf[0..ml.label_len]) });
-                }
-            } else if (picker_query.items.len > 0) {
-                const shown = if (picker_visible.items.len > 0) sel_pos + 1 else 0;
-                const list_ml = std.fmt.bufPrint(&list_ml_buf, "{s} ({d}/{d})   filter: {s}   (C-g/Esc closes, Enter opens, arrows move)", .{
-                    label,
-                    shown,
-                    picker_visible.items.len,
-                    picker_query.items,
-                }) catch label;
-                _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
-            } else {
-                const count = pickerRowCount(kind, buffers.items, bookmarks.items, recent.items);
-                const list_ml = std.fmt.bufPrint(&list_ml_buf, "{s} ({d}/{d})   (type to filter, C-s searches, Enter opens, arrows move, C-g/Esc closes)", .{
-                    label,
-                    sel_pos + 1,
-                    count,
-                }) catch label;
-                _ = body.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = body.height -| 1 });
-            }
-            // No highlights: the block cursor marks the selection.
-            body.showCursor(0, if (text_height > 0) @intCast(sel_pos - picker_top) else 0);
+            // among the visible ones. A lone window shows it full-screen;
+            // a split keeps the layout visible (see renderTree).
+            var picker_ml_buf: [2048]u8 = undefined;
+            renderPicker(body, io, picker_view.?, buffers.items, bookmarks.items, recent.items, &picker_ml_buf, search_view);
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;
