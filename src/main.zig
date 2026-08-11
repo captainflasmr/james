@@ -36,6 +36,7 @@ const YankState = struct {
 
 const Event = union(enum) {
     key_press: vaxis.Key,
+    key_release: vaxis.Key,
     winsize: vaxis.Winsize,
     /// The terminal's answer to an OSC 52 clipboard request; the text is
     /// allocated with gpa and must be freed by the handler.
@@ -4656,6 +4657,12 @@ pub fn main(init: std.process.Init) !void {
     // prefix of 0): 0 w copies the absolute file name instead of the bare
     // name. Armed by 0, cleared by any key other than w.
     var pending_dired_0 = false;
+    // Windows ConPTY drops the ALT bit from a chord's control-key state,
+    // so M-j would arrive as a bare j (typed into a *files* filter, say).
+    // The held Alt is delivered as its own modifier-only key press first —
+    // `windows_pending_alt` re-applies it to the key that follows (see the
+    // key_press handler). The Alt key-up clears it again.
+    var windows_pending_alt = false;
     // Heap allocations made while rendering one frame (tab expansions),
     // freed after each vx.render.
     var frame_allocs: FrameAllocs = .{ .gpa = gpa };
@@ -4973,16 +4980,39 @@ pub fn main(init: std.process.Init) !void {
                 }
                 yank_state = null;
             },
-            .key_press => |key| key_blk: {
-                // Windows delivers a bare modifier held alone (Ctrl/Alt/Shift)
-                // as its own .key_press with no text — the ~/ keypress arrives
-                // as a separate record after it. Linux never emits these, so
-                // every prompt, isearch and picker cancels on any unmatched
-                // text-less key, which would end the prompt mid-keystroke
-                // (e.g. Ctrl while typing C-s to continue an isearch). Drop
-                // the modifier-only events here, before the bookkeeping, so
-                // they don't disarm pending_ctrl_g either.
-                if (key.isModifier()) continue;
+            .key_release => |key| {
+                // Windows delivers a key-up record for a bare Alt too (the
+                // pair of the modifier-only key-down below): an Alt pressed
+                // and released alone must not tag the next keypress as M-.
+                // Key releases are a no-op elsewhere — no pending state.
+                if (comptime builtin.os.tag == .windows) {
+                    if (key.codepoint == vaxis.Key.left_alt or key.codepoint == vaxis.Key.right_alt) windows_pending_alt = false;
+                }
+            },
+            .key_press => |key_evt| key_blk: {
+                var key = key_evt;
+                if (comptime builtin.os.tag == .windows) {
+                    // Windows delivers a bare modifier held alone (Ctrl/Alt/
+                    // Shift) as its own .key_press with no text — the
+                    // keypress arrives as a separate record after it. Linux
+                    // never emits these, so every prompt, isearch and picker
+                    // cancels on any unmatched text-less key, which would
+                    // end the prompt mid-keystroke (e.g. Ctrl while typing
+                    // C-s to continue an isearch). Drop the modifier-only
+                    // events here, before the bookkeeping, so they don't
+                    // disarm pending_ctrl_g either.
+                    if (key.isModifier()) {
+                        // ConPTY also drops the ALT bit from the chord's
+                        // control-key state: M-j arrives as a plain j (in a
+                        // *files* list, typed into the filter). Remember the
+                        // bare Alt and re-apply it to the key that follows.
+                        if (key.codepoint == vaxis.Key.left_alt or key.codepoint == vaxis.Key.right_alt) windows_pending_alt = true;
+                        continue;
+                    }
+                    if (windows_pending_alt and !key.mods.alt) key.mods.alt = true;
+                } else if (key.isModifier()) {
+                    continue;
+                }
                 // C-l cycles recenter positions only when pressed back to
                 // back (Emacs recenter-top-bottom); any other key makes the
                 // next C-l recenter to the middle again. A transient status
