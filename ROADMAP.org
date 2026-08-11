@@ -19,12 +19,6 @@ TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =to
 - Done in 0.53.0: =w= in dired copies the marked entries' file names to the kill ring (the selected one when nothing is marked, ".." never), so =C-y= pastes them anywhere; =0 w= copies the absolute file names instead — a leading =~= expands to the home directory and relative dired paths resolve against the process cwd, like Emacs's expand-file-name. Several names are newline-joined, a following kill appends like =C-k= after =M-w=, and the copied text is echoed on the modeline until the next keypress.
 - Effort: small.
 
-** TODO M-/ word completion (dabbrev) and autosuggest
-- Emacs: =my/popup-completion-in-region= + =my/dabbrev-capf=, and =simple-autosuggest-mode=, which is *globally enabled* — the single most-used editor "feel" feature in the author's Emacs, and james has no completion at all.
-- =M-/= expands the word at point using dabbrev-style matches gathered from every open buffer (Emacs =dabbrev-expand= is the first =hippie-expand= try in the config). Pure text state — lives happily in =Buffer.zig= / =main.zig= without touching the terminal layer.
-- A dimmed ghost-text suggestion on the current line (mirroring =simple-autosuggest-mode=) could follow, reusing the transient-highlight machinery.
-- Effort: medium (dabbrev core is small; autosuggest rendering is the fiddly half).
-
 ** DONE occur — M-c
 - Emacs: =occur= on =M-c=, and =my/occur-from-isearch= (M-c inside isearch turns the search string into an occur).
 - Done in 0.51.0: every matching line of the current buffer lands in an =*occur*= buffer built on the =*grep*= machinery — =n= / =p= step, Enter jumps to the match in the source (split to the right when alone, window reused otherwise, transient highlight on the term), =F= follows, =g= re-runs over the source picking up edits, =q= / =C-g= closes; =M-c= during isearch starts from the search string.
