@@ -666,6 +666,15 @@ fn isearchCountSuffix(buf: []u8, query: []const u8, pos: usize, count: usize) []
     return std.fmt.bufPrint(buf, " ({d}/{d})", .{ pos, count }) catch "";
 }
 
+/// Remember a completed isearch query as the last search, so a fresh
+/// C-s repeats it (see isearch_last). An empty query (never searched,
+/// or cancelled before anything was typed) is not remembered.
+fn rememberIsearch(gpa: std.mem.Allocator, last: *std.ArrayList(u8), query: []const u8) void {
+    if (query.len == 0) return;
+    last.clearRetainingCapacity();
+    last.appendSlice(gpa, query) catch {};
+}
+
 /// M-% query-replace, one match: replace the match at `at` (a match of
 /// `query`, so `query.len` bytes, never crossing a line boundary) with
 /// `with`, carrying the match's capitalization like Emacs's case-replace.
@@ -4743,6 +4752,13 @@ pub fn main(init: std.process.Init) !void {
     var isearch_dir: Buffer.SearchDirection = .forward;
     var isearch_query: std.ArrayList(u8) = .empty;
     defer isearch_query.deinit(gpa);
+    // The last completed search string, so a fresh C-s repeats the previous
+    // search from wherever the cursor is (Emacs isearch-repeat: C-s with an
+    // empty query searches for the last string). The first character typed
+    // replaces the prefill, like the grep / occur prompts.
+    var isearch_last: std.ArrayList(u8) = .empty;
+    defer isearch_last.deinit(gpa);
+    var isearch_prefill = false;
     var isearch_origin: Buffer.Pos = .{ .row = 0, .col = 0 };
     var isearch_match: ?Buffer.Pos = null;
     var isearch_failed = false;
@@ -5611,9 +5627,18 @@ pub fn main(init: std.process.Init) !void {
                             }
                         } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                             // Confirm the search: the match stays selected,
-                            // and the picker's Enter opens it.
+                            // and the picker's Enter opens it. The query
+                            // becomes the remembered last search.
+                            rememberIsearch(gpa, &isearch_last, isearch_query.items);
                             isearch_active = false;
                         } else if (key.text) |t| {
+                            // The first character typed on a prefilled
+                            // search replaces the prefill, like the grep /
+                            // occur prompts.
+                            if (isearch_prefill) {
+                                isearch_prefill = false;
+                                isearch_query.clearRetainingCapacity();
+                            }
                             try isearch_query.appendSlice(gpa, t);
                             if (pickerFindNext(kind, buffers.items, bookmarks.items, recent.items, vis, isearch_query.items, isearch_origin.row, isearch_dir == .forward)) |m| {
                                 isearch_match = m;
@@ -5623,6 +5648,7 @@ pub fn main(init: std.process.Init) !void {
                                 isearch_failed = true;
                             }
                         } else {
+                            rememberIsearch(gpa, &isearch_last, isearch_query.items);
                             isearch_active = false;
                         }
                     } else {
@@ -5636,6 +5662,7 @@ pub fn main(init: std.process.Init) !void {
                             if (isearch_query.items.len > 0 and direds.items[current] == null) {
                                 syncDiredSelection(direds.items, current, buf);
                                 const term = std.mem.trim(u8, isearch_query.items, " ");
+                                rememberIsearch(gpa, &isearch_last, isearch_query.items);
                                 isearch_active = false;
                                 isearch_query.clearRetainingCapacity();
                                 if (occurRun(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, buf, term, &occur_source, &occur_source_buf, &occur_last_term, &occur_matches, &occur_buf_idx, &results_target, &results_follow, &grep_hl, &status_msg)) |idx| {
@@ -5654,6 +5681,7 @@ pub fn main(init: std.process.Init) !void {
                             if (term.len > 0 and direds.items[current] == null) {
                                 syncDiredSelection(direds.items, current, buf);
                                 buf.undoBoundary();
+                                rememberIsearch(gpa, &isearch_last, isearch_query.items);
                                 isearch_active = false;
                                 isearch_match = null;
                                 isearch_query.clearRetainingCapacity();
@@ -5721,10 +5749,20 @@ pub fn main(init: std.process.Init) !void {
                                 isearch_failed = true;
                             }
                         } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
-                            // Confirm the search: the match stays selected.
+                            // Confirm the search: the match stays selected,
+                            // and the query becomes the remembered last
+                            // search (so the next C-s repeats it).
                             syncDiredSelection(direds.items, current, buf);
+                            rememberIsearch(gpa, &isearch_last, isearch_query.items);
                             isearch_active = false;
                         } else if (key.text) |t| {
+                            // The first character typed on a prefilled
+                            // search replaces the prefill (the repeat
+                            // string), like the grep / occur prompts.
+                            if (isearch_prefill) {
+                                isearch_prefill = false;
+                                isearch_query.clearRetainingCapacity();
+                            }
                             try isearch_query.appendSlice(gpa, t);
                             if (buf.findNext(isearch_query.items, isearch_origin, isearch_dir)) |m| {
                                 buf.cursor_row = m.row;
@@ -5736,6 +5774,7 @@ pub fn main(init: std.process.Init) !void {
                                 isearch_failed = true;
                             }
                         } else {
+                            rememberIsearch(gpa, &isearch_last, isearch_query.items);
                             isearch_active = false;
                         }
                     }
@@ -5788,12 +5827,24 @@ pub fn main(init: std.process.Init) !void {
                         // C-s / C-r: incremental search over the rows (the
                         // selection follows the match), like isearch in a
                         // dired — over the filtered rows when one is active.
+                        // The last search string starts prefilled, as in a
+                        // file buffer.
                         isearch_active = true;
                         isearch_dir = .forward;
                         isearch_origin = .{ .row = pickerSelectionPos(picker_visible.items, picker_selected), .col = 0 };
                         isearch_match = null;
                         isearch_failed = false;
                         isearch_query.clearRetainingCapacity();
+                        isearch_prefill = isearch_last.items.len > 0;
+                        if (isearch_prefill) {
+                            isearch_query.appendSlice(gpa, isearch_last.items) catch {};
+                            if (pickerFindNext(kind, buffers.items, bookmarks.items, recent.items, picker_visible.items, isearch_query.items, isearch_origin.row, true)) |m| {
+                                isearch_match = m;
+                                picker_selected = m.row;
+                            } else {
+                                isearch_failed = true;
+                            }
+                        }
                     } else if (key.matches('r', .{ .ctrl = true })) {
                         isearch_active = true;
                         isearch_dir = .backward;
@@ -5801,6 +5852,20 @@ pub fn main(init: std.process.Init) !void {
                         isearch_match = null;
                         isearch_failed = false;
                         isearch_query.clearRetainingCapacity();
+                        isearch_prefill = isearch_last.items.len > 0;
+                        if (isearch_prefill) {
+                            isearch_query.appendSlice(gpa, isearch_last.items) catch {};
+                            if (picker_visible.items.len > 0) {
+                                if (pickerFindNext(kind, buffers.items, bookmarks.items, recent.items, picker_visible.items, isearch_query.items, isearch_origin.row, false)) |m| {
+                                    isearch_match = m;
+                                    picker_selected = m.row;
+                                } else {
+                                    isearch_failed = true;
+                                }
+                            } else {
+                                isearch_failed = true;
+                            }
+                        }
                     } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
                         // Enter / C-j: open the selection — switch to the
                         // buffer, jump to the bookmark, or open the recent
@@ -6661,6 +6726,10 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches(';', .{ .ctrl = true })) {
                         if (editing) try buf.toggleComment(gpa);
                     } else if (key.matches('s', .{ .ctrl = true })) {
+                        // C-s: search forward. A last search string starts
+                        // the search prefilled and jumps to the next match
+                        // at once (Emacs isearch-repeat-forward: C-s with an
+                        // empty query repeats the previous search).
                         isearch_active = true;
                         isearch_dir = .forward;
                         isearch_origin = if (direds.items[current]) |d|
@@ -6670,7 +6739,20 @@ pub fn main(init: std.process.Init) !void {
                         isearch_match = null;
                         isearch_failed = false;
                         isearch_query.clearRetainingCapacity();
+                        isearch_prefill = isearch_last.items.len > 0;
+                        if (isearch_prefill) {
+                            isearch_query.appendSlice(gpa, isearch_last.items) catch {};
+                            if (buf.findNext(isearch_query.items, isearch_origin, .forward)) |m| {
+                                buf.cursor_row = m.row;
+                                buf.cursor_col = m.col;
+                                syncDiredSelection(direds.items, current, buf);
+                                isearch_match = m;
+                            } else {
+                                isearch_failed = true;
+                            }
+                        }
                     } else if (key.matches('r', .{ .ctrl = true })) {
+                        // C-r: search backward, remembered like C-s.
                         isearch_active = true;
                         isearch_dir = .backward;
                         isearch_origin = if (direds.items[current]) |d|
@@ -6680,6 +6762,18 @@ pub fn main(init: std.process.Init) !void {
                         isearch_match = null;
                         isearch_failed = false;
                         isearch_query.clearRetainingCapacity();
+                        isearch_prefill = isearch_last.items.len > 0;
+                        if (isearch_prefill) {
+                            isearch_query.appendSlice(gpa, isearch_last.items) catch {};
+                            if (buf.findNext(isearch_query.items, isearch_origin, .backward)) |m| {
+                                buf.cursor_row = m.row;
+                                buf.cursor_col = m.col;
+                                syncDiredSelection(direds.items, current, buf);
+                                isearch_match = m;
+                            } else {
+                                isearch_failed = true;
+                            }
+                        }
                     } else if (key.matches(' ', .{ .ctrl = true }) or key.matches('@', .{ .ctrl = true })) {
                         buf.setMark();
                     } else if (key.matches('g', .{ .ctrl = true })) {
