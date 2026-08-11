@@ -82,8 +82,8 @@ Window keys (mostly aliases of the =C-x= window commands, plus a few extras):
 |---+---|
 | =C-x 2= / =M-m= | split horizontally (stacked) — =M-m= also moves to the new window |
 | =C-x 3= / =M-;= | split vertically (side-by-side) — =M-;= also moves to the new window |
-| =C-x o= / =M-n= | move to the next window (=n= / =p= / =o= repeat: after any of the three move keys, the plain keys keep stepping windows) |
-| =M-p= | move to the previous window (repeat with =n= / =p= / =o=) |
+| =C-x o= / =M-n= | move to the next window (=n= / =p= / =o= repeat after =C-x o=) |
+| =M-p= | move to the previous window |
 | =C-x 0= / =M-q= / =M-'= | delete the current window |
 | =C-x 1= / =M-a= | collapse back to a single window |
 | =C-x += | balance the window sizes (all windows equal, like Emacs) |

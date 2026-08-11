@@ -569,10 +569,10 @@ const ReplaceView = struct {
 };
 
 /// Sticky keys / repeat-mode (Emacs windmove-repeat-map, the author's
-/// my/repeat-history): after C-c j / C-c k the plain j / k keep stepping
-/// window history, and after M-n / M-p / C-x o the plain n / p / o keep
-/// moving between windows. The map stays armed while a repeat key is
-/// pressed; any other key clears it and acts normally.
+/// my/repeat-history): after C-x o the plain n / p / o keep moving
+/// between windows, and after C-c j / C-c k the plain j / k keep
+/// stepping the window layouts. The map stays armed while a repeat key
+/// is pressed; any other key clears it and acts normally.
 const RepeatMap = enum { window_history, window_move };
 
 const DiredPromptKind = enum { copy, rename, delete, create_dir, create_file, open };
@@ -3339,7 +3339,7 @@ const welcome_tail =
     \\
     \\    M-1 .. M-9          select a tab by number
     \\    M-i / M-u           next / previous tab
-    \\    M-n / M-p           next / previous window (n / p / o repeat)
+    \\    M-n / M-p           next / previous window
     \\    M-; / M-m           split below / to the right
     \\    M-q / M-'           delete the window
     \\    M-a                 one window
@@ -4835,11 +4835,12 @@ pub fn main(init: std.process.Init) !void {
                 // Sticky keys / repeat-mode: while a repeat map is armed,
                 // its plain keys repeat the window action instead of their
                 // normal binding — j / k keep stepping window history
-                // after C-c j / C-c k, n / p keep moving between windows
-                // after M-n / M-p — and the map stays armed for the next
-                // repeat. Any other key clears the map and acts normally
-                // below (so the repeat keys never hijack a prompt: opening
-                // one always passes through a non-repeat key first).
+                // after C-c j / C-c k, n / p / o keep moving between
+                // windows after C-x o — and the map stays armed for the
+                // next repeat. Any other key clears the map and acts
+                // normally below (so the repeat keys never hijack a
+                // prompt: opening one always passes through a non-repeat
+                // key first).
                 if (repeat_map) |rm| {
                     if (rm == .window_history and (key.matches('j', .{}) or key.matches('k', .{}))) {
                         if (key.matches('j', .{})) {
@@ -5958,7 +5959,8 @@ pub fn main(init: std.process.Init) !void {
                         root.balance();
                     } else if (key.matches('o', .{})) {
                         // C-x o: move to the next window. Sticky: the plain
-                        // n / p repeat (see RepeatMap), like M-n / M-p.
+                        // n / p / o repeat (see RepeatMap) — M-n / M-p stay
+                        // single moves, this is the key that keeps stepping.
                         if (moveFocus(root, focused, 1)) |nf| {
                             focused = nf;
                             current = focused.buf_idx;
@@ -6973,20 +6975,17 @@ pub fn main(init: std.process.Init) !void {
                         current = try openBufferOrDired(gpa, io, &buffers, &direds, &recent, start);
                         focused.buf_idx = current;
                     } else if (key.matches('n', .{ .alt = true })) {
-                        // M-n: move to the next window. Sticky: the plain
-                        // n / p repeat (see RepeatMap).
+                        // M-n: move to the next window.
                         if (moveFocus(root, focused, 1)) |nf| {
                             focused = nf;
                             current = focused.buf_idx;
                         }
-                        repeat_map = .window_move;
                     } else if (key.matches('p', .{ .alt = true })) {
-                        // M-p: move to the previous window. Sticky like M-n.
+                        // M-p: move to the previous window.
                         if (moveFocus(root, focused, -1)) |nf| {
                             focused = nf;
                             current = focused.buf_idx;
                         }
-                        repeat_map = .window_move;
                     } else if (key.matches('j', .{ .alt = true })) {
                         buf.moveLines(5);
                     } else if (key.matches('k', .{ .alt = true })) {
