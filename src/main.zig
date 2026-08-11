@@ -3483,9 +3483,24 @@ fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer), environ
     try text.appendSlice(gpa, welcome_head);
     // The terminal this instance is running in — TERM_PROGRAM where the
     // terminal sets it (alacritty, kitty, wezterm, vscode, ...), the
-    // TERM value otherwise, so the console is easy to see and report.
+    // Windows consoles' own variables (Windows Terminal and ConEmu each
+    // have one, and an interactive console session is SESSIONNAME
+    // "Console"), the TERM value otherwise, so the console is easy to
+    // see and report.
+    var term_name: []const u8 = "an unknown terminal";
+    if (environ_map.get("TERM_PROGRAM")) |tp| {
+        term_name = tp;
+    } else if (environ_map.get("WT_SESSION") != null) {
+        term_name = "Windows Terminal";
+    } else if (environ_map.get("ConEmuPID") != null) {
+        term_name = "ConEmu";
+    } else if (environ_map.get("TERM")) |t| {
+        term_name = t;
+    } else if (std.mem.eql(u8, environ_map.get("SESSIONNAME") orelse "", "Console")) {
+        term_name = "the Windows console";
+    }
     try text.appendSlice(gpa, "   running in ");
-    try text.appendSlice(gpa, environ_map.get("TERM_PROGRAM") orelse environ_map.get("TERM") orelse "an unknown terminal");
+    try text.appendSlice(gpa, term_name);
     if (environ_map.get("TERM_PROGRAM_VERSION")) |v| {
         try text.appendSlice(gpa, " (");
         try text.appendSlice(gpa, v);
