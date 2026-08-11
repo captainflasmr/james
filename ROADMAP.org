@@ -29,10 +29,6 @@ TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =to
 - Done in 0.56.0: =z= in dired compresses the marked entries (or the selected one, ".." never) — a file that already carries a compression suffix is decompressed instead. Anything else opens a one-key format menu in the modeline offering *only the tools this platform actually has*: a single file gets gzip / xz / bzip2 / zstd / lzip / zip / 7z, a directory or several files the tar-style tar.gz / tar.xz / tar.bz2 / tar.zst / tar.lz / zip / 7z (several files prompt for the archive name, defaulting to the directory name). The single-file tools replace the file like =gzip -9=; archives are named after the entry. Windows — which ships =tar.exe= (bsdtar) and PowerShell's =Compress-Archive= / =Expand-Archive= but no gzip — sees zip / tar.gz / tar.xz / tar.bz2 / 7z, and decompresses through those same tools; suffixes with no standard tool on the platform (a bare =gz= on Windows) report failure. The dired refreshes and the modeline reports =Compressed foo.tar.gz (1.2K)=.
 - Effort: medium.
 
-** TODO Sticky Keys
-
-- Implement the classic sticky keys offered built-in by Windows and also which can be enabled in linux by the use of an xkb file.  Basically no more key chords, but hitting the sequence of chord keys in sequential order.  This can be achieved also by using tools like AutoHotKey, but ideally I would want it built in to this text editor.  By default Emacs and this application would be using key chords, but that can be tiring and stressful on the fingers and as this application is designed to be portable and no config and to be able to run on any system with just a single executable having an internal sticky key switch to this application would be useful.
-
 ** DONE Deleted files to trash
 
 - Put deleted files into the Trash folder.
