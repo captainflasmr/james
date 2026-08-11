@@ -66,6 +66,7 @@ Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes 
 | =C-x r m= | bookmark the current position (name prompt, defaults to the file name; persisted to =~/.james-bookmarks=, =%USERPROFILE%\.james-bookmarks= on Windows) |
 | =C-x r b= | jump to a bookmark |
 | =C-x r l= / =C-c o= | list bookmarks (type to filter, C-s searches, Enter/C-m jumps, arrows move, C-g/Esc closes) |
+| =C-z e= | toggle whitespace markers (Emacs =whitespace-mode=): spaces show as =·=, tabs as =»=, line breaks as =$= at the end of each line, with =[whitespace]= in the modeline while on; per-buffer like soft wrap |
 | =C-c b= | copy the whole buffer to the kill ring |
 | =C-c w= | copy the region and deselect it |
 | =C-c C-k= | close the dired browser |

@@ -9,4 +9,4 @@ This document contains the current bugs/improvements, this is just for me mainly
 
 * Bugs/Improvements
 
-** TODO show space/tab whitespace
+** TODO allow up directory from occur/find whole buffer totes

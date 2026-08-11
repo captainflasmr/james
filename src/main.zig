@@ -309,6 +309,71 @@ fn expandTabs(frame: *FrameAllocs, line: []const u8, method: vaxis.gwidth.Method
     return owned;
 }
 
+/// The whitespace-mode display text of `line` (C-z e, Emacs
+/// whitespace-mode): every space shows as a · middle dot, every tab as
+/// a » marker padded with spaces up to its tab stop — so the line's
+/// display width, and with it the wrap, cursor and highlight math, is
+/// unchanged — and a $ newline marker at the end when `show_newline`
+/// (every line but the buffer's last, which has no line break to mark).
+/// Returns null when the line already renders as-is. The result is
+/// heap-allocated and recorded on `frame` for freeing after the frame
+/// renders, like the expandTabs results.
+fn whitespaceLine(frame: *FrameAllocs, line: []const u8, show_newline: bool, method: vaxis.gwidth.Method) ?[]u8 {
+    if (!show_newline and std.mem.indexOfAny(u8, line, " \t") == null) return null;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(frame.gpa);
+    var col: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(line);
+    while (it.next()) |g| {
+        const s = g.bytes(line);
+        if (std.mem.eql(u8, s, " ")) {
+            out.appendSlice(frame.gpa, "·") catch return null;
+            col += 1;
+        } else if (std.mem.eql(u8, s, "\t")) {
+            const w = tabStop(col);
+            out.appendSlice(frame.gpa, "»") catch return null;
+            for (1..w) |_| out.append(frame.gpa, ' ') catch return null;
+            col += w;
+        } else {
+            out.appendSlice(frame.gpa, s) catch return null;
+            col += vaxis.gwidth.gwidth(s, method);
+        }
+    }
+    if (show_newline) out.append(frame.gpa, '$') catch return null;
+    const owned = out.toOwnedSlice(frame.gpa) catch return null;
+    frame.items.append(frame.gpa, owned) catch {
+        frame.gpa.free(owned);
+        return null;
+    };
+    return owned;
+}
+
+/// The byte offset in the whitespace-display text (see whitespaceLine)
+/// of raw byte offset `p` in `line`: every space and tab before it adds
+/// its display expansion (a space becomes the 2-byte ·, a tab the 2-byte
+/// » plus its stop padding). `p` should sit on a grapheme boundary — the
+/// highlight ranges are byte offsets into the raw line.
+fn whitespaceDispAt(line: []const u8, p: usize, method: vaxis.gwidth.Method) usize {
+    var col: usize = 0;
+    var disp: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(line[0..p]);
+    while (it.next()) |g| {
+        const s = g.bytes(line[0..p]);
+        if (std.mem.eql(u8, s, " ")) {
+            col += 1;
+            disp += 2;
+        } else if (std.mem.eql(u8, s, "\t")) {
+            const w = tabStop(col);
+            col += w;
+            disp += w + 1;
+        } else {
+            col += vaxis.gwidth.gwidth(s, method);
+            disp += s.len;
+        }
+    }
+    return disp;
+}
+
 /// The longest prefix of `text` that fits in `width` display columns —
 /// for truncated (soft-wrap-off) lines. `text` must already have its
 /// tabs expanded (the render path passes the expandTabs result).
@@ -775,9 +840,17 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
     while (i < buf.lines.items.len and row < text_height) : (i += 1) {
         const raw = buf.lines.items[i].items;
         // Tabs render as spaces up to the next tab stop — vaxis drops a
-        // raw tab byte, gluing tab-separated fields together.
-        const expanded = expandTabs(frame, raw, method);
-        const line = expanded orelse raw;
+        // raw tab byte, gluing tab-separated fields together. With the
+        // whitespace markers on (C-z e) the line renders through
+        // whitespaceLine instead, which marks the spaces, tabs and the
+        // line break itself.
+        const ws_mode = buf.show_whitespace;
+        const ws_text = if (ws_mode)
+            whitespaceLine(frame, raw, i + 1 < buf.lines.items.len, method)
+        else
+            null;
+        const expanded = if (!ws_mode) expandTabs(frame, raw, method) else null;
+        const line = ws_text orelse expanded orelse raw;
         var h = highlightFor(buf, i, searching, match, query_len);
         // The transient grep-match highlight: shown on the match's line in
         // the target file after a jump (see GrepHl), losing to an active
@@ -793,7 +866,12 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
             }
         }
         if (h.hl) |hl| {
-            if (expanded != null) {
+            if (ws_text != null) {
+                // Map the raw highlight offsets through the whitespace
+                // markers (a space becomes the 2-byte ·, a tab the 2-byte
+                // » plus its stop padding).
+                h.hl = .{ .start = whitespaceDispAt(raw, hl.start, method), .end = whitespaceDispAt(raw, hl.end, method) };
+            } else if (expanded != null) {
                 // Map the raw highlight offsets through the expansion.
                 h.hl = .{ .start = tabAwareWidth(raw, 0, hl.start, method), .end = tabAwareWidth(raw, 0, hl.end, method) };
             }
@@ -934,7 +1012,7 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
                 break :blk .{ .len = n.len, .label_len = 0 };
             }
         }
-        const n = std.fmt.bufPrint(modeline_buf, "{s}{s}{s}{s}{s}  L{d}:C{d}", .{
+        const n = std.fmt.bufPrint(modeline_buf, "{s}{s}{s}{s}{s}{s}  L{d}:C{d}", .{
             // Emacs-style modified marker in the bottom-left corner of the
             // modeline.
             if (buf.dirty) "*" else "",
@@ -947,6 +1025,9 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
             // mode-line marker; its absence means the cursor scrolls
             // with the text.
             if (buf.scroll_lock) " [scroll-lock]" else "",
+            // C-z e: whitespace markers show like Emacs's whitespace-mode
+            // "WS" mode-line lighter.
+            if (buf.show_whitespace) " [whitespace]" else "",
             buf.cursor_row + 1,
             buf.cursor_col + 1,
         }) catch break :blk .{ .len = 0, .label_len = 0 };
@@ -3362,6 +3443,7 @@ const welcome_tail =
     \\    C-x r m             set a bookmark at point
     \\    C-x r b             jump to a bookmark
     \\    C-x r l             list the bookmarks
+    \\    C-z e               show spaces / tabs / newlines (whitespace)
     \\
     \\  C-c — kill ring and window history:
     \\
@@ -4567,6 +4649,9 @@ pub fn main(init: std.process.Init) !void {
     // while armed, each window shows a one-char corner label and the label
     // key jumps to its window.
     var pending_alt_o = false;
+    // C-z: the whitespace-marker prefix (the author's Emacs binds C-z e
+    // to whitespace-mode) — C-z e toggles the current buffer's markers.
+    var pending_ctrl_z = false;
     // The 0 prefix in dired (Emacs dired-copy-filename-as-kill with a
     // prefix of 0): 0 w copies the absolute file name instead of the bare
     // name. Armed by 0, cleared by any key other than w.
@@ -6309,6 +6394,17 @@ pub fn main(init: std.process.Init) !void {
                             current = focused.buf_idx;
                         }
                     }
+                } else if (pending_ctrl_z) {
+                    // C-z e: toggle the current buffer's whitespace markers
+                    // (Emacs whitespace-mode — spaces as ·, tabs as »,
+                    // line breaks as $); C-g / Esc cancels the prefix, any
+                    // other key is ignored like an undefined binding.
+                    pending_ctrl_z = false;
+                    if (key.matches('e', .{})) {
+                        buf.show_whitespace = !buf.show_whitespace;
+                    } else if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        // abort the prefix
+                    }
                 } else if (key.matches('1', .{ .alt = true }) or key.matches('2', .{ .alt = true }) or key.matches('3', .{ .alt = true }) or key.matches('4', .{ .alt = true }) or key.matches('5', .{ .alt = true }) or key.matches('6', .{ .alt = true }) or key.matches('7', .{ .alt = true }) or key.matches('8', .{ .alt = true }) or key.matches('9', .{ .alt = true })) {
                     // M-1..M-9: select a tab by number (the numbered tab
                     // set's natural selector).
@@ -6802,6 +6898,11 @@ pub fn main(init: std.process.Init) !void {
                         pending_ctrl_x = true;
                     } else if (key.matches('c', .{ .ctrl = true })) {
                         pending_ctrl_c = true;
+                    } else if (key.matches('z', .{ .ctrl = true })) {
+                        // C-z: the whitespace-marker prefix — C-z e
+                        // toggles the current buffer's markers (see the
+                        // pending_ctrl_z branch).
+                        pending_ctrl_z = true;
                     } else if (key.matches('l', .{ .alt = true })) {
                         // M-l: the my-jump prefix (see the pending_alt_l
                         // branch above).
@@ -7445,9 +7546,15 @@ pub fn main(init: std.process.Init) !void {
         while (i < buf.lines.items.len and row < text_height) : (i += 1) {
             const raw = buf.lines.items[i].items;
             // Tabs render as spaces up to the next tab stop (see
-            // renderPane).
-            const expanded = expandTabs(&frame_allocs, raw, vx.screen.width_method);
-            const line = expanded orelse raw;
+            // renderPane); the whitespace markers (C-z e) render through
+            // whitespaceLine instead.
+            const ws_mode = buf.show_whitespace;
+            const ws_text = if (ws_mode)
+                whitespaceLine(&frame_allocs, raw, i + 1 < buf.lines.items.len, vx.screen.width_method)
+            else
+                null;
+            const expanded = if (!ws_mode) expandTabs(&frame_allocs, raw, vx.screen.width_method) else null;
+            const line = ws_text orelse expanded orelse raw;
             var h = highlightFor(buf, i, search_view != null, if (search_view) |s| (if (s.failed) null else s.match) else null, if (search_view) |s| s.query.len else 0);
             // The transient grep-match highlight (see GrepHl).
             if (h.hl == null) {
@@ -7461,7 +7568,9 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
             if (h.hl) |hl| {
-                if (expanded != null) {
+                if (ws_text != null) {
+                    h.hl = .{ .start = whitespaceDispAt(raw, hl.start, vx.screen.width_method), .end = whitespaceDispAt(raw, hl.end, vx.screen.width_method) };
+                } else if (expanded != null) {
                     h.hl = .{ .start = tabAwareWidth(raw, 0, hl.start, vx.screen.width_method), .end = tabAwareWidth(raw, 0, hl.end, vx.screen.width_method) };
                 }
             }
@@ -7606,7 +7715,7 @@ pub fn main(init: std.process.Init) !void {
                 (std.fmt.bufPrint(&count_buf, "  ({d}/{d})", .{ current + 1, buffers.items.len }) catch "")
             else
                 "";
-            const n = std.fmt.bufPrint(&modeline_buf, "{s}-- {s}{s}{s}{s}{s}{s}  L{d}:C{d} --", .{
+            const n = std.fmt.bufPrint(&modeline_buf, "{s}-- {s}{s}{s}{s}{s}{s}{s}  L{d}:C{d} --", .{
                 // Emacs-style modified marker in the bottom-left corner of
                 // the modeline.
                 if (buf.dirty) "*" else "",
@@ -7620,6 +7729,9 @@ pub fn main(init: std.process.Init) !void {
                 // mode-line marker; its absence means the cursor scrolls
                 // with the text.
                 if (buf.scroll_lock) " [scroll-lock]" else "",
+                // C-z e: whitespace markers show like Emacs's
+                // whitespace-mode "WS" mode-line lighter.
+                if (buf.show_whitespace) " [whitespace]" else "",
                 buf_count,
                 buf.cursor_row + 1,
                 buf.cursor_col + 1,

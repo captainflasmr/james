@@ -33,6 +33,10 @@ undo_group: UndoKind = .none,
     /// visual-line-mode); when off they truncate and movement steps
     /// logical lines (Emacs toggle-truncate-lines).
     soft_wrap: bool = true,
+    /// C-z e toggles whitespace markers (Emacs whitespace-mode): every
+    /// space shows as a ·, every tab as a », and every line break as a $
+    /// at the end of the line. Per-buffer, like soft wrap.
+    show_whitespace: bool = false,
     /// C-x l toggles scroll lock (Emacs scroll-lock-mode, the same
     /// binding): the cursor stays on its locked screen row while the
     /// text scrolls under it, up to the ends of the buffer.
