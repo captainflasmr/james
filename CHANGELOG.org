@@ -10,6 +10,14 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.63.0 — <2026-08-10>
+
+Isearch remembers the last search string, and =M-o= jumps straight to a window.
+
+- Isearch remembers the last search, like Emacs: after a search finishes, a fresh =C-s= (or =C-r=) with an empty query repeats the previous search from the cursor — jump to the top with =M-<= and press =C-s= to find it again from the start — and the first character typed replaces the remembered string instead of gluing onto it, the same prefill rule as the grep / occur prompts. The string is remembered on confirm (Enter / Esc), on =M-c= occur and =M-%= query-replace from the search, and in the picker row searches too; a =C-g= cancel leaves it untouched.
+- =M-o= is the quick window jump (the author's =my/quick-window-jump=, ace-window style): with two windows it moves straight across; with more, every window draws its one-char label (=j= =k= =l= =;= =a= =s= =d= =f=, in render order) in its top-left corner and the label key jumps to its window, =C-g= / Esc cancelling the labels. It works from file buffers, direds and the results buffers, and joins the other window keys in the help and README.
+- The window-navigation repeat keys are trimmed: =M-n= / =M-p= are single moves again, while =C-x o= keeps its =n= / =p= / =o= repeat and =C-c j= / =C-c k= keep their =j= / =k= layout stepping.
+
 ** 0.62.0 — <2026-08-10>
 
 The pickers stay in the window: =C-x b=, the bookmark list and the recent-files list render inside the current pane instead of taking over the whole screen.

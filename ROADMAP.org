@@ -45,10 +45,11 @@ TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =to
 
 * Medium term
 
-** TODO Quick window jump — M-o
+** DONE Quick window jump — M-o
 - Emacs: =my/quick-window-jump= — each window gets a one-char label (j/k/l/;/a/s/d/f), typing it jumps; direct jump when two windows.
 - Transposes cleanly to a TUI (overlay labels in the corners like ace-window). james only cycles with =M-n= / =M-p= today.
 - Effort: small-to-medium.
+- Done: =M-o= with two windows jumps straight across; with more, each window draws its one-char label (=j= =k= =l= =;= =a= =s= =d= =f=, in render order) in its top-left corner and the label key jumps to its window, =C-g= / Esc cancelling the labels.
 
 * Quick wins
 

@@ -575,6 +575,11 @@ const ReplaceView = struct {
 /// is pressed; any other key clears it and acts normally.
 const RepeatMap = enum { window_history, window_move };
 
+/// The M-o quick-jump labels (the author's my/quick-window-jump, the
+/// ace-window corner labels): each window's one-char name in render
+/// order, drawn in its top-left corner while the jump map is armed.
+const quick_jump_labels = "jkl;asdf";
+
 const DiredPromptKind = enum { copy, rename, delete, create_dir, create_file, open };
 
 /// The dired compress formats (Z, Emacs dired-compress-file / the
@@ -3180,6 +3185,7 @@ fn renderTree(
     picker: ?PickerView,
     bookmarks: []const Bookmark,
     recent: []const []const u8,
+    quick_jump: bool,
     find_file: ?FindFileView,
     bookmark_prompt: ?BookmarkPromptView,
     goto_prompt: ?GotoPromptView,
@@ -3238,6 +3244,12 @@ fn renderTree(
         } else {
             renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_status);
         }
+        // The M-o quick-jump label in the pane's top-left corner, on top
+        // of the pane's own content (the slots count leaves in render
+        // order, so the label index matches the label keys' window order).
+        if (quick_jump and slot < quick_jump_labels.len) {
+            _ = child.printSegment(.{ .text = quick_jump_labels[slot .. slot + 1], .style = highlight_style }, .{ .row_offset = 0, .col_offset = 0 });
+        }
         return;
     }
 
@@ -3248,8 +3260,8 @@ fn renderTree(
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             // The one blank column between the panes gets the separator.
             drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
-            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, quick_jump, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, quick_jump, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
@@ -3257,8 +3269,8 @@ fn renderTree(
             // a blank row between the panes for the separator (mirroring
             // the one blank column of a vertical split).
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
-            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, quick_jump, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, quick_jump, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
         },
     }
 }
@@ -3349,6 +3361,7 @@ const welcome_tail =
     \\    M-1 .. M-9          select a tab by number
     \\    M-i / M-u           next / previous tab
     \\    M-n / M-p           next / previous window
+    \\    M-o                 jump to a window (j k l ; a s d f labels)
     \\    M-; / M-m           split below / to the right
     \\    M-q / M-'           delete the window
     \\    M-a                 one window
@@ -4501,6 +4514,10 @@ pub fn main(init: std.process.Init) !void {
     // M-l: the my-jump prefix keymap from the author's Emacs init.el — a
     // jump to a well-known directory is two keys, like every Emacs prefix.
     var pending_alt_l = false;
+    // M-o: the quick-window-jump prefix (the author's my/quick-window-jump):
+    // while armed, each window shows a one-char corner label and the label
+    // key jumps to its window.
+    var pending_alt_o = false;
     // The 0 prefix in dired (Emacs dired-copy-filename-as-kill with a
     // prefix of 0): 0 w copies the absolute file name instead of the bare
     // name. Armed by 0, cleared by any key other than w.
@@ -6214,6 +6231,24 @@ pub fn main(init: std.process.Init) !void {
                             window_redo.clearRetainingCapacity();
                         }
                     }
+                } else if (pending_alt_o) {
+                    // M-o: the quick-jump label key — j k l ; a s d f name
+                    // the windows in render order (the corner labels drawn
+                    // while the map is armed); C-g / Esc cancels, any other
+                    // key is ignored like an undefined binding in a real
+                    // keymap.
+                    pending_alt_o = false;
+                    if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        // abort the jump
+                    } else if (std.mem.indexOfScalar(u8, quick_jump_labels, @intCast(key.codepoint))) |idx| {
+                        var leaves: [MAX_PANES]*Pane = undefined;
+                        var n: usize = 0;
+                        root.collectLeaves(&leaves, &n);
+                        if (idx < n) {
+                            focused = leaves[idx];
+                            current = focused.buf_idx;
+                        }
+                    }
                 } else if (key.matches('1', .{ .alt = true }) or key.matches('2', .{ .alt = true }) or key.matches('3', .{ .alt = true }) or key.matches('4', .{ .alt = true }) or key.matches('5', .{ .alt = true }) or key.matches('6', .{ .alt = true }) or key.matches('7', .{ .alt = true }) or key.matches('8', .{ .alt = true }) or key.matches('9', .{ .alt = true })) {
                     // M-1..M-9: select a tab by number (the numbered tab
                     // set's natural selector).
@@ -7080,6 +7115,21 @@ pub fn main(init: std.process.Init) !void {
                             focused = nf;
                             current = focused.buf_idx;
                         }
+                    } else if (key.matches('o', .{ .alt = true })) {
+                        // M-o: quick window jump (the author's
+                        // my/quick-window-jump, ace-window style) — with
+                        // two windows it jumps straight across; with more,
+                        // each window gets a one-char corner label (j k l ;
+                        // a s d f) and typing the label jumps to its
+                        // window. C-g / Esc cancels the labels.
+                        if (root.leafCount() <= 2) {
+                            if (moveFocus(root, focused, 1)) |nf| {
+                                focused = nf;
+                                current = focused.buf_idx;
+                            }
+                        } else {
+                            pending_alt_o = true;
+                        }
                     } else if (key.matches('j', .{ .alt = true })) {
                         buf.moveLines(5);
                     } else if (key.matches('k', .{ .alt = true })) {
@@ -7294,7 +7344,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][2048]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, io, picker_view, bookmarks.items, recent.items, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, io, picker_view, bookmarks.items, recent.items, pending_alt_o, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;

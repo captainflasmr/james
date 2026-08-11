@@ -83,6 +83,7 @@ Window keys (mostly aliases of the =C-x= window commands, plus a few extras):
 | =C-x 2= / =M-m= | split horizontally (stacked) — =M-m= also moves to the new window |
 | =C-x 3= / =M-;= | split vertically (side-by-side) — =M-;= also moves to the new window |
 | =C-x o= / =M-n= | move to the next window (=n= / =p= / =o= repeat after =C-x o=) |
+| =M-o= | jump straight to a window: with two windows it moves across at once, with more each window shows a one-char corner label (=j= =k= =l= =;= =a= =s= =d= =f=, in render order) and the label key jumps there (=C-g= / Esc cancels) |
 | =M-p= | move to the previous window |
 | =C-x 0= / =M-q= / =M-'= | delete the current window |
 | =C-x 1= / =M-a= | collapse back to a single window |
