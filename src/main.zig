@@ -6579,6 +6579,30 @@ pub fn main(init: std.process.Init) !void {
                                 const m = grep_matches.items[sel];
                                 resultsOpenMatch(gpa, io, &buffers, &direds, &recent, root, &focused, current, &window_undo, &window_redo, m.path, m.line, m.col, &results_target, grep_last_term, &grep_hl);
                             }
+                        } else if (key.matches('^', .{}) or key.matches('e', .{ .alt = true })) {
+                            // ^ / M-e: go up a directory from the search —
+                            // the same "up" as dired's ^. The *files* buffer
+                            // opens the dired of the parent of the directory
+                            // the find ran over, *occur* the parent of the
+                            // source file's directory (nothing to go up from
+                            // for an occur over a file-less buffer). The
+                            // results buffer stays open.
+                            var up: ?[]u8 = null;
+                            defer if (up) |u| gpa.free(u);
+                            if (is_files) {
+                                if (find_dir) |d| up = Dired.parentOf(gpa, d) catch null;
+                            } else if (is_occur) {
+                                if (occur_source) |s| {
+                                    const dir = try Dired.startingDir(gpa, s);
+                                    defer gpa.free(dir);
+                                    up = Dired.parentOf(gpa, dir) catch null;
+                                }
+                            }
+                            if (up) |u| {
+                                recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                                current = try openBufferOrDired(gpa, io, &buffers, &direds, &recent, u);
+                                focused.buf_idx = current;
+                            }
                         } else if (is_files) {
                             if (key.matches(vaxis.Key.backspace, .{})) {
                                 // Backspace shortens the filter.

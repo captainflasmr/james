@@ -83,7 +83,7 @@ pub fn startingDir(gpa: std.mem.Allocator, filename: []const u8) ![]u8 {
 /// literal ".." components instead, which the OS resolves fine. Returns
 /// null only when `current` is an absolute path already at the filesystem
 /// root, where there is truly nowhere further to go.
-fn parentOf(gpa: std.mem.Allocator, current: []const u8) !?[]u8 {
+pub fn parentOf(gpa: std.mem.Allocator, current: []const u8) !?[]u8 {
     if (std.mem.eql(u8, current, ".")) return try gpa.dupe(u8, "..");
     if (std.mem.eql(u8, std.fs.path.basename(current), "..")) {
         return try std.fs.path.join(gpa, &.{ current, ".." });
