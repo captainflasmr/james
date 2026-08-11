@@ -979,7 +979,7 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
         if (files_view) |fv| {
             if (buf == fv.buf) {
                 const n = if (fv.filter.len > 0)
-                    std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}{s}   filter: {s}   (C-g/Esc clears, Enter opens, F follows, g rerun)", .{
+                    std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}{s}   filter: {s}   (C-n/C-p move, C-g/Esc clears, Enter opens, F follows, g rerun)", .{
                         fv.buf.display_name orelse "?",
                         if (fv.follow) " [follow]" else "",
                         buf.cursor_row + 1,
@@ -989,7 +989,7 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
                         fv.filter,
                     }) catch break :blk .{ .len = 0, .label_len = 0 }
                 else
-                    std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}{s}   (type to filter, C-s searches, Enter opens, F follows, g rerun, C-g/Esc closes)", .{
+                    std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}{s}   (type to filter, C-n/C-p move, C-s searches, Enter opens, F follows, g rerun, C-g/Esc closes)", .{
                         fv.buf.display_name orelse "?",
                         if (fv.follow) " [follow]" else "",
                         buf.cursor_row + 1,
@@ -6526,11 +6526,14 @@ pub fn main(init: std.process.Init) !void {
                                 results_follow = false;
                                 grep_hl = null;
                             }
-                        } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
-                            // n / p (and C-n / C-p / arrows) move between
-                            // the entries; with follow mode on (F) the
-                            // entry under point opens in the target window
-                            // automatically, focus staying here.
+                        } else if ((!is_files and key.matches('n', .{})) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
+                            // C-n / C-p (and arrows) move between the
+                            // entries; with follow mode on (F) the entry
+                            // under point opens in the target window
+                            // automatically, focus staying here. The plain
+                            // n / p step only in *grep* / *occur*, where no
+                            // key types text — in *files* every letter
+                            // filters, so n and p type too.
                             const limit: usize = if (is_files) buf.lines.items.len else if (is_occur) occur_matches.items.len else grep_matches.items.len;
                             if (buf.cursor_row + 1 < limit) {
                                 buf.cursor_row += 1;
@@ -6546,7 +6549,7 @@ pub fn main(init: std.process.Init) !void {
                                     }
                                 }
                             }
-                        } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
+                        } else if ((!is_files and key.matches('p', .{})) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
                             if (buf.cursor_row > 0) {
                                 buf.cursor_row -= 1;
                                 buf.cursor_col = 0;
@@ -6633,6 +6636,24 @@ pub fn main(init: std.process.Init) !void {
                                 current = try openBufferOrDired(gpa, io, &buffers, &direds, &recent, u);
                                 focused.buf_idx = current;
                             }
+                        } else if (key.matches('<', .{ .alt = true })) {
+                            // M-<: beginning of the list.
+                            buf.moveBufStart();
+                        } else if (key.matches('>', .{ .alt = true })) {
+                            // M->: end of the list.
+                            buf.moveBufEnd();
+                        } else if (key.matches('j', .{ .alt = true })) {
+                            // M-j: 5 entries down.
+                            buf.moveLines(5);
+                        } else if (key.matches('k', .{ .alt = true })) {
+                            // M-k: 5 entries up.
+                            buf.moveLines(-5);
+                        } else if (key.matches('J', .{ .alt = true })) {
+                            // M-J: a page down the list (Emacs scroll-up).
+                            buf.moveLines(@intCast(focused_text_height -| 1));
+                        } else if (key.matches('K', .{ .alt = true })) {
+                            // M-K: a page up the list (Emacs scroll-down).
+                            buf.moveLines(-@as(isize, @intCast(focused_text_height -| 1)));
                         } else if (is_files) {
                             if (key.matches(vaxis.Key.backspace, .{})) {
                                 // Backspace shortens the filter.
