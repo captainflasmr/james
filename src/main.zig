@@ -1073,6 +1073,22 @@ const Pane = struct {
     }
 };
 
+/// The resize step for the C-M-h / C-M-l width keys, in 256ths of the
+/// split's total: ~2 columns per press, scaled by the window width —
+/// the old fixed 8/256 step moved about six columns on a 200-column
+/// terminal, a jump per keypress on any wide screen.
+fn resizeColsStep(total: usize) i16 {
+    return @intCast(512 / @max(total, 1));
+}
+
+/// The resize step for the C-M-j / C-M-k height keys: ~1 row per press.
+/// A terminal is far shorter than it is wide, so the width formula's
+/// fraction would move the divider proportionally much further per
+/// press (2 of 30 rows is a 6% jump, 2 of 100 columns barely 2%).
+fn resizeRowsStep(total: usize) i16 {
+    return @intCast(256 / @max(total, 1));
+}
+
 /// A tab: an independent window layout (its own pane tree) over the
 /// shared buffer list, numbered 1..N and shown as blocks at the top of
 /// the screen once a second one exists. M-l = opens a new tab at the
@@ -7175,25 +7191,26 @@ pub fn main(init: std.process.Init) !void {
                         // without the kitty keyboard protocol send the
                         // chord as ESC + the control byte (0x08 = C-h),
                         // which vaxis reports as alt + 0x08 — both
-                        // encodings are bound here.
+                        // encodings are bound here. The step is ~2 columns
+                        // of the screen per press (see resizeStep).
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                        root.resizeDivider(focused, .vertical, -8);
+                        root.resizeDivider(focused, .vertical, -resizeColsStep(if (last_winsize) |ws| ws.cols else 100));
                     } else if (key.matches(0x0C, .{ .alt = true }) or key.matches('l', .{ .alt = true, .ctrl = true })) {
                         // C-M-l: the mirror of C-M-h — a left window
                         // grows, a right one shrinks.
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                        root.resizeDivider(focused, .vertical, 8);
+                        root.resizeDivider(focused, .vertical, resizeColsStep(if (last_winsize) |ws| ws.cols else 100));
                     } else if (key.matches(0x0A, .{ .alt = true }) or key.matches('j', .{ .alt = true, .ctrl = true })) {
                         // C-M-j: resize height, matching the author's
                         // Emacs — a top window shrinks, a bottom one
                         // grows.
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                        root.resizeDivider(focused, .horizontal, -8);
+                        root.resizeDivider(focused, .horizontal, -resizeRowsStep(if (last_winsize) |ws| ws.rows else 30));
                     } else if (key.matches(0x0B, .{ .alt = true }) or key.matches('k', .{ .alt = true, .ctrl = true })) {
                         // C-M-k: the mirror of C-M-j — a top window
                         // grows, a bottom one shrinks.
                         recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                        root.resizeDivider(focused, .horizontal, 8);
+                        root.resizeDivider(focused, .horizontal, resizeRowsStep(if (last_winsize) |ws| ws.rows else 30));
                     } else if (key.matches(vaxis.Key.enter, .{}) or key.matches(0x0A, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
                         // A bare LF (0x0A) key event is a paste-delivered
                         // line break: Windows terminals that synthesize
