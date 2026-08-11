@@ -9,4 +9,8 @@ This document contains the current bugs/improvements, this is just for me mainly
 
 * Bugs/Improvements
 
-** DONE scroll lock
+** TODO horizontal window resizing to not resize in such large jumps
+
+** TODO when running windows the terminal on the welcome screen comes up as unknown
+
+** TODO open terminal from the current dired
