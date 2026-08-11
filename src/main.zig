@@ -1825,7 +1825,10 @@ fn winFlushConsoleInput(tty: *vaxis.Tty) void {
 
 /// C-x j: hand the terminal to a real shell. Returns the pid of a shell
 /// suspended with C-z (to resume on the next C-x j), or null when the
-/// shell exited or none could be started.
+/// shell exited or none could be started. The shell starts in
+/// `shell_dir` when one is given — the dired's directory while browsing,
+/// the current file's directory otherwise — so a fresh shell lands where
+/// the cursor is, ready to work (null keeps the editor's own directory).
 fn enterShell(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -1835,9 +1838,10 @@ fn enterShell(
     tty: *vaxis.Tty,
     shell_pid: ?std.posix.pid_t,
     editor_pgrp: ?std.posix.pid_t,
+    shell_dir: ?[]const u8,
 ) !?std.posix.pid_t {
     if (comptime builtin.os.tag == .windows) {
-        return enterShellWindows(gpa, io, environ_map, loop, vx, tty);
+        return enterShellWindows(gpa, io, environ_map, loop, vx, tty, shell_dir);
     }
 
     // Stop the input thread first: while the shell owns the terminal the
@@ -1862,12 +1866,21 @@ fn enterShell(
         resuming = true;
     } else {
         const shell_path = environ_map.get("SHELL") orelse "/bin/sh";
-        const child = std.process.spawn(io, .{ .argv = &.{shell_path}, .pgid = 0 }) catch
-            std.process.spawn(io, .{ .argv = &.{"/bin/sh"}, .pgid = 0 }) catch {
-            // No usable shell: come back to the editor untouched.
-            restoreEditor(gpa, vx, tty) catch {};
-            loop.start() catch {};
-            return null;
+        // The shell starts in the buffer's directory when one is given:
+        // spawn's cwd option chdirs in the child (POSIX) or passes the
+        // path to CreateProcessW (Windows), so a fresh shell lands where
+        // the cursor is.
+        var shell_opts: std.process.SpawnOptions = .{ .argv = &.{shell_path}, .pgid = 0 };
+        if (shell_dir) |d| shell_opts.cwd = .{ .path = d };
+        const child = std.process.spawn(io, shell_opts) catch blk: {
+            var fallback: std.process.SpawnOptions = .{ .argv = &.{"/bin/sh"}, .pgid = 0 };
+            if (shell_dir) |d| fallback.cwd = .{ .path = d };
+            break :blk std.process.spawn(io, fallback) catch {
+                // No usable shell: come back to the editor untouched.
+                restoreEditor(gpa, vx, tty) catch {};
+                loop.start() catch {};
+                return null;
+            };
         };
         pid = @intCast(child.id.?);
     }
@@ -1896,6 +1909,7 @@ fn enterShellWindows(
     loop: *vaxis.Loop(Event),
     vx: *vaxis.Vaxis,
     tty: *vaxis.Tty,
+    shell_dir: ?[]const u8,
 ) !?std.posix.pid_t {
     loop.stop();
     while (loop.tryEvent() catch null) |_| {}
@@ -1914,7 +1928,11 @@ fn enterShellWindows(
 
     const shell_path = environ_map.get("SHELL") orelse
         (environ_map.get("COMSPEC") orelse "cmd.exe");
-    var child = std.process.spawn(io, .{ .argv = &.{shell_path} }) catch {
+    // The shell starts in the buffer's directory when one is given (the
+    // spawn's cwd option passes the path to CreateProcessW).
+    var shell_opts: std.process.SpawnOptions = .{ .argv = &.{shell_path} };
+    if (shell_dir) |d| shell_opts.cwd = .{ .path = d };
+    var child = std.process.spawn(io, shell_opts) catch {
         // No usable shell: come back to the editor untouched.
         restoreEditorWindows(gpa, vx, tty) catch {};
         loop.start() catch {};
@@ -6085,7 +6103,18 @@ pub fn main(init: std.process.Init) !void {
                         // whole screen until it exits (exit / C-d) or is
                         // suspended with C-z, which brings the editor back;
                         // C-x j (or C-x c) then resumes that same shell.
-                        shell_pid = try enterShell(gpa, io, init.environ_map, &loop, &vx, &tty, shell_pid, editor_pgrp);
+                        // A fresh shell starts in the current context's
+                        // directory: the dired's own while browsing, the
+                        // file's directory otherwise (the editor's working
+                        // directory when the buffer has no file).
+                        const shell_dir: ?[]const u8 = if (direds.items[current]) |*d|
+                            try gpa.dupe(u8, d.path.items)
+                        else if (buf.filename) |f|
+                            try Dired.startingDir(gpa, f)
+                        else
+                            null;
+                        defer if (shell_dir) |sd| gpa.free(sd);
+                        shell_pid = try enterShell(gpa, io, init.environ_map, &loop, &vx, &tty, shell_pid, editor_pgrp, shell_dir);
                     }
                 } else if (pending_ctrl_x_r) {
                     pending_ctrl_x_r = false;

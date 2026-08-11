@@ -8,7 +8,3 @@
 This document contains the current bugs/improvements, this is just for me mainly but does include any Issues reported.
 
 * Bugs/Improvements
-
-** TODO when running windows the terminal on the welcome screen comes up as unknown
-
-** TODO open terminal from the current dired
