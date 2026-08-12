@@ -3732,6 +3732,7 @@ const welcome_tail =
     \\    C-c f               find files (fuzzy list)
     \\    C-c g               grep the current directory (Enter opens, F follows)
     \\    C-c j / C-c k       step back / forward through window layouts (j / k repeat)
+    \\    C-c r               re-render the whole frame (fixes display glitches)
     \\
     \\  M-l — jumps and tabs (the my-jump prefix):
     \\
@@ -5595,6 +5596,16 @@ pub fn main(init: std.process.Init) !void {
                             current = focused.buf_idx;
                         }
                         repeat_map = .window_history;
+                    } else if (key.matches('r', .{})) {
+                        // C-c r: force a full re-render of the frame — the
+                        // next vx.render repaints every cell instead of
+                        // diffing against the last frame (vaxis
+                        // queueRefresh), washing out any stray characters
+                        // the terminal has picked up (most often seen on
+                        // Windows, where the console can drop or mangle
+                        // output from background tools).
+                        vx.queueRefresh();
+                        status_msg = "Display refreshed";
                     }
                 } else if (switching_buffer) {
                     if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {

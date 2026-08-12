@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.66.0 — <2026-08-12>
+
+=C-c r= forces a full re-render of the frame, washing out stray characters the terminal has picked up.
+
+- =C-c r= (the =C-c= family's free =r=, for refresh) makes the next frame a full repaint: vaxis's =queueRefresh= skips the frame-to-frame diff and writes every cell afresh, so any garbage the terminal has accumulated — random characters appearing on screen, most often noticed on Windows, where the console can mangle or drop output from the background grep / find tools and the cp / robocopy / PowerShell helpers — is overwritten and the display is clean again. The modeline reports =Display refreshed= so the press is visible, and the message lingers until the next keypress like any transient status. One keypress, anywhere in the editor (file buffers, direds, the results lists), and the layout is untouched.
+
 ** 0.65.0 — <2026-08-12>
 
 Dired marks by regexp: =%= =m= prompts for a pattern and marks every entry whose name matches.
