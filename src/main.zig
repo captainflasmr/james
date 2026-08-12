@@ -41,6 +41,17 @@ const Event = union(enum) {
     /// The terminal's answer to an OSC 52 clipboard request; the text is
     /// allocated with gpa and must be freed by the handler.
     paste: []const u8,
+    /// A background grep / find made progress — posted by the worker as
+    /// its output grows, and by the size watchdog every ~100ms while a
+    /// run is active so the modeline's spinner ticks even when the tool
+    /// is quiet. The main loop redraws and reads the count; a stale
+    /// pointer from a superseded run is recognized by comparison and
+    /// never dereferenced.
+    proc_progress: *ProcRun,
+    /// The worker finished (done, failed or cancelled): the run is still
+    /// alive until this event is handled, then the main loop joins the
+    /// thread and frees it.
+    proc_done: *ProcRun,
 };
 
 // The mark region and the isearch match keep this reverse-video
@@ -1569,15 +1580,203 @@ fn filesMirror(gpa: std.mem.Allocator, buf: *Buffer, paths: []const []const u8, 
     buf.cursor_col = 0;
 }
 
-/// Run the file-finder over `dir` and (re)fill the *files* buffer: the
-/// existing one is re-mirrored, or a new buffer is created. Returns the
-/// buffer index; null when the find fails or finds nothing.
-fn filesRun(
-    gpa: std.mem.Allocator,
+/// The background grep / find worker, run on its own thread: spawns the
+/// first command line that starts (the primary tool, then the fallback),
+/// captures stdout incrementally — counting lines for the live modeline
+/// status — and posts a final .proc_done event. The run struct stays
+/// owned by the main loop; nothing is touched after the post.
+fn procWorker(io: std.Io, gpa: std.mem.Allocator, loop: *vaxis.Loop(Event), run: *ProcRun) void {
+    var child: ?std.process.Child = null;
+    for (0..run.argv_len.len) |i| {
+        const len = run.argv_len[i];
+        if (len == 0) continue;
+        if (std.process.spawn(io, .{ .argv = run.argv[i][0..len], .stdin = .ignore, .stdout = .pipe, .stderr = .ignore })) |c| {
+            child = c;
+            break;
+        } else |_| {}
+    }
+    if (child == null) {
+        run.state.store(.failed, .release);
+        _ = loop.tryPostEvent(.{ .proc_done = run }) catch {};
+        return;
+    }
+    var lines: usize = 0;
+    var last_posted: usize = 0;
+    var last_post_at: i128 = std.Io.Clock.now(.real, io).nanoseconds;
+    if (child.?.stdout) |f| {
+        var buf: [1024]u8 = undefined;
+        var r = f.reader(io, &buf);
+        var chunk: [1024]u8 = undefined;
+        while (!run.cancel.load(.acquire)) {
+            const n = r.interface.readSliceShort(&chunk) catch break;
+            if (n == 0) break;
+            run.out.appendSlice(gpa, chunk[0..n]) catch break;
+            lines += std.mem.count(u8, chunk[0..n], "\n");
+            // Throttle the progress posts: every 64 lines, or 100ms.
+            const now = std.Io.Clock.now(.real, io).nanoseconds;
+            if (lines - last_posted >= 64 or now - last_post_at >= 100_000_000) {
+                run.lines.store(lines, .release);
+                last_posted = lines;
+                last_post_at = now;
+                _ = loop.tryPostEvent(.{ .proc_progress = run }) catch {};
+            }
+        }
+    }
+    // The final line may lack its trailing newline.
+    if (run.out.items.len > 0 and run.out.items[run.out.items.len - 1] != '\n') lines += 1;
+    run.lines.store(lines, .release);
+    if (run.cancel.load(.acquire)) {
+        child.?.kill(io);
+        run.state.store(.cancelled, .release);
+    } else {
+        const term = child.?.wait(io) catch null;
+        const state: ProcState = if (term) |t| switch (t) {
+            .exited => .done,
+            else => .failed,
+        } else .failed;
+        run.state.store(state, .release);
+    }
+    _ = loop.tryPostEvent(.{ .proc_done = run }) catch {};
+}
+
+/// Kick off a background grep / find: the worker thread runs the tool
+/// while the editor stays responsive, posting progress and a final
+/// .proc_done event. A previous run still in flight is asked to stop
+/// (its done event is recognized as stale and freed without
+/// finalizing). True when the worker was spawned; on failure the run is
+/// left intact for the caller to free.
+fn startProc(
     io: std.Io,
+    gpa: std.mem.Allocator,
+    loop: *vaxis.Loop(Event),
+    run: *ProcRun,
+    proc_run: *?*ProcRun,
+    proc_current: *std.atomic.Value(?*ProcRun),
+) bool {
+    if (proc_run.*) |old| old.cancel.store(true, .release);
+    run.future = io.concurrent(procWorker, .{ io, gpa, loop, run }) catch return false;
+    proc_run.* = run;
+    proc_current.store(run, .release);
+    return true;
+}
+
+/// Free a ProcRun: the label (unless the finalizer took it over), every
+/// argv string, the collected output and the struct itself.
+fn freeProcRun(gpa: std.mem.Allocator, run: *ProcRun) void {
+    if (run.label.len > 0) gpa.free(run.label);
+    for (0..run.argv_len.len) |i| {
+        for (run.argv[i][0..run.argv_len[i]]) |arg| gpa.free(arg);
+    }
+    run.out.deinit(gpa);
+    gpa.destroy(run);
+}
+
+/// Dupe one candidate command line into the run's slot `k`. The caller
+/// keeps its own copy of the args; on failure the slot is left empty
+/// (and any partial dups freed).
+fn setArgv(gpa: std.mem.Allocator, run: *ProcRun, k: usize, argv: []const []const u8) bool {
+    if (argv.len > run.argv[k].len) return false;
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        run.argv[k][i] = gpa.dupe(u8, argv[i]) catch {
+            for (run.argv[k][0..i]) |a| gpa.free(a);
+            run.argv_len[k] = 0;
+            return false;
+        };
+    }
+    run.argv_len[k] = argv.len;
+    return true;
+}
+
+/// The grep command lines: ripgrep, with findstr (Windows) or grep
+/// (elsewhere) as the fallback the worker tries when rg can't spawn.
+/// Returns the number of lines built.
+fn grepArgv(gpa: std.mem.Allocator, run: *ProcRun, dir: []const u8, term: []const u8) usize {
+    var n: usize = 0;
+    if (setArgv(gpa, run, 0, &.{ "rg", "--color=never", "--column", "--line-number", "--no-heading", "--smart-case", "-e", term, dir })) n = 1;
+    if (comptime builtin.os.tag == .windows) {
+        const literal = std.fmt.allocPrint(gpa, "/c:{s}", .{term}) catch return n;
+        defer gpa.free(literal);
+        const pattern = if (dir.len > 0 and dir[dir.len - 1] == std.fs.path.sep)
+            std.fmt.allocPrint(gpa, "{s}*", .{dir}) catch return n
+        else
+            std.fmt.allocPrint(gpa, "{s}{c}*", .{ dir, std.fs.path.sep }) catch return n;
+        defer gpa.free(pattern);
+        if (setArgv(gpa, run, 1, &.{ "findstr", "/s", "/n", "/i", literal, pattern })) n = 2;
+    } else {
+        if (setArgv(gpa, run, 1, &.{ "grep", "-rni", "-e", term, dir })) n = 2;
+    }
+    return n;
+}
+
+/// The file-finder command lines: ripgrep --files, with `find -type f`
+/// (POSIX) or `dir /s /b` (Windows) as the fallback. Returns the number
+/// of lines built.
+fn findArgv(gpa: std.mem.Allocator, run: *ProcRun, dir: []const u8) usize {
+    var n: usize = 0;
+    if (setArgv(gpa, run, 0, &.{ "rg", "--files", dir })) n = 1;
+    if (comptime builtin.os.tag == .windows) {
+        if (setArgv(gpa, run, 1, &.{ "cmd.exe", "/c", "dir", "/s", "/b", dir })) n = 2;
+    } else {
+        if (setArgv(gpa, run, 1, &.{ "find", dir, "-type", "f" })) n = 2;
+    }
+    return n;
+}
+
+/// The background grep landed: build the *grep* buffer from the
+/// worker's output. Returns the buffer index; null when nothing
+/// matched (the caller sets the status). Takes over the run's label as
+/// the remembered last term.
+fn finishGrep(
+    gpa: std.mem.Allocator,
     buffers: *std.ArrayList(*Buffer),
     direds: *std.ArrayList(?Dired),
-    dir: []const u8,
+    run: *ProcRun,
+    grep_buf_idx: *?usize,
+    grep_last_term: *?[]u8,
+    grep_matches: *std.ArrayList(GrepMatch),
+) ?usize {
+    if (grep_last_term.*) |t| gpa.free(t);
+    grep_last_term.* = run.label;
+    run.label = &.{};
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    var it = std.mem.splitScalar(u8, run.out.items, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (parseGrepLine(gpa, line)) |m| {
+            text.appendSlice(gpa, line) catch break;
+            text.append(gpa, '\n') catch break;
+            grep_matches.append(gpa, m) catch {
+                gpa.free(m.path);
+                break;
+            };
+        }
+    }
+    if (grep_matches.items.len == 0) return null;
+    const new_buf = gpa.create(Buffer) catch return null;
+    errdefer gpa.destroy(new_buf);
+    new_buf.* = Buffer.fromText(gpa, text.items) catch return null;
+    new_buf.display_name = gpa.dupe(u8, "*grep*") catch return null;
+    // Results always truncate: one match per row, however long the
+    // line (the modeline's [truncate] shows the state).
+    new_buf.soft_wrap = false;
+    buffers.append(gpa, new_buf) catch return null;
+    direds.append(gpa, null) catch return null;
+    grep_buf_idx.* = buffers.items.len - 1;
+    return grep_buf_idx.*;
+}
+
+/// The background find landed: (re)fill the *files* buffer from the
+/// worker's output — the existing buffer is re-mirrored, or a new one
+/// is created. Returns the buffer index; null when nothing was found
+/// (the caller sets the status). Takes over the run's label as the
+/// remembered find directory.
+fn finishFind(
+    gpa: std.mem.Allocator,
+    buffers: *std.ArrayList(*Buffer),
+    direds: *std.ArrayList(?Dired),
+    run: *ProcRun,
     find_paths: *std.ArrayList([]u8),
     find_dir: *?[]u8,
     find_filter: *std.ArrayList(u8),
@@ -1585,13 +1784,11 @@ fn filesRun(
     find_hl: *std.ArrayList(FuzzyHl),
     find_buf_idx: *?usize,
 ) ?usize {
-    const out = findRun(io, gpa, dir) orelse return null;
-    defer gpa.free(out);
     for (find_paths.items) |p| gpa.free(p);
     find_paths.clearRetainingCapacity();
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
-    var it = std.mem.splitScalar(u8, out, '\n');
+    var it = std.mem.splitScalar(u8, run.out.items, '\n');
     while (it.next()) |raw| {
         const p = std.mem.trim(u8, raw, " \t\r");
         if (p.len == 0) continue;
@@ -1601,7 +1798,8 @@ fn filesRun(
     }
     if (find_paths.items.len == 0) return null;
     if (find_dir.*) |d| gpa.free(d);
-    find_dir.* = gpa.dupe(u8, dir) catch null;
+    find_dir.* = run.label;
+    run.label = &.{};
     find_filter.clearRetainingCapacity();
 
     // Reuse the existing *files* buffer (re-mirror), or create it.
@@ -1624,22 +1822,12 @@ fn filesRun(
         }
     }
     const new_buf = gpa.create(Buffer) catch return null;
-    new_buf.* = Buffer.fromText(gpa, text.items) catch {
-        gpa.destroy(new_buf);
-        return null;
-    };
-    new_buf.display_name = gpa.dupe(u8, "*files*") catch {
-        new_buf.deinit(gpa);
-        gpa.destroy(new_buf);
-        return null;
-    };
+    errdefer gpa.destroy(new_buf);
+    new_buf.* = Buffer.fromText(gpa, text.items) catch return null;
+    new_buf.display_name = gpa.dupe(u8, "*files*") catch return null;
     // Results always truncate: one row per file.
     new_buf.soft_wrap = false;
-    buffers.append(gpa, new_buf) catch {
-        new_buf.deinit(gpa);
-        gpa.destroy(new_buf);
-        return null;
-    };
+    buffers.append(gpa, new_buf) catch return null;
     direds.append(gpa, null) catch return null;
     find_buf_idx.* = buffers.items.len - 1;
     filesMirror(gpa, new_buf, find_paths.items, "", find_visible, find_hl);
@@ -2755,6 +2943,54 @@ const FilesView = struct {
     row_hl: []const FuzzyHl,
 };
 
+/// A background grep / find (C-c g, C-c f, g): the tool runs on its own
+/// thread (procWorker) so the editor stays responsive, with the live
+/// status — a spinner, the matches / files counted so far and the
+/// elapsed time — on the modeline and C-g to cancel. Owned by the main
+/// loop, which frees it when the worker's .proc_done event is handled;
+/// the worker writes only `lines` / `state` / `cancel` (atomics) and
+/// its own `out` buffer, and touches nothing else after posting
+/// .proc_done. The finalizer takes over `label` (the last term / find
+/// directory), so freeProcRun skips it once transferred.
+const ProcRun = struct {
+    const Kind = enum { grep, find };
+
+    kind: Kind,
+    /// Whether the results buffer takes the focus when the run lands
+    /// (the C-c f / C-c g starts do; the *files* g re-run doesn't).
+    jump: bool,
+    /// The search term (grep) or directory (find), for the modeline.
+    label: []u8 = &.{},
+    /// Two candidate command lines — the primary tool and its fallback
+    /// (findstr / grep, or find / dir): the worker tries the second only
+    /// when the first can't spawn. Each arg is a gpa-duped slice.
+    argv: [2][9][]const u8 = undefined,
+    argv_len: [2]usize = .{ 0, 0 },
+    /// The collected stdout, written by the worker only.
+    out: std.ArrayList(u8) = .empty,
+    /// Matches (grep) or files (find) seen so far.
+    lines: std.atomic.Value(usize) = .init(0),
+    state: std.atomic.Value(ProcState) = .init(.running),
+    /// Set by the main loop to cancel; the worker sees it at its next
+    /// read and kills the child (a silent child is noticed at its next
+    /// output or exit).
+    cancel: std.atomic.Value(bool) = .init(false),
+    /// The worker thread, joined when the .proc_done event lands.
+    future: ?std.Io.Future(void) = null,
+    /// When the run started, for the modeline's elapsed time.
+    started: i128 = 0,
+};
+
+const ProcState = enum(u8) {
+    running,
+    done,
+    /// The tool exited abnormally, or nothing came back at all (rg
+    /// exits 1 on no matches): the finalizer distinguishes the two by
+    /// the collected output's length.
+    failed,
+    cancelled,
+};
+
 /// Parse one grep result line into a match: the first "colon, digits,
 /// [colon, digits], colon" segment ends the file path — ripgrep prints
 /// "path:line:col: text", grep and findstr "path:line:text" (findstr with
@@ -2789,39 +3025,6 @@ fn parseGrepLine(gpa: std.mem.Allocator, line: []const u8) ?GrepMatch {
         };
     }
     return null;
-}
-
-/// Run the grep over `dir` for `term`, returning the raw output (null on
-/// failure or no matches): ripgrep first, then grep (POSIX) / findstr
-/// (Windows).
-fn grepRun(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, term: []const u8) ?[]u8 {
-    if (comptime builtin.os.tag == .windows) {
-        if (runCapture(io, gpa, &.{ "rg", "--color=never", "--column", "--line-number", "--no-heading", "--smart-case", "-e", term, dir })) |out| return out;
-        const literal = std.fmt.allocPrint(gpa, "/c:{s}", .{term}) catch return null;
-        defer gpa.free(literal);
-        const pattern = if (dir.len > 0 and dir[dir.len - 1] == std.fs.path.sep)
-            std.fmt.allocPrint(gpa, "{s}*", .{dir}) catch return null
-        else
-            std.fmt.allocPrint(gpa, "{s}{c}*", .{ dir, std.fs.path.sep }) catch return null;
-        defer gpa.free(pattern);
-        return runCapture(io, gpa, &.{ "findstr", "/s", "/n", "/i", literal, pattern });
-    }
-    if (runCapture(io, gpa, &.{ "rg", "--color=never", "--column", "--line-number", "--no-heading", "--smart-case", "-e", term, dir })) |out| return out;
-    return runCapture(io, gpa, &.{ "grep", "-rni", "-e", term, dir });
-}
-
-/// Run the platform's file-finder over `dir`, returning the file list
-/// (null on failure): ripgrep --files when available, then the built-in
-/// find — `find -type f` on POSIX, Windows' `dir /s /b` (Windows has no
-/// find that lists names: its find.exe searches file contents, the
-/// DOS-era grep — dir is the name lister).
-fn findRun(io: std.Io, gpa: std.mem.Allocator, dir: []const u8) ?[]u8 {
-    if (comptime builtin.os.tag == .windows) {
-        if (runCapture(io, gpa, &.{ "rg", "--files", dir })) |out| return out;
-        return runCapture(io, gpa, &.{ "cmd.exe", "/c", "dir", "/s", "/b", dir });
-    }
-    if (runCapture(io, gpa, &.{ "rg", "--files", dir })) |out| return out;
-    return runCapture(io, gpa, &.{ "find", dir, "-type", "f" });
 }
 
 /// The application the desktop would use to open `path` externally: on
@@ -2941,17 +3144,27 @@ fn syncClipboard(vx: *vaxis.Vaxis, tty: *vaxis.Tty, gpa: std.mem.Allocator, kill
 // right and bottom — until the next keystroke. A dedicated thread
 // re-reads the kernel's ioctl size every 100ms and posts a winsize event
 // only when it actually changed, so the editor tracks the terminal on
-// its own, fast enough to land well before the next keystroke.
+// its own, fast enough to land well before the next keystroke. It also
+// carries the running-search heartbeat: while a background grep / find
+// is active it posts a .proc_progress tick each wake, so the modeline's
+// spinner keeps turning even when the tool is quiet — same thread, no
+// extra machinery.
 //
 // A thread rather than a signal handler: postEvent takes the event
 // queue's mutex, and a handler that interrupted the main thread inside a
 // queue critical section would deadlock on it. The thread holds no
 // locks across the editor's fork for the C-x j shell (spawn does no
 // allocation between fork and exec), so the swap stays safe too.
-fn sizeWatchdogMain(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event)) void {
+fn sizeWatchdogMain(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event), proc_current: *std.atomic.Value(?*ProcRun)) void {
     var last: vaxis.Winsize = tty.getWinsize() catch std.mem.zeroes(vaxis.Winsize);
     while (true) {
         io.sleep(std.Io.Duration.fromMilliseconds(100), .real) catch continue;
+        // The running-search heartbeat: a tick keeps the live status
+        // animated. A stale pointer in a racing post is ignored by the
+        // main loop, never dereferenced.
+        if (proc_current.load(.acquire)) |run| {
+            _ = loop.tryPostEvent(.{ .proc_progress = run }) catch {};
+        }
         const ws = tty.getWinsize() catch continue;
         if (ws.cols == 0 or ws.rows == 0) continue;
         if (last.cols == ws.cols and last.rows == ws.rows) continue;
@@ -2963,10 +3176,10 @@ fn sizeWatchdogMain(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event)) void 
     }
 }
 
-fn armSizeWatchdog(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event)) void {
+fn armSizeWatchdog(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event), proc_current: *std.atomic.Value(?*ProcRun)) void {
     // The future is deliberately dropped: its thread runs for the life of
     // the editor, and the dropped wrapper keeps the context alive.
-    _ = io.concurrent(sizeWatchdogMain, .{ io, tty, loop }) catch {};
+    _ = io.concurrent(sizeWatchdogMain, .{ io, tty, loop, proc_current }) catch {};
 }
 
 /// Render one dired listing plus its own compact modeline into `win`, which
@@ -4630,6 +4843,23 @@ pub fn main(init: std.process.Init) !void {
     // C-g C-/: redo — the author's Emacs habit. C-g leaves this set for
     // the next keypress; anything other than C-/ clears it again.
     var pending_ctrl_g = false;
+    // A background grep / find (C-c g / C-c f / g): the tool runs on
+    // its own thread (see procWorker), the live status shows on the
+    // modeline while it runs (see the render section) and C-g cancels.
+    // `proc_run` is the active run (null between runs) and
+    // `proc_current` is the size watchdog's atomic window into it —
+    // the watchdog posts the .proc_progress ticks that keep the
+    // spinner turning (no extra thread). The worker's thread lives in
+    // the run itself (ProcRun.future) and is joined when the
+    // .proc_done event lands.
+    var proc_run: ?*ProcRun = null;
+    var proc_current: std.atomic.Value(?*ProcRun) = .init(null);
+    defer {
+        // Quitting with a search still running: ask its worker to stop,
+        // so no orphaned rg / find keeps scanning after the editor is
+        // gone (the worker notices at its next read and kills it).
+        if (proc_run) |run| run.cancel.store(true, .release);
+    }
     if (tty.getWinsize() catch null) |ws| {
         if (ws.cols > 0 and ws.rows > 0) {
             try vx.resize(gpa, tty.writer(), ws);
@@ -4638,7 +4868,7 @@ pub fn main(init: std.process.Init) !void {
     }
     // The size watchdog is portable (a thread + ioctl/console query), so
     // every platform gets the same safety net.
-    armSizeWatchdog(io, &tty, &loop);
+    armSizeWatchdog(io, &tty, &loop, &proc_current);
 
     var pending_ctrl_x = false;
     var pending_ctrl_x_r = false;
@@ -4989,6 +5219,67 @@ pub fn main(init: std.process.Init) !void {
                     if (key.codepoint == vaxis.Key.left_alt or key.codepoint == vaxis.Key.right_alt) windows_pending_alt = false;
                 }
             },
+            .proc_progress => {
+                // A background grep / find made progress — from the worker
+                // (more output) or the heartbeat (a tick): nothing to do
+                // here, the frame below redraws the live status.
+            },
+            .proc_done => |run| proc_done_blk: {
+                // The worker posted this as its last act: join its thread
+                // (its future lives in the run, so a superseded run's
+                // event never blocks on the wrong worker), then either
+                // finalize the run — build the results buffer, move
+                // focus — or, when a newer run already replaced it, just
+                // free it.
+                if (run.future) |*f| f.await(io);
+                run.future = null;
+                if (proc_run == null or run != proc_run.?) {
+                    freeProcRun(gpa, run);
+                    break :proc_done_blk;
+                }
+                proc_run = null;
+                proc_current.store(null, .release);
+                // The live "searching…" status was rebuilt every frame
+                // while the run was active; with nothing running it would
+                // linger forever, so clear it before the finalizer's own
+                // message (if any) takes over.
+                status_msg = null;
+                defer freeProcRun(gpa, run);
+                switch (run.state.load(.acquire)) {
+                    .done => {
+                        if (run.kind == .grep) {
+                            if (finishGrep(gpa, &buffers, &direds, run, &grep_buf_idx, &grep_last_term, &grep_matches)) |idx| {
+                                recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                                current = idx;
+                                focused.buf_idx = current;
+                            } else {
+                                status_msg = "No matches";
+                            }
+                        } else {
+                            if (finishFind(gpa, &buffers, &direds, run, &find_paths, &find_dir, &find_filter, &find_visible, &find_hl, &find_buf_idx)) |idx| {
+                                if (run.jump) {
+                                    recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                                    current = idx;
+                                    focused.buf_idx = current;
+                                    kill_active = false;
+                                }
+                            } else {
+                                status_msg = "No files found";
+                            }
+                        }
+                    },
+                    .failed => {
+                        // An empty capture is the tool's "no match" exit
+                        // (rg exits 1); output that failed to parse means
+                        // the tool itself went wrong.
+                        status_msg = if (run.out.items.len == 0) (if (run.kind == .grep) "No matches" else "No files found") else "Search failed";
+                    },
+                    .cancelled => {
+                        status_msg = if (run.kind == .grep) "Search cancelled" else "Find cancelled";
+                    },
+                    .running => unreachable,
+                }
+            },
             .key_press => |key_evt| key_blk: {
                 var key = key_evt;
                 if (comptime builtin.os.tag == .windows) {
@@ -5012,6 +5303,15 @@ pub fn main(init: std.process.Init) !void {
                     if (windows_pending_alt and !key.mods.alt) key.mods.alt = true;
                 } else if (key.isModifier()) {
                     continue;
+                }
+                // C-g cancels a background grep / find: the worker sees
+                // the flag at its next read and kills the child, then the
+                // .proc_done event lands the run's final state.
+                if (proc_run) |run| {
+                    if (key.matches('g', .{ .ctrl = true })) {
+                        run.cancel.store(true, .release);
+                        break :key_blk;
+                    }
                 }
                 // C-l cycles recenter positions only when pressed back to
                 // back (Emacs recenter-top-bottom); any other key makes the
@@ -5169,19 +5469,25 @@ pub fn main(init: std.process.Init) !void {
                         // while browsing, else the file's) into a
                         // persistent *files* buffer, like *grep*: n/p
                         // steps through it, Enter opens in another window,
-                        // and typing filters it (partial-completion).
-                        const dir = if (direds.items[current]) |*d|
-                            try gpa.dupe(u8, d.path.items)
-                        else
-                            try Dired.startingDir(gpa, buf.filename orelse ".");
-                        defer gpa.free(dir);
-                        if (filesRun(gpa, io, &buffers, &direds, dir, &find_paths, &find_dir, &find_filter, &find_visible, &find_hl, &find_buf_idx)) |idx| {
-                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                            current = idx;
-                            focused.buf_idx = current;
-                            kill_active = false;
-                        } else {
-                            status_msg = "No files found";
+                        // and typing filters it (partial-completion). The
+                        // find runs in the background: the modeline shows
+                        // the files counted so far, and the focus moves to
+                        // the listing when it lands.
+                        f_blk: {
+                            const dir = if (direds.items[current]) |*d|
+                                try gpa.dupe(u8, d.path.items)
+                            else
+                                try Dired.startingDir(gpa, buf.filename orelse ".");
+                            defer gpa.free(dir);
+                            const run = gpa.create(ProcRun) catch break :f_blk;
+                            run.* = .{ .kind = .find, .jump = true, .started = std.Io.Clock.now(.real, io).nanoseconds };
+                            errdefer freeProcRun(gpa, run);
+                            run.label = gpa.dupe(u8, dir) catch break :f_blk;
+                            if (findArgv(gpa, run, dir) == 0) break :f_blk;
+                            if (!startProc(io, gpa, &loop, run, &proc_run, &proc_current)) {
+                                status_msg = "No files found";
+                                break :f_blk;
+                            }
                         }
                     } else if (key.matches('g', .{})) {
                         // C-c g: grep (the my/grep key from the author's
@@ -5313,45 +5619,19 @@ pub fn main(init: std.process.Init) !void {
                                 for (grep_matches.items) |m| gpa.free(m.path);
                                 grep_matches.clearRetainingCapacity();
                             }
-                            const out = grepRun(io, gpa, dir, term) orelse {
-                                status_msg = "No matches";
-                                break :run_blk;
-                            };
-                            defer gpa.free(out);
-                            if (grep_last_term) |t| gpa.free(t);
-                            grep_last_term = gpa.dupe(u8, term) catch null;
-                            var text: std.ArrayList(u8) = .empty;
-                            defer text.deinit(gpa);
-                            var it = std.mem.splitScalar(u8, out, '\n');
-                            while (it.next()) |raw| {
-                                const line = std.mem.trimEnd(u8, raw, "\r");
-                                if (parseGrepLine(gpa, line)) |m| {
-                                    text.appendSlice(gpa, line) catch break;
-                                    text.append(gpa, '\n') catch break;
-                                    grep_matches.append(gpa, m) catch {
-                                        gpa.free(m.path);
-                                        break;
-                                    };
-                                }
-                            }
-                            if (grep_matches.items.len == 0) {
+                            // The search runs in the background: the
+                            // modeline shows the matches counted so far
+                            // (and C-g cancels), and the focus moves to the
+                            // *grep* buffer when it lands.
+                            const run = gpa.create(ProcRun) catch break :run_blk;
+                            run.* = .{ .kind = .grep, .jump = true, .started = std.Io.Clock.now(.real, io).nanoseconds };
+                            errdefer freeProcRun(gpa, run);
+                            run.label = gpa.dupe(u8, term) catch break :run_blk;
+                            if (grepArgv(gpa, run, dir, term) == 0) break :run_blk;
+                            if (!startProc(io, gpa, &loop, run, &proc_run, &proc_current)) {
                                 status_msg = "No matches";
                                 break :run_blk;
                             }
-                            const new_buf = try gpa.create(Buffer);
-                            errdefer gpa.destroy(new_buf);
-                            new_buf.* = try Buffer.fromText(gpa, text.items);
-                            new_buf.display_name = try gpa.dupe(u8, "*grep*");
-                            // Results always truncate: one match per row,
-                            // however long the line (the modeline's
-                            // [truncate] shows the state).
-                            new_buf.soft_wrap = false;
-                            try buffers.append(gpa, new_buf);
-                            try direds.append(gpa, null);
-                            grep_buf_idx = buffers.items.len - 1;
-                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                            current = grep_buf_idx.?;
-                            focused.buf_idx = current;
                         }
                     } else if (key.text) |t| {
                         if (grep_prefill) {
@@ -6492,7 +6772,7 @@ pub fn main(init: std.process.Init) !void {
                     // read-only like a dired, so keys they don't consume
                     // (kills) don't corrupt their rows.
                     const editing = direds.items[current] == null and results_kind == null;
-                    if (results_kind) |rkind| {
+                    if (results_kind) |rkind| results_blk: {
                         const is_files = rkind == .files;
                         const is_occur = rkind == .occur;
                         // Close: C-g / Esc for both (clearing the *files*
@@ -6571,13 +6851,22 @@ pub fn main(init: std.process.Init) !void {
                         } else if (key.matches('g', .{})) {
                             if (is_files) {
                                 // g: re-run the find over the last
-                                // directory, staying in the buffer.
+                                // directory, staying in the buffer. The
+                                // listing keeps its old contents while the
+                                // background find runs; it is re-mirrored
+                                // when the run lands (no focus change).
                                 if (find_dir) |d| {
                                     const dir = gpa.dupe(u8, d) catch null;
                                     defer if (dir) |dd| gpa.free(dd);
                                     if (dir) |dd| {
-                                        if (filesRun(gpa, io, &buffers, &direds, dd, &find_paths, &find_dir, &find_filter, &find_visible, &find_hl, &find_buf_idx) == null) {
+                                        const run = gpa.create(ProcRun) catch break :results_blk;
+                                        run.* = .{ .kind = .find, .jump = false, .started = std.Io.Clock.now(.real, io).nanoseconds };
+                                        errdefer freeProcRun(gpa, run);
+                                        run.label = gpa.dupe(u8, dd) catch break :results_blk;
+                                        if (findArgv(gpa, run, dd) == 0) break :results_blk;
+                                        if (!startProc(io, gpa, &loop, run, &proc_run, &proc_current)) {
                                             status_msg = "No files found";
+                                            break :results_blk;
                                         }
                                     }
                                 }
@@ -7577,6 +7866,30 @@ pub fn main(init: std.process.Init) !void {
             .{ .kind = kind, .visible = picker_visible.items, .selected = picker_selected, .top = &picker_top, .query = picker_query.items, .hl = picker_hl.items }
         else
             null;
+
+        if (proc_run) |run| {
+            // A background grep / find is running: the live status — a
+            // spinner, the matches / files counted so far and the elapsed
+            // time — replaces the transient status message for this frame.
+            // Each .proc_progress event (worker or heartbeat) redraws it,
+            // so the spinner always ticks.
+            const now = std.Io.Clock.now(.real, io).nanoseconds;
+            const elapsed_ms: u64 = @intCast(@max(now - run.started, 0) / 1_000_000);
+            const frame = "|/-\\"[@mod(@divTrunc(elapsed_ms, 120), 4)];
+            const count = run.lines.load(.acquire);
+            const what = if (run.kind == .grep) "match" else "file";
+            const n = std.fmt.bufPrint(&status_buf, "{c} {s}: {s} — {d} {s}{s}, {d}.{d:0>1}s", .{
+                frame,
+                if (run.kind == .grep) "grep" else "find",
+                run.label,
+                count,
+                what,
+                if (count == 1) "" else "es",
+                @divTrunc(elapsed_ms, 1000),
+                @mod(@divTrunc(elapsed_ms, 100), 10),
+            }) catch null;
+            if (n) |nn| status_msg = status_buf[0..nn.len];
+        }
 
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][2048]u8 = undefined;
