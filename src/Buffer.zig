@@ -37,6 +37,10 @@ undo_group: UndoKind = .none,
     /// space shows as a ·, every tab as a », and every line break as a $
     /// at the end of the line. Per-buffer, like soft wrap.
     show_whitespace: bool = false,
+    /// C-z n toggles the line-number gutter (Emacs
+    /// display-line-numbers-mode): each line's number, right-aligned in
+    /// a column ahead of the text. Per-buffer, like soft wrap.
+    show_line_numbers: bool = false,
     /// C-x l toggles scroll lock (Emacs scroll-lock-mode, the same
     /// binding): the cursor stays on its locked screen row while the
     /// text scrolls under it, up to the ends of the buffer.

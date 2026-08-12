@@ -10,6 +10,16 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.64.0 — <2026-08-12>
+
+Grep and find run in the background with a live progress readout, the file list's =n= / =p= type into the filter, and =C-z n= shows line numbers.
+
+- =C-c g= (grep), =C-c f= (find files) and the =g= re-runs no longer freeze the editor while the tool scans: the search runs on its own thread, and the modeline shows its live status — a spinner, the matches (grep) or files (find) counted so far, and the elapsed time — while the editor stays fully responsive for editing, navigating and everything else. =C-g= cancels a running search (the tool is stopped and the modeline reports =Search cancelled= or =Find cancelled=); when the run lands, the results buffer is built exactly as before — the old =*grep*= / =*files*= buffer replaced or re-mirrored, focus moving to the results for a fresh search and staying put for a =g= re-run — and the status line clears. The tool fallbacks are unchanged, tried in order by the worker: ripgrep, then findstr (Windows) or grep (elsewhere), and =find -type f= / =dir /s /b= for the file lists.
+- The =*files*= list's plain =n= / =p= now type into the filter like every other letter — the filter is the point of the list, and typing a name starting with =n= or =p= previously jumped to the next entry instead — with =C-n= / =C-p= (and the arrows) moving through the list; the modeline hint says so. The =*grep*= / =*occur*= lists keep their =n= / =p= stepping, since nothing types there.
+- The results lists (=*grep*=, =*files*=, =*occur*=) scroll with the same keys as a dired or a file buffer: =M-j= / =M-k= move five entries, =M-J= / =M-K= a page, =M-<= the start and =M->= the end — previously those keys fell through into the filter in a file list (=M-j= typed a =j=), or did nothing at all.
+- =C-z n= toggles the line numbers (Emacs display-line-numbers-mode): each line's number sits right-aligned in a dim gutter column, wide enough for the buffer's longest number, with the text area, wrapping and the cursor shrinking accordingly. The modeline shows =[linum]= while it is on (Emacs's mode-line lighter), and the setting is per-buffer like soft wrap.
+- The M-key chords work on Windows again: Windows Terminal's ConPTY reports an =Alt+J= press as a plain =j= — the ALT bit is dropped from the key record — so =M-j= and friends scrolled the dired or typed into a filter instead of moving. The bare Alt key-down, which Windows does deliver as its own record, is now remembered and re-applied to the key that follows, with the Alt key-up clearing it again, so =M-j= / =M-k= / =M-J= / =M-K= / =M-<= / =M->= behave on Windows exactly as they do elsewhere.
+
 ** 0.63.0 — <2026-08-10>
 
 Isearch remembers the last search string, and =M-o= jumps straight to a window.

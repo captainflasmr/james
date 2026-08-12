@@ -839,9 +839,21 @@ fn printModeline(win: vaxis.Window, buf: []u8, ml: PromptModeline, style: vaxis.
 /// the whole screen.
 fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, grep_view: ?GrepView, files_view: ?FilesView, occur_view: ?GrepView, grep_hl: ?GrepHl, search: ?IsearchView, replace: ?ReplaceView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
+    // C-z n: the line-number gutter (Emacs display-line-numbers-mode) —
+    // one column per digit of the largest line number, plus a space, so
+    // the numbers stay right-aligned as the buffer grows. The text area
+    // shrinks by the gutter's width.
+    const line_num_width: usize = if (buf.show_line_numbers)
+        (std.fmt.count("{d}", .{buf.lines.items.len}) + 1)
+    else
+        0;
+    const text_win = if (line_num_width > 0 and win.width > line_num_width)
+        win.child(.{ .x_off = @intCast(line_num_width), .width = win.width - @as(u16, @intCast(line_num_width)) })
+    else
+        win;
     const method = win.screen.width_method;
-    scrollToCursorVisual(buf, text_height, win.width, method);
-    scrollToCursorHorizontal(buf, win.width, method);
+    scrollToCursorVisual(buf, text_height, text_win.width, method);
+    scrollToCursorHorizontal(buf, text_win.width, method);
 
     const searching = search != null;
     const match: ?Buffer.Pos = if (search) |s| (if (s.failed) null else s.match) else null;
@@ -850,6 +862,19 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
     var row: u16 = 0;
     var i = buf.top_line;
     while (i < buf.lines.items.len and row < text_height) : (i += 1) {
+        if (line_num_width > 0) {
+            // The number of the line, right-aligned in the gutter, dimmed
+            // like the modeline's unfocused style — Emacs's
+            // display-line-numbers-mode colors them too. Allocated on the
+            // frame like the tab expansions, since the cells keep their
+            // text slices until the frame is drawn.
+            const n = std.fmt.allocPrint(frame.gpa, "{d}", .{i + 1}) catch continue;
+            frame.items.append(frame.gpa, n) catch {
+                frame.gpa.free(n);
+                continue;
+            };
+            _ = win.printSegment(.{ .text = n, .style = .{ .dim = true } }, .{ .row_offset = row_base + row, .col_offset = @intCast(line_num_width - 1 - n.len) });
+        }
         const raw = buf.lines.items[i].items;
         // Tabs render as spaces up to the next tab stop — vaxis drops a
         // raw tab byte, gluing tab-separated fields together. With the
@@ -903,9 +928,9 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
         // Advance by the line's wrapped height, so a soft-wrapped line
         // takes all of its visual rows instead of the next line
         // clobbering its continuation.
-        const wraps = wrapCount(raw, buf.soft_wrap, win.width, method);
+        const wraps = wrapCount(raw, buf.soft_wrap, text_win.width, method);
         if (buf.soft_wrap) {
-            _ = win.print(segs, .{ .row_offset = row_base + row });
+            _ = text_win.print(segs, .{ .row_offset = row_base + row });
         } else {
             // Soft wrap off (M-z): the line truncates at the pane edge —
             // each segment is clipped to the remaining width, one row.
@@ -916,7 +941,7 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
             var seg_off: usize = 0;
             const skip = if (buf.hscroll > 0) byteAtColumn(line, buf.hscroll, method) else 0;
             for (segs) |seg| {
-                if (col >= win.width) break;
+                if (col >= text_win.width) break;
                 // Cut the segment at the scroll boundary: the segments
                 // tile the line in byte order, so a running offset picks
                 // out the part after the scrolled-off columns.
@@ -926,10 +951,10 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
                     seg.text;
                 seg_off += seg.text.len;
                 if (rest.len == 0) continue;
-                const clipped = clipToWidth(rest, win.width - col, method);
+                const clipped = clipToWidth(rest, text_win.width - col, method);
                 if (clipped.len == 0) continue;
-                _ = win.printSegment(.{ .text = clipped, .style = seg.style }, .{ .row_offset = row_base + row, .col_offset = col });
-                col += win.gwidth(clipped);
+                _ = text_win.printSegment(.{ .text = clipped, .style = seg.style }, .{ .row_offset = row_base + row, .col_offset = col });
+                col += text_win.gwidth(clipped);
             }
         }
         row += @intCast(wraps);
@@ -1024,7 +1049,7 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
                 break :blk .{ .len = n.len, .label_len = 0 };
             }
         }
-        const n = std.fmt.bufPrint(modeline_buf, "{s}{s}{s}{s}{s}{s}  L{d}:C{d}", .{
+        const n = std.fmt.bufPrint(modeline_buf, "{s}{s}{s}{s}{s}{s}{s}  L{d}:C{d}", .{
             // Emacs-style modified marker in the bottom-left corner of the
             // modeline.
             if (buf.dirty) "*" else "",
@@ -1040,6 +1065,9 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
             // C-z e: whitespace markers show like Emacs's whitespace-mode
             // "WS" mode-line lighter.
             if (buf.show_whitespace) " [whitespace]" else "",
+            // C-z n: the line numbers show like Emacs's
+            // display-line-numbers-mode lighter.
+            if (buf.show_line_numbers) " [linum]" else "",
             buf.cursor_row + 1,
             buf.cursor_col + 1,
         }) catch break :blk .{ .len = 0, .label_len = 0 };
@@ -1058,10 +1086,10 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
     if (is_focused) {
         // The cursor sits on the cursor's visual line, at its display
         // column within that wrapped segment — past the number column.
-        const cv = cursorVisual(buf, win.width, method);
+        const cv = cursorVisual(buf, text_win.width, method);
         // In truncate mode the view may have scrolled right (hscroll), so
         // the cursor's display column counts from the scrolled edge.
-        win.showCursor(@intCast(if (buf.soft_wrap) cv.col else cv.col -| buf.hscroll), @intCast(visualRowOfCursor(buf, buf.top_line, win.width, method)));
+        win.showCursor(@intCast(line_num_width + (if (buf.soft_wrap) cv.col else cv.col -| buf.hscroll)), @intCast(visualRowOfCursor(buf, buf.top_line, text_win.width, method)));
     }
 }
 
@@ -3658,6 +3686,7 @@ const welcome_tail =
     \\    C-x r b             jump to a bookmark
     \\    C-x r l             list the bookmarks
     \\    C-z e               show spaces / tabs / newlines (whitespace)
+    \\    C-z n               show / hide the line numbers
     \\
     \\  C-c — kill ring and window history:
     \\
@@ -5327,7 +5356,7 @@ pub fn main(init: std.process.Init) !void {
                 // the w it arms; any other key clears it.
                 if (!key.matches('w', .{})) pending_dired_0 = false;
                 status_msg = null;
-                const buf: *Buffer = buffers.items[current];
+        const buf: *Buffer = buffers.items[current];
 
                 // Sticky keys / repeat-mode: while a repeat map is armed,
                 // its plain keys repeat the window action instead of their
@@ -6705,13 +6734,17 @@ pub fn main(init: std.process.Init) !void {
                         }
                     }
                 } else if (pending_ctrl_z) {
-                    // C-z e: toggle the current buffer's whitespace markers
-                    // (Emacs whitespace-mode — spaces as ·, tabs as »,
-                    // line breaks as $); C-g / Esc cancels the prefix, any
-                    // other key is ignored like an undefined binding.
+                    // C-z e: toggle the current buffer's whitespace
+                    // markers (Emacs whitespace-mode — spaces as ·, tabs
+                    // as », line breaks as $); C-z n toggles the line
+                    // numbers (Emacs display-line-numbers-mode). C-g /
+                    // Esc cancels the prefix, any other key is ignored
+                    // like an undefined binding.
                     pending_ctrl_z = false;
                     if (key.matches('e', .{})) {
                         buf.show_whitespace = !buf.show_whitespace;
+                    } else if (key.matches('n', .{})) {
+                        buf.show_line_numbers = !buf.show_line_numbers;
                     } else if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                         // abort the prefix
                     }
@@ -7927,12 +7960,33 @@ pub fn main(init: std.process.Init) !void {
         // lines mirror the listing, so the prompt modeline works exactly as
         // it does in a file buffer. isearch is handled natively above.
 
-        scrollToCursorVisual(buf, text_height, body.width, vx.screen.width_method);
-        scrollToCursorHorizontal(buf, body.width, vx.screen.width_method);
+        // C-z n: the line-number gutter (see renderPane for the split
+        // panes) — the same column, and the text area shrinks by it.
+        const line_num_width: usize = if (buf.show_line_numbers)
+            (std.fmt.count("{d}", .{buf.lines.items.len}) + 1)
+        else
+            0;
+        const text_win = if (line_num_width > 0 and body.width > line_num_width)
+            body.child(.{ .x_off = @intCast(line_num_width), .width = body.width - @as(u16, @intCast(line_num_width)) })
+        else
+            body;
+        scrollToCursorVisual(buf, text_height, text_win.width, vx.screen.width_method);
+        scrollToCursorHorizontal(buf, text_win.width, vx.screen.width_method);
         var row: u16 = 0;
         var i = buf.top_line;
         while (i < buf.lines.items.len and row < text_height) : (i += 1) {
             const raw = buf.lines.items[i].items;
+            if (line_num_width > 0) {
+                // The line's number, right-aligned in the gutter (see
+                // renderPane), allocated on the frame like the tab
+                // expansions.
+                const n = std.fmt.allocPrint(frame_allocs.gpa, "{d}", .{i + 1}) catch continue;
+                frame_allocs.items.append(frame_allocs.gpa, n) catch {
+                    frame_allocs.gpa.free(n);
+                    continue;
+                };
+                _ = body.printSegment(.{ .text = n, .style = .{ .dim = true } }, .{ .row_offset = row, .col_offset = @intCast(line_num_width - 1 - n.len) });
+            }
             // Tabs render as spaces up to the next tab stop (see
             // renderPane); the whitespace markers (C-z e) render through
             // whitespaceLine instead.
@@ -7973,9 +8027,9 @@ pub fn main(init: std.process.Init) !void {
             else
                 lineSegments(line, h.hl, h.empty_marker, &seg_storage3, i == buf.cursor_row);
             // Advance by the line's wrapped height (see renderPane).
-            const wraps = wrapCount(raw, buf.soft_wrap, body.width, vx.screen.width_method);
+            const wraps = wrapCount(raw, buf.soft_wrap, text_win.width, vx.screen.width_method);
             if (buf.soft_wrap) {
-                _ = body.print(segs, .{ .row_offset = row });
+                _ = text_win.print(segs, .{ .row_offset = row });
             } else {
                 // Soft wrap off (M-z): the line truncates at the window
                 // edge, scrolled right with the cursor when it walks past
@@ -7984,17 +8038,17 @@ pub fn main(init: std.process.Init) !void {
                 var seg_off: usize = 0;
                 const skip = if (buf.hscroll > 0) byteAtColumn(line, buf.hscroll, vx.screen.width_method) else 0;
                 for (segs) |seg| {
-                    if (col >= body.width) break;
+                    if (col >= text_win.width) break;
                     const rest = if (seg_off < skip)
                         seg.text[@min(skip - seg_off, seg.text.len)..]
                     else
                         seg.text;
                     seg_off += seg.text.len;
                     if (rest.len == 0) continue;
-                    const clipped = clipToWidth(rest, body.width - col, vx.screen.width_method);
+                    const clipped = clipToWidth(rest, text_win.width - col, vx.screen.width_method);
                     if (clipped.len == 0) continue;
-                    _ = body.printSegment(.{ .text = clipped, .style = seg.style }, .{ .row_offset = row, .col_offset = col });
-                    col += body.gwidth(clipped);
+                    _ = text_win.printSegment(.{ .text = clipped, .style = seg.style }, .{ .row_offset = row, .col_offset = col });
+                    col += text_win.gwidth(clipped);
                 }
             }
             row += @intCast(wraps);
@@ -8103,7 +8157,7 @@ pub fn main(init: std.process.Init) !void {
                 (std.fmt.bufPrint(&count_buf, "  ({d}/{d})", .{ current + 1, buffers.items.len }) catch "")
             else
                 "";
-            const n = std.fmt.bufPrint(&modeline_buf, "{s}-- {s}{s}{s}{s}{s}{s}{s}  L{d}:C{d} --", .{
+            const n = std.fmt.bufPrint(&modeline_buf, "{s}-- {s}{s}{s}{s}{s}{s}{s}{s}  L{d}:C{d} --", .{
                 // Emacs-style modified marker in the bottom-left corner of
                 // the modeline.
                 if (buf.dirty) "*" else "",
@@ -8120,6 +8174,9 @@ pub fn main(init: std.process.Init) !void {
                 // C-z e: whitespace markers show like Emacs's
                 // whitespace-mode "WS" mode-line lighter.
                 if (buf.show_whitespace) " [whitespace]" else "",
+                // C-z n: the line numbers show like Emacs's
+                // display-line-numbers-mode lighter.
+                if (buf.show_line_numbers) " [linum]" else "",
                 buf_count,
                 buf.cursor_row + 1,
                 buf.cursor_col + 1,
@@ -8131,10 +8188,10 @@ pub fn main(init: std.process.Init) !void {
         // prompt's label is bold too, so it stands out.
         printModeline(body, &modeline_buf, ml, highlight_style, body.height -| 1);
 
-        const cv = cursorVisual(buf, body.width, vx.screen.width_method);
+        const cv = cursorVisual(buf, text_win.width, vx.screen.width_method);
         body.showCursor(
-            @intCast(if (buf.soft_wrap) cv.col else cv.col -| buf.hscroll),
-            @intCast(visualRowOfCursor(buf, buf.top_line, body.width, vx.screen.width_method)),
+            @intCast(line_num_width + (if (buf.soft_wrap) cv.col else cv.col -| buf.hscroll)),
+            @intCast(visualRowOfCursor(buf, buf.top_line, text_win.width, vx.screen.width_method)),
         );
 
         try vx.render(tty.writer());

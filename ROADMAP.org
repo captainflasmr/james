@@ -46,13 +46,16 @@ TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =to
 ** DONE M-h mark block
 - Emacs: =my/mark-block= — mark the text between surrounding blank lines. Trivial in james (scan rows, set mark).
 - Done in 0.60.0: =M-h= (Emacs =mark-paragraph=) marks the block around the cursor — the run of non-blank lines bounded by blank lines, mark at the paragraph's start, cursor at its end, so the region is the whole paragraph for =M-w= / =C-w=; on a blank line the following paragraph is marked (falling back to the previous one).
+
 ** DONE Isearch lazy count
 - Emacs: =isearch-lazy-count= with the =(%s/%s)= format; show match position / total in the modeline while searching.
 - Done in 0.54.0: while searching, the modeline's =I-search:= prompt trails the query with = (N/M)= — the current match's 1-based position and the query's total, like Emacs's isearch-lazy-count. In buffers and direds the count covers the buffer's lines (the dired mirror included); in the pickers, the visible rows. A failing search shows =(0/0)=, and an empty query shows no count. The count is recomputed once per search keystroke, not per frame.
 - Effort: small.
+
 ** DONE Dired trash delete
 - Emacs: =my/dired-async-do-delete= (trash instead of =D='s hard delete, with a confirm prompt like james's existing y/n) and =delete-by-moving-to-trash=.
 - Done in 0.57.0: =D= never hard-deletes — the confirm prompt now reads =Move X to the trash?= and the entries go to the platform trash: the Windows Recycle Bin through PowerShell's =Microsoft.VisualBasic= =FileSystem.DeleteFile/DeleteDirectory= with =SendToRecycleBin= (the same API the config's Windows branch calls), and the freedesktop.org trash elsewhere — =XDG_DATA_HOME=/Trash/files (or =~/.local/share/Trash/files=) with a =.trashinfo= sidecar in =Trash/info= (Path + UTC ISO 8601 DeletionDate) and the config's name-collision counter (=foo.tar.gz= → =foo.tar.1.gz=). A failed trash leaves the file alone and reports =Trash failed=.
+
 ** DONE Dired duplicate file
 - Emacs: =my/dired-duplicate-file= (=_NNN= incremented names, async).
 - Done in 0.58.0: =C-c d= in dired duplicates the selected entry with the config's name scheme — =foo.txt= → =foo_001.txt=, =foo.tar.gz= → =foo.tar_001.gz=, the first free number (a prefix arg sets the starting counter in Emacs; james always starts at 1) — directories recursively. The copy uses the built-in tools: =cp -a= (the twin of the config's =rsync -a=) on POSIX, =robocopy= for directories and PowerShell =Copy-Item= for files on Windows (robocopy's 0-7 exit codes count as success, like the config). The dired refreshes and the modeline reports =Duplicated: foo_001.txt=.

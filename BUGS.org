@@ -9,7 +9,5 @@ This document contains the current bugs/improvements, this is just for me mainly
 
 * Bugs/Improvements
 
-** DOING allow up directory from occur/find whole buffer totes
-
 ** TODO is it possible to theme change based on the current terminal?
 
