@@ -454,3 +454,369 @@ pub fn choose(self: *Dired, gpa: std.mem.Allocator) !Choice {
     if (entry.is_dir) return .{ .open_dir = try target.toOwnedSlice(gpa) };
     return .{ .open_file = try target.toOwnedSlice(gpa) };
 }
+
+/// Mark every entry whose name matches `regexp` — Emacs
+/// dired-mark-files-regexp, `% m` in dired — a small regexp over the bare
+/// entry name. ".." is never marked, like the other marking keys. Returns
+/// how many entries were marked.
+pub fn markFilesRegexp(self: *Dired, regexp: []const u8) usize {
+    var n: usize = 0;
+    for (self.entries.items) |*e| {
+        if (std.mem.eql(u8, e.name, "..")) continue;
+        if (regexMatch(e.name, regexp)) {
+            e.marked = true;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// One parsed regexp atom: a single element of the pattern — a literal
+/// character, ".", a character class, an anchor, or a group.
+const Atom = struct {
+    /// Pattern position just after the atom (before any quantifier).
+    next: usize,
+    kind: Kind,
+    /// .literal: the character. .group: where the group's pattern starts
+    /// (just after the opening paren).
+    a: usize = 0,
+    /// .group: where the group's pattern ends (at the closing paren).
+    b: usize = 0,
+    /// .class: the class body, between the brackets.
+    text: []const u8 = &.{},
+    /// .class: a negated class ([^...]).
+    negate: bool = false,
+
+    const Kind = enum { literal, any, class, start, end, group };
+};
+
+/// Match the small regexp `pat` against `s` anywhere in the string (the
+/// dired twin of Emacs string-match-p): unanchored unless the pattern
+/// starts with ^, which pins it to the beginning; $ pins the end. The
+/// supported syntax: . (any char), [...] / [^...] classes with ranges,
+/// the greedy * + ? quantifiers, | (or Emacs \|) alternation, (...) and
+/// Emacs-style \(...\) groups, ^ $ anchors, and the escapes \d \D \w \W
+/// \s \S plus any escaped literal. A simple backtracking match — no
+/// backreferences.
+fn regexMatch(s: []const u8, pat: []const u8) bool {
+    const anchored = pat.len > 0 and pat[0] == '^';
+    var i: usize = 0;
+    while (i <= s.len) : (i += 1) {
+        if (matchBranch(s, i, pat, 0, pat.len) != null) return true;
+        if (anchored) break;
+    }
+    return false;
+}
+
+/// Match one branch of `pat[pi..end]` against `s[si..]` — a sequence of
+/// atoms, possibly split by top-level "|" (or Emacs "\|") alternation —
+/// and return the position in `s` just after the match, or null on
+/// failure. `end` is the end of the enclosing group's pattern (or the
+/// whole pattern), so a branch never reads past its own closing paren.
+fn matchBranch(s: []const u8, si: usize, pat: []const u8, pi: usize, end: usize) ?usize {
+    // Find the top-level alternation points. Nested groups and classes
+    // are skipped; their own branch matching resolves the pipes inside.
+    // The recorded positions are the `|` characters themselves, so the
+    // alternative before a pipe is [start, pipe) and the next starts at
+    // pipe + 1, whether the pipe is plain or Emacs-style "\|".
+    var pipe: [16]usize = undefined;
+    var npipes: usize = 0;
+    var depth: usize = 0;
+    var q = pi;
+    while (q < end) {
+        const c = pat[q];
+        if (c == '\\') {
+            if (q + 1 >= end) break;
+            const e = pat[q + 1];
+            if (e == '(') {
+                depth += 1;
+            } else if (e == ')') {
+                depth -|= 1;
+            } else if (e == '|') {
+                if (depth == 0 and npipes < pipe.len) pipe[npipes] = q + 1;
+                npipes = @min(npipes + 1, pipe.len);
+            }
+            q += 2;
+        } else if (c == '(') {
+            depth += 1;
+            q += 1;
+        } else if (c == ')') {
+            depth -|= 1;
+            q += 1;
+        } else if (c == '[') {
+            q = skipClass(pat, q, end) orelse break;
+        } else if (c == '|') {
+            if (depth == 0) {
+                if (npipes < pipe.len) pipe[npipes] = q;
+                npipes = @min(npipes + 1, pipe.len);
+            }
+            q += 1;
+        } else {
+            q += 1;
+        }
+    }
+    // Try each alternative from the same position in `s`: the first that
+    // matches, wins.
+    var start = pi;
+    for (pipe[0..npipes]) |p| {
+        if (matchSequence(s, si, pat, start, p)) |m| return m;
+        start = p + 1;
+    }
+    return matchSequence(s, si, pat, start, end);
+}
+
+/// Match the atom sequence `pat[pi..end]` against `s[si..]`, returning
+/// the position just after the match, or null on failure. A quantifier
+/// after an atom (* + ?) repeats it, trying the most repetitions first so
+/// the match is greedy, then backtracking.
+fn matchSequence(s: []const u8, si: usize, pat: []const u8, pi: usize, end: usize) ?usize {
+    if (pi >= end) return si;
+    const atom = parseAtom(pat, pi, end) orelse return null;
+    if (atom.next >= end or (pat[atom.next] != '*' and pat[atom.next] != '+' and pat[atom.next] != '?')) {
+        const pos = matchAtom(s, si, pat, atom) orelse return null;
+        return matchSequence(s, pos, pat, atom.next, end);
+    }
+    const op = pat[atom.next];
+    const after = atom.next + 1;
+    const min: usize = if (op == '+') 1 else 0;
+    const max: usize = if (op == '?') 1 else 0x7fff_ffff;
+    // The positions reachable by repeating the atom, greedily — a name is
+    // at most a few hundred bytes, so the fixed history is plenty.
+    var poss: [256]usize = undefined;
+    var np: usize = 0;
+    var pos = si;
+    while (np < max and np < poss.len) {
+        const npos = matchAtom(s, pos, pat, atom) orelse break;
+        if (npos == pos) {
+            // A zero-width repetition (e.g. a group matching nothing):
+            // take it once and stop, like the real engines.
+            poss[np] = npos;
+            np += 1;
+            break;
+        }
+        poss[np] = npos;
+        np += 1;
+        pos = npos;
+    }
+    var count = np;
+    while (count > 0) : (count -= 1) {
+        if (matchSequence(s, poss[count - 1], pat, after, end)) |m| return m;
+        if (count <= min) break;
+    }
+    if (min == 0) {
+        if (matchSequence(s, si, pat, after, end)) |m| return m;
+    }
+    return null;
+}
+
+/// Parse the atom at `pat[pi]`: a literal character, ".", a character
+/// class, an anchor, or a group. Returns the atom and the pattern
+/// position just after it, or null when the pattern is malformed there
+/// (an unterminated class or group, a dangling backslash).
+fn parseAtom(pat: []const u8, pi: usize, end: usize) ?Atom {
+    if (pi >= end) return null;
+    const c = pat[pi];
+    if (c == '\\') {
+        if (pi + 1 >= end) return null;
+        const e = pat[pi + 1];
+        switch (e) {
+            '(' => {
+                const close = findGroupEnd(pat, pi + 2, end) orelse return null;
+                return .{ .next = close + 1, .kind = .group, .a = pi + 2, .b = close };
+            },
+            'd' => return .{ .next = pi + 2, .kind = .class, .text = "0-9" },
+            'D' => return .{ .next = pi + 2, .kind = .class, .negate = true, .text = "0-9" },
+            'w' => return .{ .next = pi + 2, .kind = .class, .text = "A-Za-z0-9_" },
+            'W' => return .{ .next = pi + 2, .kind = .class, .negate = true, .text = "A-Za-z0-9_" },
+            's' => return .{ .next = pi + 2, .kind = .class, .text = " \t\n\r\x0c\x0b" },
+            'S' => return .{ .next = pi + 2, .kind = .class, .negate = true, .text = " \t\n\r\x0c\x0b" },
+            // Any other escape is a literal of the escaped character
+            // (\. \* \[ and friends, or a stray \| \ ) \]).
+            else => return .{ .next = pi + 2, .kind = .literal, .a = e },
+        }
+    }
+    switch (c) {
+        '.' => return .{ .next = pi + 1, .kind = .any },
+        '^' => return .{ .next = pi + 1, .kind = .start },
+        '$' => return .{ .next = pi + 1, .kind = .end },
+        '[' => {
+            const close = skipClass(pat, pi, end) orelse return null;
+            var body_start = pi + 1;
+            var negate = false;
+            if (body_start < close - 1 and (pat[body_start] == '^' or pat[body_start] == '!')) {
+                negate = true;
+                body_start += 1;
+            }
+            if (body_start >= close - 1) return null; // an empty class
+            return .{ .next = close, .kind = .class, .text = pat[body_start .. close - 1], .negate = negate };
+        },
+        '(' => {
+            const close = findGroupEnd(pat, pi + 1, end) orelse return null;
+            return .{ .next = close + 1, .kind = .group, .a = pi + 1, .b = close };
+        },
+        // A bare quantifier is a literal — there is nothing for it to
+        // quantify.
+        '*', '+', '?' => return .{ .next = pi + 1, .kind = .literal, .a = c },
+        else => return .{ .next = pi + 1, .kind = .literal, .a = c },
+    }
+}
+
+/// The position just after the closing "]" of the class starting at
+/// `pat[pi]` == "[", or null when the class never closes.
+fn skipClass(pat: []const u8, pi: usize, end: usize) ?usize {
+    var q = pi + 1;
+    if (q < end and (pat[q] == '^' or pat[q] == '!')) q += 1;
+    while (q < end and pat[q] != ']') : (q += 1) {}
+    if (q >= end) return null;
+    return q + 1;
+}
+
+/// The position of the closing paren of the group whose pattern starts at
+/// `pat[pi]` (just after the opening "(" or "\("): the scan tracks nested
+/// groups (both ( and \( open, ) and \) close, classes skipped) and
+/// returns the closing paren's position, or null when the group never
+/// closes.
+fn findGroupEnd(pat: []const u8, pi: usize, end: usize) ?usize {
+    var depth: usize = 1;
+    var q = pi;
+    while (q < end) {
+        const c = pat[q];
+        if (c == '\\') {
+            if (q + 1 >= end) return null;
+            if (pat[q + 1] == '(') {
+                depth += 1;
+            } else if (pat[q + 1] == ')') {
+                depth -= 1;
+                if (depth == 0) return q + 1;
+            }
+            q += 2;
+        } else if (c == '(') {
+            depth += 1;
+            q += 1;
+        } else if (c == ')') {
+            depth -= 1;
+            if (depth == 0) return q;
+            q += 1;
+        } else if (c == '[') {
+            q = skipClass(pat, q, end) orelse return null;
+        } else {
+            q += 1;
+        }
+    }
+    return null;
+}
+
+/// Match one atom against `s[si]`, returning the position just after it,
+/// or null when the character doesn't fit. A group matches its whole
+/// nested pattern via matchBranch.
+fn matchAtom(s: []const u8, si: usize, pat: []const u8, atom: Atom) ?usize {
+    switch (atom.kind) {
+        .literal => return if (si < s.len and s[si] == atom.a) si + 1 else null,
+        .any => return if (si < s.len) si + 1 else null,
+        .start => return if (si == 0) si else null,
+        .end => return if (si == s.len) si else null,
+        .group => return matchBranch(s, si, pat, atom.a, atom.b),
+        .class => {
+            if (si >= s.len) return null;
+            const ch = s[si];
+            var in_class = false;
+            var q: usize = 0;
+            while (q < atom.text.len) {
+                // A range is a-b; a dash anywhere else is a literal.
+                if (q + 2 < atom.text.len and atom.text[q + 1] == '-') {
+                    if (atom.text[q] <= ch and ch <= atom.text[q + 2]) in_class = true;
+                    q += 3;
+                } else {
+                    if (atom.text[q] == ch) in_class = true;
+                    q += 1;
+                }
+            }
+            return if (in_class != atom.negate) si + 1 else null;
+        },
+    }
+}
+
+test "regexMatch" {
+    // Literals and unanchored matching.
+    try std.testing.expect(regexMatch("Makefile", "Make"));
+    try std.testing.expect(regexMatch("Makefile", "file"));
+    try std.testing.expect(!regexMatch("Makefile", "readme"));
+    // Anchors.
+    try std.testing.expect(regexMatch("Makefile", "^Make"));
+    try std.testing.expect(!regexMatch("Makefile", "^file"));
+    try std.testing.expect(regexMatch("Makefile", "file$"));
+    try std.testing.expect(!regexMatch("Makefile", "Make$"));
+    try std.testing.expect(regexMatch("Makefile", "^Makefile$"));
+    // The any char and classes, with ranges and negation.
+    try std.testing.expect(regexMatch("file.txt", "file.t.t"));
+    try std.testing.expect(regexMatch("file.txt", "file.[tx]xt"));
+    try std.testing.expect(!regexMatch("file.ax t", "file.[tx]xt"));
+    try std.testing.expect(regexMatch("file1", "file[0-9]"));
+    try std.testing.expect(!regexMatch("filex", "file[0-9]"));
+    try std.testing.expect(regexMatch("filex", "file[^0-9]"));
+    try std.testing.expect(!regexMatch("file1", "file[^0-9]"));
+    try std.testing.expect(regexMatch("file-1", "file[-a]1"));
+    // Quantifiers, greedy and backtracking.
+    try std.testing.expect(regexMatch("foooo", "fo*"));
+    try std.testing.expect(regexMatch("f", "fo*"));
+    try std.testing.expect(regexMatch("foooo", "fo+"));
+    try std.testing.expect(!regexMatch("f", "fo+"));
+    try std.testing.expect(regexMatch("fo", "fo?"));
+    try std.testing.expect(regexMatch("f", "fo?"));
+    try std.testing.expect(!regexMatch("foo", "fo?$"));
+    try std.testing.expect(regexMatch("ab", "a.*b"));
+    try std.testing.expect(regexMatch("axb", "a.b"));
+    try std.testing.expect(!regexMatch("ab", "a.b"));
+    try std.testing.expect(regexMatch("config.log", ".*\\.log$"));
+    try std.testing.expect(regexMatch("Makefile", "^Make*f"));
+    // Alternation and groups, in both Emacs and plain syntax.
+    try std.testing.expect(regexMatch("file.txt", "md|txt"));
+    try std.testing.expect(regexMatch("README.md", "md|txt"));
+    try std.testing.expect(regexMatch("file.txt", "md\\|txt"));
+    try std.testing.expect(regexMatch("foo.txt", "\\(foo\\|bar\\).txt"));
+    try std.testing.expect(regexMatch("bar.txt", "(foo|bar).txt"));
+    try std.testing.expect(!regexMatch("baz.txt", "(foo|bar).txt"));
+    try std.testing.expect(regexMatch("ababab", "(ab)+"));
+    try std.testing.expect(!regexMatch("ababx", "^(ab)+$"));
+    try std.testing.expect(regexMatch("aabb", "(a|b)*"));
+    try std.testing.expect(regexMatch("photo-2026.jpg", "photo-[0-9][0-9][0-9][0-9]"));
+    // Escapes.
+    try std.testing.expect(regexMatch("file1", "file\\d"));
+    try std.testing.expect(!regexMatch("filex", "file\\d"));
+    try std.testing.expect(regexMatch("filex", "file\\D"));
+    try std.testing.expect(regexMatch("a_b", "\\w\\w\\w"));
+    try std.testing.expect(!regexMatch("a b", "\\w\\w\\w"));
+    try std.testing.expect(regexMatch("a b", "\\S\\s\\S"));
+    try std.testing.expect(regexMatch("file.txt", "file\\.txt"));
+    try std.testing.expect(!regexMatch("filextxt", "file\\.txt"));
+    // Empty and degenerate patterns.
+    try std.testing.expect(regexMatch("anything", ""));
+    try std.testing.expect(regexMatch("anything", ".*"));
+    try std.testing.expect(regexMatch("", "^$"));
+    try std.testing.expect(regexMatch("", ""));
+    try std.testing.expect(regexMatch("file.txt", "file"));
+}
+
+test "markFilesRegexp" {
+    var d: Dired = .{};
+    const names = [_][]const u8{ "..", "a.txt", "b.md", "c.txt", "notes.txt.bak", "README" };
+    for (names) |n| {
+        try d.entries.append(std.testing.allocator, .{ .name = try std.testing.allocator.dupe(u8, n), .is_dir = false });
+    }
+    defer {
+        for (d.entries.items) |e| {
+            std.testing.allocator.free(e.name);
+            if (e.meta.len > 0) std.testing.allocator.free(e.meta);
+        }
+        d.entries.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 3), d.markFilesRegexp("txt"));
+    try std.testing.expect(d.entries.items[1].marked); // a.txt
+    try std.testing.expect(d.entries.items[3].marked); // c.txt
+    try std.testing.expect(d.entries.items[4].marked); // notes.txt.bak
+    try std.testing.expect(!d.entries.items[0].marked); // ".." is never marked
+    try std.testing.expect(!d.entries.items[2].marked); // b.md
+    try std.testing.expect(!d.entries.items[5].marked); // README
+    try std.testing.expectEqual(@as(usize, 1), d.markFilesRegexp("\\.md$"));
+    try std.testing.expect(d.entries.items[2].marked);
+}

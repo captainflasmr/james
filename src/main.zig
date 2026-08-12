@@ -657,7 +657,7 @@ const RepeatMap = enum { window_history, window_move };
 /// order, drawn in its top-left corner while the jump map is armed.
 const quick_jump_labels = "jkl;asdf";
 
-const DiredPromptKind = enum { copy, rename, delete, create_dir, create_file, open };
+const DiredPromptKind = enum { copy, rename, delete, create_dir, create_file, open, mark_regexp };
 
 /// The dired compress formats (Z, Emacs dired-compress-file / the
 /// author's my/dired-compress-transient): the single-file tools replace
@@ -1608,6 +1608,37 @@ fn filesMirror(gpa: std.mem.Allocator, buf: *Buffer, paths: []const []const u8, 
     buf.cursor_col = 0;
 }
 
+/// TEMP DIAGNOSTIC for the Windows *files* issue: write what the search
+/// worker saw to james-proc.log in the working directory — whether a
+/// command line spawned, the captured output's size and head, the exit
+/// and the final state. No-op outside Windows; removed once the missing
+/// *files* buffer is understood.
+fn procLog(io: std.Io, gpa: std.mem.Allocator, run: *ProcRun, spawned: bool, term: ?std.process.Child.Term, state: ProcState) void {
+    if (comptime builtin.os.tag != .windows) return;
+    const term_str: []const u8 = if (term) |t| switch (t) {
+        .exited => |code| blk: {
+            var buf: [16]u8 = undefined;
+            const n = std.fmt.bufPrint(&buf, "exited:{d}", .{code}) catch return;
+            break :blk buf[0..n.len];
+        },
+        else => "other",
+    } else "none";
+    var log: std.ArrayList(u8) = .empty;
+    defer log.deinit(gpa);
+    var buf: [1024]u8 = undefined;
+    const head = run.out.items[0..@min(run.out.items.len, 512)];
+    const n = std.fmt.bufPrint(&buf, "kind={s} spawned={} out_len={d} state={s} term={s}\nhead: {s}\n", .{
+        if (run.kind == .grep) "grep" else "find",
+        spawned,
+        run.out.items.len,
+        @tagName(state),
+        term_str,
+        head,
+    }) catch return;
+    log.appendSlice(gpa, buf[0..n.len]) catch return;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "james-proc.log", .data = log.items }) catch {};
+}
+
 /// The background grep / find worker, run on its own thread: spawns the
 /// first command line that starts (the primary tool, then the fallback),
 /// captures stdout incrementally — counting lines for the live modeline
@@ -1625,6 +1656,7 @@ fn procWorker(io: std.Io, gpa: std.mem.Allocator, loop: *vaxis.Loop(Event), run:
     }
     if (child == null) {
         run.state.store(.failed, .release);
+        procLog(io, gpa, run, false, null, .failed);
         _ = loop.tryPostEvent(.{ .proc_done = run }) catch {};
         return;
     }
@@ -1663,6 +1695,7 @@ fn procWorker(io: std.Io, gpa: std.mem.Allocator, loop: *vaxis.Loop(Event), run:
             else => .failed,
         } else .failed;
         run.state.store(state, .release);
+        procLog(io, gpa, run, true, term, state);
     }
     _ = loop.tryPostEvent(.{ .proc_done = run }) catch {};
 }
@@ -3350,6 +3383,7 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
             else
                 fillPromptModeline(modeline_buf, "Move {s}{s} to the trash? (y / n / C-g cancels)", .{ if (is_dir) "directory " else "", name }, ""),
             .open => fillPromptModeline(modeline_buf, "Open {s} with {s}? (y / n / C-g cancels)", .{ name, p.detail }, ""),
+            .mark_regexp => fillPromptModeline(modeline_buf, "Mark files matching regexp (C-g cancels): ", .{}, p.query),
         };
     } else if (status) |m| blk: {
         const n = std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch break :blk .{ .len = 0, .label_len = 0 };
@@ -3773,6 +3807,7 @@ const welcome_tail =
     \\    n / p               next / previous entry (arrows too)
     \\    Enter / f           open the selected entry
     \\    m / u               mark / unmark the entry
+    \\    % m                 mark every entry matching a regexp
     \\    U                   unmark everything
     \\    t                   toggle all marks
     \\    w                   copy the names to the kill ring
@@ -4916,6 +4951,10 @@ pub fn main(init: std.process.Init) !void {
     // prefix of 0): 0 w copies the absolute file name instead of the bare
     // name. Armed by 0, cleared by any key other than w.
     var pending_dired_0 = false;
+    // The % prefix in dired (Emacs dired % m / dired-mark-files-regexp):
+    // % m prompts for a regexp and marks every entry whose name matches.
+    // Armed by %, cleared by any key other than m.
+    var pending_dired_pct = false;
     // Windows ConPTY drops the ALT bit from a chord's control-key state,
     // so M-j would arrive as a bare j (typed into a *files* filter, say).
     // The held Alt is delivered as its own modifier-only key press first —
@@ -5355,6 +5394,9 @@ pub fn main(init: std.process.Init) !void {
                 // The dired 0 prefix (0 w copies the full path) lives until
                 // the w it arms; any other key clears it.
                 if (!key.matches('w', .{})) pending_dired_0 = false;
+                // The dired % prefix (% m marks by regexp) lives until the
+                // m it arms; any other key clears it.
+                if (!key.matches('m', .{})) pending_dired_pct = false;
                 status_msg = null;
         const buf: *Buffer = buffers.items[current];
 
@@ -5869,6 +5911,18 @@ pub fn main(init: std.process.Init) !void {
                                     }
                                 },
                                 .delete => unreachable,
+                                .mark_regexp => {
+                                    // % m: mark every entry whose name
+                                    // matches the regexp (Emacs
+                                    // dired-mark-files-regexp): the match
+                                    // is a small regexp over the bare name
+                                    // (see Dired.regexMatch), ".." never
+                                    // marked. The modeline reports the
+                                    // count.
+                                    const n = d.markFilesRegexp(target_raw);
+                                    const msg = std.fmt.bufPrint(&status_buf, "Marked {d} file{s}", .{ n, if (n == 1) "" else "s" }) catch unreachable;
+                                    status_msg = status_buf[0..msg.len];
+                                },
                                 else => {
                                     // C / R: apply to every marked entry,
                                     // or just the selected one when nothing
@@ -7011,10 +7065,26 @@ pub fn main(init: std.process.Init) !void {
                         } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
                             d.moveUp();
                         } else if (key.matches('m', .{})) {
-                            // m: mark the selected entry (Emacs dired-mark)
-                            // and move down, so a run of m's marks a block.
-                            d.entries.items[d.selected].marked = true;
-                            d.moveDown();
+                            if (pending_dired_pct) {
+                                // % m: mark every entry whose name matches
+                                // a regexp (Emacs dired-mark-files-regexp).
+                                // The prompt takes the regexp; Enter marks
+                                // the matches.
+                                dired_copy_kind = .mark_regexp;
+                                dired_copy_prompt = true;
+                                dired_copy_query.clearRetainingCapacity();
+                            } else {
+                                // m: mark the selected entry (Emacs
+                                // dired-mark) and move down, so a run of
+                                // m's marks a block.
+                                d.entries.items[d.selected].marked = true;
+                                d.moveDown();
+                            }
+                        } else if (key.matches('%', .{})) {
+                            // %: the mark-by-regexp prefix — % m prompts
+                            // for a regexp and marks every entry whose name
+                            // matches (Emacs dired-mark-files-regexp).
+                            pending_dired_pct = true;
                         } else if (key.matches('u', .{})) {
                             // u: unmark the selected entry (Emacs
                             // dired-unmark) and move down.

@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.65.0 — <2026-08-12>
+
+Dired marks by regexp: =%= =m= prompts for a pattern and marks every entry whose name matches.
+
+- =%= =m= in dired (Emacs =dired-mark-files-regexp=, the same =%= prefix =m= key) prompts for a regexp and marks every entry whose name matches it, the modeline reporting how many were marked (=Marked 3 files=). The regexp is a small Emacs-flavoured one: =^= =$= anchors, =.= any character, =[...]= / =[^...]= classes with ranges, the greedy =*= =+= =?= quantifiers, =|= and Emacs =\\|= alternation, =(...)= and =\(...\)= groups, and the =\\d= =\\D= =\\w= =\\W= =\\s= =\\S= escapes plus any escaped literal (=\\.=, =\\*=, ...) — everything but backreferences and interval counts, which names rarely need. It matches the bare name anywhere (a pattern of =txt= marks every file with =txt= in its name; =^makefile$= the one exact match), never the =..= entry, and the marks feed straight into the existing =C= / =R= / =D= / =z= / =w= machinery. =%= =m= joins =m= / =u= / =U= / =t= in the welcome-screen help and README.
+
 ** 0.64.0 — <2026-08-12>
 
 Grep and find run in the background with a live progress readout, the file list's =n= / =p= type into the filter, and =C-z n= shows line numbers.
