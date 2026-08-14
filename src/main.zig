@@ -3264,7 +3264,7 @@ fn armSizeWatchdog(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event), proc_c
 /// taking over the whole screen; when a file is chosen it's simply
 /// replaced by the newly opened buffer. An active isearch shows its prompt
 /// in the modeline; the match is the selected entry.
-fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, grep_view: ?GrepView, files_view: ?FilesView, occur_view: ?GrepView, grep_hl: ?GrepHl, search: ?IsearchView, replace: ?ReplaceView, compress_menu: ?CompressMenuView, archive_query: ?[]const u8, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
+fn renderDiredPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, dired: *Dired, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, grep_view: ?GrepView, files_view: ?FilesView, occur_view: ?GrepView, grep_hl: ?GrepHl, search: ?IsearchView, replace: ?ReplaceView, compress_menu: ?CompressMenuView, archive_query: ?[]const u8, dired_prompt: ?DiredPromptView, status: ?[]const u8) void {
     // Query-replace never runs in a dired (editing buffers only), so the
     // replace view is ignored here; the parameter keeps the call chain
     // uniform with renderPane.
@@ -3277,8 +3277,19 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
     _ = occur_view;
     _ = grep_hl;
     const text_height: usize = if (height > 1) height - 1 else height;
+    // C-z n: the line-number gutter (Emacs display-line-numbers-mode),
+    // exactly as in a file buffer — one column per digit of the largest
+    // entry number, plus a space, the entries numbered 1..N (the header
+    // line is not an entry, so it stays unnumbered, and the numbers
+    // match the mirror buffer's lines, which isearch and M-g navigate).
+    const line_num_width: usize = if (buf.show_line_numbers)
+        (std.fmt.count("{d}", .{dired.entries.items.len}) + 1)
+    else
+        0;
     // The full directory path heads the listing (the classic dired header
     // line), taking one row unless the pane is too small to spare it.
+    // With the gutter on it sits at its right edge, aligned with the
+    // entries' mark column.
     const show_header = text_height >= 2;
     const entry_rows = if (show_header) text_height - 1 else text_height;
     dired.scrollToSelected(entry_rows);
@@ -3293,7 +3304,7 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
 
     var row: u16 = 0;
     if (show_header) {
-        _ = win.printSegment(.{ .text = dired.display_path.items }, .{ .row_offset = row_base });
+        _ = win.printSegment(.{ .text = dired.display_path.items }, .{ .row_offset = row_base, .col_offset = @intCast(line_num_width) });
         row = 1;
     }
     var i = dired.top;
@@ -3308,15 +3319,29 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
         const current = i == dired.selected;
         const style: vaxis.Style = if (is_marked) highlight_style else if (current) .{ .bold = true } else .{};
         const hl_style: vaxis.Style = if (is_marked) .{ .bold = true } else if (current) .{ .reverse = true, .bold = true } else highlight_style;
-        // Column 0 is the mark column, like Emacs: "*" for a marked
-        // entry, a blank otherwise.
-        _ = win.printSegment(.{ .text = if (e.marked) "*" else " ", .style = style }, .{ .row_offset = row_base + row });
+        if (line_num_width > 0) {
+            // The entry's number, right-aligned in the gutter and dimmed
+            // like a file buffer's; allocated on the frame since the
+            // cells keep their text slices until the frame is drawn.
+            const n = std.fmt.allocPrint(frame.gpa, "{d}", .{i + 1}) catch continue;
+            frame.items.append(frame.gpa, n) catch {
+                frame.gpa.free(n);
+                continue;
+            };
+            _ = win.printSegment(.{ .text = n, .style = .{ .dim = true } }, .{ .row_offset = row_base + row, .col_offset = @intCast(line_num_width - 1 - n.len) });
+        }
+        // Column 0 of the entries is the mark column, like Emacs: "*" for
+        // a marked entry, a blank otherwise.
+        _ = win.printSegment(.{ .text = if (e.marked) "*" else " ", .style = style }, .{ .row_offset = row_base + row, .col_offset = @intCast(line_num_width) });
         // ( toggles dired-hide-details-mode: with the details hidden the
         // metadata prefix (permissions, size, date) is skipped, so only
         // the names remain — the mark column and name line up as usual.
-        const name_col: u16 = if (dired.hide_details) 1 else 1 + win.gwidth(e.meta);
+        const name_col: u16 = if (dired.hide_details)
+            @intCast(line_num_width + 1)
+        else
+            @intCast(line_num_width + 1 + win.gwidth(e.meta));
         if (!dired.hide_details) {
-            _ = win.printSegment(.{ .text = e.meta, .style = style }, .{ .row_offset = row_base + row, .col_offset = 1 });
+            _ = win.printSegment(.{ .text = e.meta, .style = style }, .{ .row_offset = row_base + row, .col_offset = @intCast(line_num_width + 1) });
         }
         const hl: ?Highlight = if (searching) blk: {
             if (match) |m| {
@@ -3404,7 +3429,7 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
         const n = std.fmt.bufPrint(modeline_buf, "{s}", .{m}) catch break :blk .{ .len = 0, .label_len = 0 };
         break :blk .{ .len = n.len, .label_len = 0 };
     } else blk: {
-        const n = std.fmt.bufPrint(modeline_buf, "Dired: {s}{s}", .{ dired.display_path.items, if (dired.hide_details) " (Hide-Details)" else "" }) catch break :blk .{ .len = 0, .label_len = 0 };
+        const n = std.fmt.bufPrint(modeline_buf, "Dired: {s}{s}{s}", .{ dired.display_path.items, if (dired.hide_details) " (Hide-Details)" else "", if (buf.show_line_numbers) " [linum]" else "" }) catch break :blk .{ .len = 0, .label_len = 0 };
         break :blk .{ .len = n.len, .label_len = 0 };
     };
     const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true };
@@ -3412,13 +3437,16 @@ fn renderDiredPane(win: vaxis.Window, dired: *Dired, is_focused: bool, row_base:
 
     if (is_focused) {
         // The cursor sits at the start of the entry's name, after the
-        // mark column and the metadata prefix, rather than at the start
-        // of the line.
+        // line-number gutter (when on), the mark column and the metadata
+        // prefix, rather than at the start of the line.
         const sel = dired.selected;
         const name_col: u16 = if (sel < dired.entries.items.len)
-            1 + win.gwidth(dired.entries.items[sel].meta)
+            (if (dired.hide_details)
+                @intCast(line_num_width + 1)
+            else
+                @intCast(line_num_width + 1 + win.gwidth(dired.entries.items[sel].meta)))
         else
-            0;
+            @intCast(line_num_width);
         win.showCursor(name_col, @intCast(sel - dired.top + @as(usize, @intFromBool(show_header))));
     }
 }
@@ -3646,7 +3674,7 @@ fn renderTree(
             // full-screen (the single pane covers the whole window).
             renderPicker(child, io, picker.?, buffers, bookmarks, recent, &modeline_bufs[slot % MAX_PANES], pane_search);
         } else if (direds[pane.buf_idx]) |*d| {
-            renderDiredPane(child, d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_compress_menu, pane_archive_query, pane_prompt, pane_status);
+            renderDiredPane(child, frame, buffers[pane.buf_idx], d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_compress_menu, pane_archive_query, pane_prompt, pane_status);
         } else {
             renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_status);
         }
@@ -8469,7 +8497,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal) {
             if (direds.items[current]) |*d| {
                 var modeline_buf: [2048]u8 = undefined;
-                renderDiredPane(body, d, true, 0, body.height, &modeline_buf, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg);
+                renderDiredPane(body, &frame_allocs, buf, d, true, 0, body.height, &modeline_buf, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg);
                 try vx.render(tty.writer());
                 frame_allocs.reset();
                 continue;

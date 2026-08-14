@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.68.0 — <2026-08-14>
+
+Direds show line numbers: =C-z n= now works while browsing a directory.
+
+- =C-z n= (Emacs =display-line-numbers-mode=) now numbers a dired's listing as well as a file buffer's: each entry's number in the same dim, right-aligned gutter — one column per digit of the largest entry number, the entries numbered 1..N — so a directory listing reads like a numbered index of its files, and the numbers match the mirror lines that =M-g= and isearch navigate. The directory header line stays unnumbered (it is not an entry) and sits at the gutter's edge, aligned with the entries' mark column; the cursor lands after the gutter on the selected entry's name as usual. The modeline shows =[linum]= while on — =Dired: <path> [linum]= — and the setting is per-buffer like soft wrap, so each dired remembers its own. Split panes and the full-width listing both get the gutter.
+
 ** 0.67.0 — <2026-08-14>
 
 =C-x C-b= opens the =*Ibuffer*=, Emacs's ibuffer: every buffer in a table, with marks and kill-marked.

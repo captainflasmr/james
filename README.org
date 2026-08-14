@@ -68,6 +68,7 @@ Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes 
 | =C-x r b= | jump to a bookmark |
 | =C-x r l= / =C-c o= | list bookmarks (type to filter, C-s searches, Enter/C-m jumps, arrows move, C-g/Esc closes) |
 | =C-z e= | toggle whitespace markers (Emacs =whitespace-mode=): spaces show as =·=, tabs as =»=, line breaks as =$= at the end of each line, with =[whitespace]= in the modeline while on; per-buffer like soft wrap |
+| =C-z n= | toggle line numbers (Emacs =display-line-numbers-mode=): each line's number in a dim right-aligned gutter — file buffers and direds alike (a dired's header line stays unnumbered, the entries carry 1..N matching the mirror's lines) — with =[linum]= in the modeline while on; per-buffer like soft wrap |
 | =C-c b= | copy the whole buffer to the kill ring |
 | =C-c w= | copy the region and deselect it |
 | =C-c C-k= | close the dired browser |
