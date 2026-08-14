@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.67.0 — <2026-08-14>
+
+=C-x C-b= opens the =*Ibuffer*=, Emacs's ibuffer: every buffer in a table, with marks and kill-marked.
+
+- =C-x C-b= (Emacs =list-buffers= / ibuffer) opens a persistent =*Ibuffer*= buffer — the sibling of the transient =C-x b= picker — listing every open buffer in an Emacs-style table: the =MRL= mark / read-only / lock column, then the name, size, mode and filename columns, and a footer mirroring Emacs's =N buffers ... M files, no processes= summary. The mode column reads like Emacs's (=Dired by name= and the other dired sorts, =Grep= / =Files= / =Occur= / =Home= for the special buffers, =Fundamental= for a file), read-only buffers show =%= in the R column, long names elide with =...=, and the default sort puts the starred buffers first by name (=s= toggles to the buffer-list order). It is a real buffer: it stays open in the list, shows in any window, and the listing rebuilds itself whenever a buffer opens or closes, so a stale row can never be acted on. =n= / =p= (and arrows) move, Enter opens the row's buffer in the window (the =*Ibuffer*= stays open, like a dired), =m= / =u= mark and unmark rows with a =*= in the M column, =U= unmarks everything, =t= toggles all marks, =X= kills the marked buffers — largest index first so the kills can't shift underfoot, a modified file buffer kept, the ibuffer re-found and re-focused after — =g= re-reads the listing, =q= / =C-g= closes, and =C-s= / =C-r= search the table like any buffer. The cursor lands on the current buffer when the ibuffer opens, and a rebuild keeps the selection on the same buffer by name.
+
 ** 0.66.0 — <2026-08-12>
 
 =C-c r= forces a full re-render of the frame, washing out stray characters the terminal has picked up.

@@ -6,6 +6,18 @@ const Buffer = @import("Buffer.zig");
 const Dired = @import("Dired.zig");
 const build_options = @import("build_options");
 
+/// The sort order of the ibuffer listing (C-x C-b): by name — special
+/// (starred) buffers first, then case-insensitive, the classic Emacs
+/// default — or by the buffer-list order, what the C-x b picker shows.
+/// s in the ibuffer toggles between them.
+const IbufferSort = enum { name, order };
+
+/// Bumped every time a buffer is added to or removed from the buffer
+/// list, so an open *Ibuffer* can tell (at the next render) that its
+/// rows — buffer indices — have gone stale and must be rebuilt before
+/// they are acted on again.
+var buffer_list_gen: usize = 0;
+
 /// Suppress vaxis's std.log output: stderr shares the terminal, so its
 /// startup chatter ("kitty keyboard capability", resize notices, ...)
 /// would otherwise be painted on top of the editor screen.
@@ -1540,6 +1552,7 @@ fn occurRun(
     new_buf.soft_wrap = false;
     buffers.append(gpa, new_buf) catch return null;
     direds.append(gpa, null) catch return null;
+    buffer_list_gen += 1; // the *Ibuffer* listing is now stale
     occur_buf_idx.* = buffers.items.len - 1;
     recordWindow(gpa, root, focused.*, current, undo, redo);
     focused.*.buf_idx = occur_buf_idx.*.?;
@@ -1824,6 +1837,7 @@ fn finishGrep(
     new_buf.soft_wrap = false;
     buffers.append(gpa, new_buf) catch return null;
     direds.append(gpa, null) catch return null;
+    buffer_list_gen += 1; // the *Ibuffer* listing is now stale
     grep_buf_idx.* = buffers.items.len - 1;
     return grep_buf_idx.*;
 }
@@ -1890,6 +1904,7 @@ fn finishFind(
     new_buf.soft_wrap = false;
     buffers.append(gpa, new_buf) catch return null;
     direds.append(gpa, null) catch return null;
+    buffer_list_gen += 1; // the *Ibuffer* listing is now stale
     find_buf_idx.* = buffers.items.len - 1;
     filesMirror(gpa, new_buf, find_paths.items, "", find_visible, find_hl);
     return find_buf_idx.*;
@@ -3697,6 +3712,7 @@ const welcome_tail =
     \\    C-x d / C-x m       browse files (dired)
     \\    C-x C-f             open or create a file
     \\    C-x b               pick an open buffer
+    \\    C-x C-b             list every buffer (ibuffer)
     \\
     \\  C-x — files, buffers and windows:
     \\
@@ -3705,6 +3721,7 @@ const welcome_tail =
     \\    C-x u               undo
     \\    C-x k               kill the current buffer
     \\    C-x C-f             open or create a file
+    \\    C-x C-b             list every buffer (ibuffer)
     \\    C-x g               re-read the file from disk
     \\    C-x h               mark the whole buffer
     \\    C-x l               toggle scroll lock (cursor stays put, text scrolls)
@@ -3827,6 +3844,16 @@ const welcome_tail =
     \\    z                   compress / decompress the marked entries
     \\    q / C-g             close the dired
     \\
+    \\  Ibuffer (C-x C-b):
+    \\
+    \\    n / p               next / previous buffer (arrows too)
+    \\    Enter               open the buffer
+    \\    m / u / U / t       mark / unmark rows
+    \\    X                   kill the marked buffers
+    \\    s                   toggle the sort (name / list order)
+    \\    g                   re-read the listing
+    \\    q / C-g             close the ibuffer
+    \\
     \\  Pickers (buffers, bookmarks and recent files):
     \\
     \\    type              filter the list (fuzzy, as you type)
@@ -3911,6 +3938,7 @@ fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer), environ
     new_buf.* = try Buffer.fromText(gpa, text.items);
     new_buf.display_name = try gpa.dupe(u8, "*welcome*");
     try buffers.append(gpa, new_buf);
+    buffer_list_gen += 1; // the *Ibuffer* listing is now stale
 }
 
 /// True if `path` names a directory (so it should be browsed, not read).
@@ -3967,6 +3995,7 @@ fn openBufferOrDired(
             popped.deinit(gpa);
         }
         try buffers.append(gpa, new_buf);
+        buffer_list_gen += 1; // the *Ibuffer* listing is now stale
         return buffers.items.len - 1;
     }
     const new_buf = try gpa.create(Buffer);
@@ -3974,6 +4003,7 @@ fn openBufferOrDired(
     new_buf.* = try Buffer.loadFile(gpa, io, path);
     try buffers.append(gpa, new_buf);
     try direds.append(gpa, null);
+    buffer_list_gen += 1; // the *Ibuffer* listing is now stale
     // A freshly opened file joins the recent-files list (M-l l), like
     // Emacs recentf — directories are not remembered.
     recordRecent(gpa, recent, path);
@@ -4005,6 +4035,7 @@ fn closeBuffer(
     var b = buffers.orderedRemove(current);
     b.deinit(gpa);
     gpa.destroy(b);
+    buffer_list_gen += 1; // the *Ibuffer* listing is now stale
 
     // Rebase every window's buffer index onto the shrunken list; a pane
     // that showed the killed buffer now shows the buffer that took its slot.
@@ -4451,6 +4482,193 @@ fn selectDiredEntry(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer), di
             return;
         }
     }
+}
+
+/// The Name column of the ibuffer row for buffer `i`: the display name
+/// (results buffers, the home screen), else the file / directory's base
+/// name, like Emacs's buffer-name. A dired's name comes from its display
+/// path — absolute, dot and dotdot cleaned — not the raw path it was
+/// opened with, which may be "." (so the name reads "james", not ".").
+/// Buffer names are unique in james — files and directories open-or-
+/// switch by path, the special buffers by name — which is what lets a
+/// rebuild re-find the selection.
+fn ibufferNameOf(buffers: []*Buffer, direds: []?Dired, i: usize) []const u8 {
+    const b = buffers[i];
+    if (b.display_name) |dn| return dn;
+    if (direds[i]) |d| {
+        const base = std.fs.path.basename(d.display_path.items);
+        if (base.len > 0) return base;
+        return d.display_path.items;
+    }
+    return if (b.filename) |f| std.fs.path.basename(f) else "?";
+}
+
+/// The Mode column of the ibuffer row for buffer `i`, mirroring Emacs's
+/// mode names: "Dired by name" (and friends, matching the dired's sort),
+/// "Grep" / "Files" / "Occur" / "Home" for the special buffers, and
+/// "Fundamental" for a plain file.
+fn ibufferModeOf(buffers: []*Buffer, direds: []?Dired, i: usize) []const u8 {
+    if (direds[i]) |d| return switch (d.sort_mode) {
+        .name => "Dired by name",
+        .size => "Dired by size",
+        .date => "Dired by date",
+        .extension => "Dired by extension",
+    };
+    if (buffers[i].display_name) |dn| {
+        if (std.mem.eql(u8, dn, "*grep*")) return "Grep";
+        if (std.mem.eql(u8, dn, "*files*")) return "Files";
+        if (std.mem.eql(u8, dn, "*occur*")) return "Occur";
+        if (std.mem.eql(u8, dn, "*welcome*")) return "Home";
+        if (std.mem.eql(u8, dn, "*Ibuffer*")) return "Ibuffer";
+    }
+    return "Fundamental";
+}
+
+/// The Filename column of the ibuffer row for buffer `i`: the full path
+/// (a dired's display path, which is absolute and cleaned), or empty for
+/// the file-less special buffers.
+fn ibufferPathOf(direds: []?Dired, b: *Buffer, i: usize) []const u8 {
+    if (direds[i]) |d| return d.display_path.items;
+    return b.filename orelse "";
+}
+
+/// The sort context for ibufferLessName: the lists the row indices
+/// resolve against.
+const IbufferCtx = struct { buffers: []*Buffer, direds: []?Dired };
+
+/// Sort the ibuffer rows by name — special (starred) buffers first, then
+/// case-insensitive — the classic Emacs default.
+fn ibufferLessName(ctx: IbufferCtx, a: usize, b: usize) bool {
+    const an = ibufferNameOf(ctx.buffers, ctx.direds, a);
+    const bn = ibufferNameOf(ctx.buffers, ctx.direds, b);
+    const a_special = an.len > 0 and an[0] == '*';
+    const b_special = bn.len > 0 and bn[0] == '*';
+    if (a_special != b_special) return a_special;
+    return std.ascii.lessThanIgnoreCase(an, bn);
+}
+
+/// Rebuild the *Ibuffer* buffer's listing: the header and dashes ruler,
+/// one row per open buffer — the ibuffer itself excluded — formatted
+/// like Emacs's ibuffer table (the MRL mark / read-only / lock column,
+/// then the name, size, mode and filename columns), and a footer of the
+/// total count, size and file count mirroring Emacs's "N buffers ... M
+/// files, no processes" summary. `rows` gets the buffer index of each
+/// entry row in order, so the entry at line r sits at rows[r - 2]. The
+/// row under the cursor is re-selected afterwards: `select_name` when
+/// the caller names one (C-x C-b selects the current buffer), else the
+/// previously selected row's buffer — found by name, since buffer names
+/// are unique here — so a rebuild after opening or killing buffers keeps
+/// the cursor put. Marks live in the rows' M column and a rebuild wipes
+/// them, like a dired refresh.
+fn ibufferRebuild(gpa: std.mem.Allocator, buffers: []*Buffer, direds: []?Dired, idx: usize, rows: *std.ArrayList(usize), sort: IbufferSort, select_name: ?[]const u8) void {
+    const buf = buffers[idx];
+    // The row to reselect: the caller's choice, else the previously
+    // selected row's buffer name. The old rows may be stale after
+    // buffers were killed — guard the bounds.
+    const prev_name: ?[]const u8 = if (select_name) |sn|
+        sn
+    else if (buf.cursor_row >= 2 and buf.cursor_row - 2 < rows.items.len and rows.items[buf.cursor_row - 2] < buffers.len)
+        ibufferNameOf(buffers, direds, rows.items[buf.cursor_row - 2])
+    else
+        null;
+
+    for (buf.lines.items) |*l| l.deinit(gpa);
+    buf.lines.clearRetainingCapacity();
+    rows.clearRetainingCapacity();
+
+    // Every buffer but the ibuffer itself, in listing order.
+    var order: std.ArrayList(usize) = .empty;
+    defer order.deinit(gpa);
+    for (buffers, 0..) |_, i| {
+        if (i == idx) continue;
+        order.append(gpa, i) catch return;
+    }
+    if (sort == .name) {
+        const ctx: IbufferCtx = .{ .buffers = buffers, .direds = direds };
+        std.mem.sort(usize, order.items, ctx, ibufferLessName);
+    }
+
+    const append_line = struct {
+        fn run(alloc: std.mem.Allocator, target: *Buffer, text: []const u8) bool {
+            var line: std.ArrayList(u8) = .empty;
+            errdefer line.deinit(alloc);
+            line.appendSlice(alloc, text) catch return false;
+            target.lines.append(alloc, line) catch return false;
+            return true;
+        }
+    }.run;
+
+    // The header and its dashes ruler. The columns match Emacs's default
+    // ibuffer format: MRL, then name 20 wide, size 6 right-aligned, mode
+    // 18, and the filename taking the rest of the line.
+    const header = std.fmt.allocPrint(gpa, " MRL {s:<20} {s:>6} {s:<18} {s}", .{ "Name", "Size", "Mode", "Filename/Process" }) catch return;
+    defer gpa.free(header);
+    const ruler = std.fmt.allocPrint(gpa, " --- {s:<20} {s:>6} {s:<18} {s}", .{ "--------------------", "----", "------------------", "----------------" }) catch return;
+    defer gpa.free(ruler);
+    if (!append_line(gpa, buf, header)) return;
+    if (!append_line(gpa, buf, ruler)) return;
+
+    var total_size: u64 = 0;
+    var nfiles: usize = 0;
+    for (order.items) |i| {
+        const b = buffers[i];
+        const is_dired = direds[i] != null;
+        if (b.filename != null and !is_dired) nfiles += 1;
+        var size: u64 = 0;
+        for (b.lines.items) |l| size += l.items.len + 1;
+        total_size += size;
+        // A long name elides with ... like Emacs's elide.
+        const name = ibufferNameOf(buffers, direds, i);
+        const name_w: usize = 20;
+        var owned_name: ?[]u8 = null;
+        defer if (owned_name) |o| gpa.free(o);
+        const name_disp: []const u8 = if (name.len > name_w) blk: {
+            owned_name = std.fmt.allocPrint(gpa, "{s}...", .{name[0 .. name_w - 3]}) catch return;
+            break :blk owned_name.?;
+        } else name;
+        // M column: * when marked (marks live in the line, so a rebuild
+        // starts unmarked). R column: % for a read-only buffer — direds
+        // and the special buffers. L is never set.
+        const row = std.fmt.allocPrint(gpa, " {c}{c}  {s:<20} {d:>6} {s:<18} {s}", .{
+            ' ',
+            @as(u8, if (is_dired or b.display_name != null) '%' else ' '),
+            name_disp,
+            size,
+            ibufferModeOf(buffers, direds, i),
+            ibufferPathOf(direds, b, i),
+        }) catch return;
+        defer gpa.free(row);
+        if (!append_line(gpa, buf, row)) return;
+        rows.append(gpa, i) catch return;
+    }
+
+    const footer = std.fmt.allocPrint(gpa, "{d:>6} buffers {d:>16} {d:>3} files, no processes", .{ order.items.len, total_size, nfiles }) catch return;
+    defer gpa.free(footer);
+    _ = append_line(gpa, buf, footer);
+
+    // Reselect: the named buffer if given, else the previous selection
+    // (its name is always found unless the buffer is gone, in which case
+    // the cursor lands on the first row).
+    buf.cursor_row = if (rows.items.len > 0) 2 else 0;
+    buf.cursor_col = 0;
+    if (prev_name) |pn| {
+        for (rows.items, 0..) |bi, r| {
+            if (std.mem.eql(u8, ibufferNameOf(buffers, direds, bi), pn)) {
+                buf.cursor_row = r + 2;
+                break;
+            }
+        }
+    }
+}
+
+/// m / u in the ibuffer: mark (or unmark) the row under the cursor —
+/// the mark lives in the row's M column (column 1), so no separate state
+/// is needed — stepping down afterwards like dired. The header, ruler
+/// and footer rows are never marked.
+fn ibufferSetMark(buf: *Buffer, row: usize, on: bool) void {
+    if (row < 2 or row >= buf.lines.items.len) return;
+    const line: []u8 = buf.lines.items[row].items;
+    if (line.len > 1) line[1] = if (on) '*' else ' ';
 }
 
 /// A named (file, position) pair, like an Emacs bookmark. Persisted to
@@ -5118,6 +5336,18 @@ pub fn main(init: std.process.Init) !void {
     defer find_hl.deinit(gpa);
     var find_dir: ?[]u8 = null;
     defer if (find_dir) |d| gpa.free(d);
+    // The *Ibuffer* (C-x C-b, Emacs's ibuffer): the persistent buffer
+    // table. `ibuffer_rows` maps each entry row (line minus the header
+    // and ruler) to its buffer index; `ibuffer_sort` orders the rows by
+    // name (the default) or by buffer-list order, s toggling. The
+    // listing is rebuilt whenever it is opened and whenever the buffer
+    // list changes (see buffer_list_gen); `ibuffer_gen` remembers the
+    // list generation the rows were last built from.
+    var ibuffer_buf_idx: ?usize = null;
+    var ibuffer_rows: std.ArrayList(usize) = .empty;
+    defer ibuffer_rows.deinit(gpa);
+    var ibuffer_sort: IbufferSort = .name;
+    var ibuffer_gen: usize = 0;
     // The modal picker (C-x b buffers, C-x r l / C-c o / M-l o bookmarks,
     // M-l l recent files): one at a time, over rows that filter as you
     // type (see pickerFilter). `picker_kind` selects the row source;
@@ -6486,6 +6716,40 @@ pub fn main(init: std.process.Init) !void {
                         picker_top = 0;
                         picker_query.clearRetainingCapacity();
                         pickerFilter(gpa, .buffers, buffers.items, bookmarks.items, recent.items, "", &picker_visible, &picker_hl);
+                    } else if (key.matches('b', .{ .ctrl = true })) {
+                        // C-x C-b: open (or switch to) the *Ibuffer* — the
+                        // persistent buffer table, Emacs's ibuffer (the C-x b
+                        // picker is the transient quick-access list; this is
+                        // the full listing). The listing is rebuilt on
+                        // entry, the selection landing on the current
+                        // buffer, and the window layout otherwise untouched.
+                        if (ibuffer_buf_idx) |ib| {
+                            if (ib < buffers.items.len and std.mem.eql(u8, buffers.items[ib].display_name orelse "", "*Ibuffer*")) {
+                                ibufferRebuild(gpa, buffers.items, direds.items, ib, &ibuffer_rows, ibuffer_sort, if (current == ib) null else ibufferNameOf(buffers.items, direds.items, current));
+                                ibuffer_gen = buffer_list_gen;
+                                recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                                current = ib;
+                                focused.buf_idx = current;
+                                break :key_blk;
+                            }
+                            // The tracked index is stale (the buffer was
+                            // killed) — fall through and create a fresh one.
+                            ibuffer_buf_idx = null;
+                        }
+                        const new_buf = try gpa.create(Buffer);
+                        errdefer gpa.destroy(new_buf);
+                        new_buf.* = Buffer.initEmpty();
+                        new_buf.display_name = try gpa.dupe(u8, "*Ibuffer*");
+                        try buffers.append(gpa, new_buf);
+                        try direds.append(gpa, null);
+                        buffer_list_gen += 1; // the new buffer is listed too
+                        ibuffer_buf_idx = buffers.items.len - 1;
+                        ibufferRebuild(gpa, buffers.items, direds.items, ibuffer_buf_idx.?, &ibuffer_rows, ibuffer_sort, ibufferNameOf(buffers.items, direds.items, current));
+                        ibuffer_gen = buffer_list_gen;
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                        current = ibuffer_buf_idx.?;
+                        focused.buf_idx = current;
+                        break :key_blk;
                     } else if (key.matches('k', .{})) {
                         // C-x k: kill the current buffer (Emacs kill-buffer).
                         // A modified file buffer asks first (y saves and
@@ -6861,6 +7125,13 @@ pub fn main(init: std.process.Init) !void {
                         if (current == occur_buf_idx and std.mem.eql(u8, name, "*occur*")) break :blk .occur;
                         break :blk null;
                     };
+                    // The *Ibuffer* buffer (C-x C-b), verified by name like
+                    // the results buffers, so a stale index can't hijack a
+                    // buffer that took the slot.
+                    const is_ibuffer = if (ibuffer_buf_idx) |ib|
+                        ib == current and std.mem.eql(u8, buffers.items[current].display_name orelse "", "*Ibuffer*")
+                    else
+                        false;
                     // `editing` is captured BEFORE the dired block runs: it
                     // must describe the buffer this keypress actually acts
                     // on. Opening a file from dired changes `current` mid-
@@ -6869,7 +7140,7 @@ pub fn main(init: std.process.Init) !void {
                     // zero-line dired buffer. The results buffers are
                     // read-only like a dired, so keys they don't consume
                     // (kills) don't corrupt their rows.
-                    const editing = direds.items[current] == null and results_kind == null;
+                    const editing = direds.items[current] == null and results_kind == null and !is_ibuffer;
                     if (results_kind) |rkind| results_blk: {
                         const is_files = rkind == .files;
                         const is_occur = rkind == .occur;
@@ -7066,6 +7337,161 @@ pub fn main(init: std.process.Init) !void {
                                     buf.cursor_col = 0;
                                 }
                             }
+                        }
+                    } else if (is_ibuffer) {
+                        // The *Ibuffer* (C-x C-b, Emacs's ibuffer): the
+                        // persistent buffer table. n / p (and arrows / C-n /
+                        // C-p) move between the rows, Enter opens the row's
+                        // buffer in this window (the *Ibuffer* stays open,
+                        // like a dired), g rebuilds the listing, s toggles
+                        // the sort, m / u / U / t mark rows — the * in the
+                        // M column — and X kills the marked buffers (a
+                        // modified file buffer is kept). C-s / C-r search
+                        // the table like any buffer. The rows start at line
+                        // 2, under the header and its dashes ruler; the
+                        // entry at line r sits at rows[r - 2].
+                        const first_row: usize = 2;
+                        const last_row = ibuffer_rows.items.len + first_row -| 1;
+                        // Every key the table owns ends with break :key_blk
+                        // so the editing keys below (C-n / C-p movement,
+                        // M-< / M->, C-d / Backspace / C-k deletions) never
+                        // also act on the table's lines — the ibuffer's
+                        // cursor and marks live in those lines, unlike a
+                        // dired's. Keys the ibuffer doesn't bind (C-x, C-s,
+                        // C-l, ...) fall through to the chain below, like
+                        // a dired.
+                        if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
+                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo);
+                            ibuffer_buf_idx = null;
+                            break :key_blk;
+                        } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
+                            if (buf.cursor_row < last_row) buf.cursor_row += 1;
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
+                            if (buf.cursor_row > first_row) buf.cursor_row -= 1;
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches('f', .{})) {
+                            // Enter: open the row's buffer in this window.
+                            // The header, ruler and footer rows are not
+                            // entries — nothing opens.
+                            if (buf.cursor_row >= first_row and buf.cursor_row <= last_row) {
+                                const target = ibuffer_rows.items[buf.cursor_row - first_row];
+                                recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                                current = target;
+                                focused.buf_idx = current;
+                            }
+                            break :key_blk;
+                        } else if (key.matches('g', .{})) {
+                            // g: rebuild the listing (Emacs
+                            // revert-buffer), keeping the selection.
+                            ibufferRebuild(gpa, buffers.items, direds.items, current, &ibuffer_rows, ibuffer_sort, null);
+                            ibuffer_gen = buffer_list_gen;
+                            break :key_blk;
+                        } else if (key.matches('s', .{})) {
+                            // s: toggle the sort — by name (special
+                            // buffers first) or by the buffer-list order.
+                            ibuffer_sort = if (ibuffer_sort == .name) .order else .name;
+                            ibufferRebuild(gpa, buffers.items, direds.items, current, &ibuffer_rows, ibuffer_sort, null);
+                            break :key_blk;
+                        } else if (key.matches('m', .{})) {
+                            if (buf.cursor_row >= first_row and buf.cursor_row <= last_row) ibufferSetMark(buf, buf.cursor_row, true);
+                            if (buf.cursor_row < last_row) buf.cursor_row += 1;
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches('u', .{})) {
+                            if (buf.cursor_row >= first_row and buf.cursor_row <= last_row) ibufferSetMark(buf, buf.cursor_row, false);
+                            if (buf.cursor_row < last_row) buf.cursor_row += 1;
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches('U', .{})) {
+                            // U: unmark every row (Emacs
+                            // ibuffer-unmark-all).
+                            for (buf.lines.items, 0..) |*l, r| {
+                                if (r < first_row or r > last_row) continue;
+                                if (l.items.len > 1) l.items[1] = ' ';
+                            }
+                            break :key_blk;
+                        } else if (key.matches('t', .{})) {
+                            // t: toggle the marks on every row (Emacs
+                            // ibuffer-toggle-marks).
+                            for (buf.lines.items, 0..) |*l, r| {
+                                if (r < first_row or r > last_row) continue;
+                                if (l.items.len > 1) l.items[1] = if (l.items[1] == '*') ' ' else '*';
+                            }
+                            break :key_blk;
+                        } else if (key.matches('X', .{})) {
+                            // X: kill the marked buffers (Emacs
+                            // ibuffer-do-kill-on-deletion-marks). A
+                            // modified file buffer is kept, like C-x k
+                            // asking first. The kills run largest index
+                            // first so earlier indices don't shift
+                            // underfoot.
+                            var kill_list: std.ArrayList(usize) = .empty;
+                            defer kill_list.deinit(gpa);
+                            var kept_dirty = false;
+                            for (ibuffer_rows.items, 0..) |bi, r| {
+                                const line: []u8 = buf.lines.items[r + first_row].items;
+                                if (line.len > 1 and line[1] == '*') {
+                                    if (buffers.items[bi].dirty and buffers.items[bi].filename != null) {
+                                        kept_dirty = true;
+                                    } else {
+                                        kill_list.append(gpa, bi) catch {};
+                                    }
+                                }
+                            }
+                            std.mem.sort(usize, kill_list.items, {}, std.sort.desc(usize));
+                            for (kill_list.items) |k| {
+                                _ = closeBuffer(gpa, &buffers, &direds, root, focused, k, &window_undo, &window_redo);
+                            }
+                            if (kill_list.items.len > 0) {
+                                // The kills shift every later index — find
+                                // the *Ibuffer* again and re-focus it.
+                                for (buffers.items, 0..) |b, i| {
+                                    if (std.mem.eql(u8, b.display_name orelse "", "*Ibuffer*")) {
+                                        ibuffer_buf_idx = i;
+                                        current = i;
+                                        focused.buf_idx = i;
+                                        break;
+                                    }
+                                }
+                                ibufferRebuild(gpa, buffers.items, direds.items, ibuffer_buf_idx.?, &ibuffer_rows, ibuffer_sort, null);
+                                ibuffer_gen = buffer_list_gen;
+                                if (kept_dirty) status_msg = "Modified buffers kept";
+                            }
+                            break :key_blk;
+                        } else if (key.matches('<', .{ .alt = true })) {
+                            buf.cursor_row = first_row;
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches('>', .{ .alt = true })) {
+                            buf.cursor_row = last_row;
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches('j', .{ .alt = true })) {
+                            buf.cursor_row = @min(buf.cursor_row + 5, last_row);
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches('k', .{ .alt = true })) {
+                            buf.cursor_row -|= 5;
+                            if (buf.cursor_row < first_row) buf.cursor_row = first_row;
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches('J', .{ .alt = true })) {
+                            buf.cursor_row = @min(buf.cursor_row + (focused_text_height -| 1), last_row);
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches('K', .{ .alt = true })) {
+                            buf.cursor_row -|= focused_text_height -| 1;
+                            if (buf.cursor_row < first_row) buf.cursor_row = first_row;
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches(vaxis.Key.backspace, .{}) or key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.delete, .{})) {
+                            // The table is read-only: deletion keys are
+                            // swallowed rather than corrupting a row.
+                            break :key_blk;
                         }
                     } else if (direds.items[current]) |*d| {
                         if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
@@ -8003,6 +8429,19 @@ pub fn main(init: std.process.Init) !void {
                 @mod(@divTrunc(elapsed_ms, 100), 10),
             }) catch null;
             if (n) |nn| status_msg = status_buf[0..nn.len];
+        }
+
+        // The *Ibuffer*'s rows are buffer indices, so any buffer opened or
+        // killed since the last rebuild has shifted them. Rebuild the
+        // listing before rendering — whether the ibuffer is the focused
+        // pane or sits in a split — so a stale row can never be shown or
+        // acted on (the selection follows the previously selected buffer
+        // by name).
+        if (ibuffer_buf_idx) |ib| {
+            if (ib < buffers.items.len and std.mem.eql(u8, buffers.items[ib].display_name orelse "", "*Ibuffer*") and ibuffer_gen != buffer_list_gen) {
+                ibufferRebuild(gpa, buffers.items, direds.items, ib, &ibuffer_rows, ibuffer_sort, null);
+                ibuffer_gen = buffer_list_gen;
+            }
         }
 
         if (!is_modal and !root.isLeaf()) {
