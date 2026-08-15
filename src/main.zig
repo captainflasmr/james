@@ -4129,10 +4129,10 @@ const welcome_tail =
     \\    M-l g               the config directory
     \\    M-l i               the Emacs-vanilla config
     \\    M-l y               the Emacs-DIYer config
-    \\    M-l r             the scratch buffer
-    \\    M-l o             the bookmark list
-    \\    M-l l             pick a recently opened file
-    \\    M-l = / M-l -     new / close tab
+    \\    M-l r               the scratch buffer
+    \\    M-l o               the bookmark list
+    \\    M-l l               pick a recently opened file
+    \\    M-l = / M-l -       new / close tab
     \\
     \\  Tabs and windows:
     \\
@@ -4225,12 +4225,12 @@ const welcome_tail =
     \\
     \\  Pickers (buffers, bookmarks and recent files):
     \\
-    \\    type              filter the list (fuzzy, as you type)
-    \\    arrows / C-n/C-p  move the selection
-    \\    Enter             open the selection
-    \\    C-s / C-r         search the list
-    \\    Backspace         shorten the filter
-    \\    q                 close (C-g clears the filter first)
+    \\    type                filter the list (fuzzy, as you type)
+    \\    arrows / C-n/C-p    move the selection
+    \\    Enter               open the selection
+    \\    C-s / C-r           search the list
+    \\    Backspace           shorten the filter
+    \\    q                   close (C-g clears the filter first)
     \\
     \\  Prompts and confirmations:
     \\
@@ -6253,6 +6253,7 @@ pub fn main(init: std.process.Init) !void {
                         try buf.copyWholeBuffer(gpa, &kill_ring);
                         syncClipboard(&vx, &tty, gpa, kill_ring.current() orelse "");
                         kill_active = true;
+                        status_msg = "Copied";
                     } else if (key.matches('d', .{})) {
                         // C-c d: duplicate the selected entry with an
                         // incremented counter (the author's
