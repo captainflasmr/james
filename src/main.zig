@@ -7268,6 +7268,10 @@ pub fn main(init: std.process.Init) !void {
                         errdefer gpa.destroy(new_buf);
                         new_buf.* = Buffer.initEmpty();
                         new_buf.display_name = try gpa.dupe(u8, "*Ibuffer*");
+                        // The table always truncates: one buffer per row,
+                        // however long the name (the modeline's
+                        // [truncate] shows the state).
+                        new_buf.soft_wrap = false;
                         try buffers.append(gpa, new_buf);
                         try direds.append(gpa, null);
                         buffer_list_gen += 1; // the new buffer is listed too
