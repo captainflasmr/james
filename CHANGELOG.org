@@ -10,6 +10,15 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.79.0 — <2026-08-15>
+
+The buffer / bookmark / recent-file pickers dock at the bottom of the display icomplete-vertical-style, the dired buffer ends with a visible trailing newline, and the =*Ibuffer*= truncates by default.
+
+- The pickers (=C-x b=, =C-c o=, =M-l l=) render at the bottom of the display like Emacs's icomplete-vertical-mode / minibuffer: the windows shrink up to make room, their modelines sitting just above the candidate list, the current candidate highlighted in reverse video, and the typed filter in a prompt row beneath the candidates with the cursor at its end. The buffer or dired stays visible above while picking — the candidates no longer merge into the buffer's text. An idle hint ("type to filter, Enter opens, C-g closes") stands in for the filter when nothing is typed; the isearch prompt keeps its label, query and lazy count.
+- A dired buffer now ends with the trailing newline an Emacs dired has: =M->= (or =n= past the last entry) rests the selection on the empty final line, visible like a file buffer's final line, and copies of the listing (=C-c b=, =C-x h= + =M-w=) carry the final line break. The mirror buffer's trailing empty line is never drawn (the listing renders from the dired's entries) and never matched by isearch; every operation that indexes the selected entry (mark, copy, rename, delete, compress, duplicate, reveal, open) treats the trailing line like =".."= — a safe no-op.
+- The =*Ibuffer*= (=C-x C-b=) truncates by default, like the =*grep*= / =*files*= / =*occur*= results buffers — one buffer per row, however long the name, with =[truncate]= in its modeline (=M-z= toggles soft wrap).
+- The native and =x86_64-windows= cross builds compile.
+
 ** 0.78.0 — <2026-08-15>
 
 =C-x E= opens the native file manager at the current context, and =C-x T= opens a new native terminal window in its directory — from a dired, from a file buffer, from anywhere.

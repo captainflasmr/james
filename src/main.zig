@@ -3794,6 +3794,17 @@ fn renderDiredPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, dired: 
 /// while picking. The modeline text is built in `modeline_buf`, which
 /// the caller keeps alive until after the frame — vaxis stores grapheme
 /// slices, not copies.
+/// The height the picker takes at the bottom of the display — up to 10
+/// candidate rows plus the prompt row, capped to leave at least one row
+/// for the panes above (and never more than half the display). Emacs's
+/// icomplete-vertical shrinks the windows the same way.
+fn pickerHeight(pv: PickerView, body_height: u16) u16 {
+    const max_rows: u16 = @max(1, @min(10, body_height / 2));
+    const cand_rows: u16 = @intCast(@min(pv.visible.len, @as(usize, max_rows)));
+    const cap: u16 = if (body_height > 2) body_height - 1 else body_height;
+    return @min(cand_rows + 1, cap);
+}
+
 fn renderPicker(
     win: vaxis.Window,
     io: std.Io,
@@ -3834,11 +3845,11 @@ fn renderPicker(
             .recent => std.fs.path.dirname(recent[full]),
             .buffers => null,
         };
-        // An active isearch highlights the matched part of the name,
-        // like the dired and file-buffer match highlights; otherwise an
-        // active filter highlights the characters the fuzzy match hit,
-        // so the rows show why they're there.
-        const hl: ?Highlight = if (search != null and !search.?.failed) blk: {
+        // The current candidate is the icomplete-style selection bar
+        // (reverse video); the char-level highlights (isearch or fuzzy)
+        // mark only the other rows, so the bar stays distinct.
+        const current = i == sel_pos;
+        const hl: ?Highlight = if (search != null and !search.?.failed and !current) blk: {
             if (search.?.match) |m| {
                 if (full == m.row) {
                     const start = @min(m.col, name.len);
@@ -3848,8 +3859,10 @@ fn renderPicker(
             }
             break :blk null;
         } else null;
-        const fuzzy_hl: ?FuzzyHl = if (hl == null and view.query.len > 0 and i < view.hl.len) view.hl[i] else null;
-        if (hl) |h| {
+        const fuzzy_hl: ?FuzzyHl = if (hl == null and !current and view.query.len > 0 and i < view.hl.len) view.hl[i] else null;
+        if (current) {
+            _ = win.printSegment(.{ .text = name, .style = .{ .reverse = true } }, .{ .row_offset = list_row });
+        } else if (hl) |h| {
             var col: u16 = 0;
             if (h.start > 0) {
                 _ = win.printSegment(.{ .text = name[0..h.start], .style = .{} }, .{ .row_offset = list_row });
@@ -3885,49 +3898,50 @@ fn renderPicker(
             _ = win.printSegment(.{ .text = name, .style = .{} }, .{ .row_offset = list_row });
         }
         if (dir) |d| {
-            _ = win.printSegment(.{ .text = d, .style = dimStyle() }, .{ .row_offset = list_row, .col_offset = win.gwidth(name) + 2 });
+            const dir_style: vaxis.Style = if (current) .{ .reverse = true } else dimStyle();
+            _ = win.printSegment(.{ .text = d, .style = dir_style }, .{ .row_offset = list_row, .col_offset = win.gwidth(name) + 2 });
         }
         list_row += 1;
     }
+
+    // The prompt row (icomplete-vertical's minibuffer): the label and
+    // count bold, the typed filter plain with the cursor at its end; an
+    // idle hint stands in for the filter when nothing is typed.
+    const prompt_row: u16 = win.height -| 1;
     if (search) |s| {
         const search_label = if (s.failed)
             (if (s.backward) "Failing I-search backward" else "Failing I-search")
         else
             (if (s.backward) "I-search backward" else "I-search");
-        // The lazy count ("I-search: term (3/12)", like Emacs) trails
-        // the query in the same plain style.
+        const label_text = std.fmt.bufPrint(modeline_buf, "{s}: ", .{search_label}) catch search_label;
+        _ = win.printSegment(.{ .text = label_text, .style = .{ .bold = true } }, .{ .row_offset = prompt_row });
+        const label_w = win.gwidth(label_text);
+        _ = win.printSegment(.{ .text = s.query, .style = .{} }, .{ .row_offset = prompt_row, .col_offset = label_w });
+        const query_w = win.gwidth(s.query);
         var count_buf: [32]u8 = undefined;
         const suffix = isearchCountSuffix(&count_buf, s.query, s.pos, s.count);
-        var query_buf: [2048]u8 = undefined;
-        const query_with_count = if (suffix.len > 0)
-            (std.fmt.bufPrint(&query_buf, "{s}{s}", .{ s.query, suffix }) catch s.query)
-        else
-            s.query;
-        const ml = fillPromptModeline(modeline_buf, "{s}: ", .{search_label}, query_with_count);
-        _ = win.printSegment(.{ .text = modeline_buf[0..ml.label_len], .style = .{ .bold = true } }, .{ .row_offset = win.height -| 1 });
-        if (ml.label_len < ml.len) {
-            _ = win.printSegment(.{ .text = modeline_buf[ml.label_len..ml.len], .style = .{} }, .{ .row_offset = win.height -| 1, .col_offset = win.gwidth(modeline_buf[0..ml.label_len]) });
+        if (suffix.len > 0) {
+            _ = win.printSegment(.{ .text = suffix, .style = .{} }, .{ .row_offset = prompt_row, .col_offset = label_w + query_w });
         }
-    } else if (view.query.len > 0) {
-        const shown = if (view.visible.len > 0) sel_pos + 1 else 0;
-        const list_ml = std.fmt.bufPrint(modeline_buf, "{s} ({d}/{d})   filter: {s}   (C-g/Esc closes, Enter opens, arrows move)", .{
-            label,
-            shown,
-            view.visible.len,
-            view.query,
-        }) catch label;
-        _ = win.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = win.height -| 1 });
+        win.showCursor(label_w + query_w, prompt_row);
     } else {
-        const count = pickerRowCount(view.kind, buffers, bookmarks, recent);
-        const list_ml = std.fmt.bufPrint(modeline_buf, "{s} ({d}/{d})   (type to filter, C-s searches, Enter opens, arrows move, C-g/Esc closes)", .{
-            label,
-            sel_pos + 1,
-            count,
-        }) catch label;
-        _ = win.printSegment(.{ .text = list_ml, .style = .{} }, .{ .row_offset = win.height -| 1 });
+        const shown: usize = if (view.visible.len > 0) sel_pos + 1 else 0;
+        const ml = fillPromptModeline(modeline_buf, "{s} ({d}/{d})  ", .{ label, shown, view.visible.len }, view.query);
+        _ = win.printSegment(.{ .text = modeline_buf[0..ml.label_len], .style = .{ .bold = true } }, .{ .row_offset = prompt_row });
+        const label_w = win.gwidth(modeline_buf[0..ml.label_len]);
+        if (view.query.len > 0) {
+            if (ml.label_len < ml.len) {
+                _ = win.printSegment(.{ .text = modeline_buf[ml.label_len..ml.len], .style = .{} }, .{ .row_offset = prompt_row, .col_offset = label_w });
+            }
+            win.showCursor(label_w + win.gwidth(view.query), prompt_row);
+        } else {
+            // Idle hint where the filter would be; the cursor sits at
+            // its start, ready to type.
+            const hint = "type to filter, Enter opens, C-g closes";
+            _ = win.printSegment(.{ .text = hint, .style = dimStyle() }, .{ .row_offset = prompt_row, .col_offset = label_w });
+            win.showCursor(label_w, prompt_row);
+        }
     }
-    // No highlights: the block cursor marks the selection.
-    win.showCursor(0, if (text_height > 0) @intCast(sel_pos - view.top.*) else 0);
 }
 
 fn renderTree(
@@ -3982,7 +3996,10 @@ fn renderTree(
         // isearch operates on the focused buffer only: passing the match
         // to every pane would highlight the wrong window and could slice
         // past a shorter line in a neighbouring buffer.
-        const pane_search: ?IsearchView = if (pane == focused) search else null;
+        // The picker's isearch belongs to the picker overlay (rendered at
+        // the bottom of the display by the caller), not the buffer behind
+        // it, so the panes render with a null search while it's active.
+        const pane_search: ?IsearchView = if (pane == focused and picker == null) search else null;
         const pane_replace: ?ReplaceView = if (pane == focused) replace else null;
         const pane_prompt: ?DiredPromptView = if (pane == focused) dired_prompt else null;
         const pane_compress_menu: ?CompressMenuView = if (pane == focused) compress_menu else null;
@@ -3997,12 +4014,7 @@ fn renderTree(
         const pane_grep_hl: ?GrepHl = if (grep_hl) |gh| (if (buffers[pane.buf_idx] == gh.buf) gh else null) else null;
         const pane_status: ?[]const u8 = if (pane == focused) status else null;
         const child = win.child(.{ .x_off = x_off, .y_off = y_off, .width = width, .height = height });
-        if (pane == focused and picker != null) {
-            // The list picker renders inside the focused pane, leaving
-            // the split layout visible; a lone window shows it
-            // full-screen (the single pane covers the whole window).
-            renderPicker(child, io, picker.?, buffers, bookmarks, recent, &modeline_bufs[slot % MAX_PANES], pane_search);
-        } else if (direds[pane.buf_idx]) |*d| {
+        if (direds[pane.buf_idx]) |*d| {
             renderDiredPane(child, frame, buffers[pane.buf_idx], d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_compress_menu, pane_archive_query, pane_prompt, pane_status);
         } else {
             renderPane(child, frame, gpa, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_status);
@@ -9024,7 +9036,25 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][2048]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(body, &frame_allocs, gpa, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, io, picker_view, bookmarks.items, recent.items, pending_alt_o, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+            if (picker_view) |pv| {
+                // icomplete-vertical: the picker sits at the bottom of the
+                // display (the echo area), and the panes shrink up to
+                // make room — their modelines sit just above the picker,
+                // not buried under it.
+                const ph = pickerHeight(pv, body.height);
+                const panes_h = body.height -| ph;
+                if (panes_h >= 1) {
+                    const panes_win = body.child(.{ .x_off = 0, .y_off = 0, .width = body.width, .height = panes_h });
+                    renderTree(panes_win, &frame_allocs, gpa, root, 0, 0, panes_win.width, panes_h, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, io, picker_view, bookmarks.items, recent.items, pending_alt_o, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+                }
+                if (ph >= 1) {
+                    const picker_win = body.child(.{ .x_off = 0, .y_off = panes_h, .width = body.width, .height = ph });
+                    var picker_ml_buf: [2048]u8 = undefined;
+                    renderPicker(picker_win, io, pv, buffers.items, bookmarks.items, recent.items, &picker_ml_buf, search_view);
+                }
+            } else {
+                renderTree(body, &frame_allocs, gpa, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, io, picker_view, bookmarks.items, recent.items, pending_alt_o, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+            }
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;
@@ -9033,11 +9063,29 @@ pub fn main(init: std.process.Init) !void {
         if (picker_kind) |_| {
             // The picker (buffers / bookmarks / recent files): one row per
             // entry, Enter opens the selection. Typing filters the rows
-            // (see pickerFilter) — the block cursor marks the selection
-            // among the visible ones. A lone window shows it full-screen;
-            // a split keeps the layout visible (see renderTree).
-            var picker_ml_buf: [2048]u8 = undefined;
-            renderPicker(body, io, picker_view.?, buffers.items, bookmarks.items, recent.items, &picker_ml_buf, search_view);
+            // (see pickerFilter). icomplete-vertical: the picker sits at
+            // the bottom of the display, and the buffer/dired shrinks up
+            // to make room — its modeline sits just above the picker.
+            const pv = picker_view.?;
+            const ph = pickerHeight(pv, body.height);
+            const panes_h = body.height -| ph;
+            if (panes_h >= 1) {
+                const panes_win = body.child(.{ .x_off = 0, .y_off = 0, .width = body.width, .height = panes_h });
+                focused_text_height = if (panes_h > 1) panes_h - 1 else panes_h;
+                focused_text_width = body.width;
+                if (direds.items[current]) |*d| {
+                    var modeline_buf: [2048]u8 = undefined;
+                    renderDiredPane(panes_win, &frame_allocs, buf, d, true, 0, panes_h, &modeline_buf, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, null, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg);
+                } else {
+                    var modeline_buf: [2048]u8 = undefined;
+                    renderPane(panes_win, &frame_allocs, gpa, buf, true, 0, panes_h, &modeline_buf, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, null, replace_view, status_msg);
+                }
+            }
+            if (ph >= 1) {
+                const picker_win = body.child(.{ .x_off = 0, .y_off = panes_h, .width = body.width, .height = ph });
+                var picker_ml_buf: [2048]u8 = undefined;
+                renderPicker(picker_win, io, pv, buffers.items, bookmarks.items, recent.items, &picker_ml_buf, search_view);
+            }
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;

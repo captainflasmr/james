@@ -8,7 +8,3 @@
 This document contains the current bugs/improvements, this is just for me mainly but does include any Issues reported.
 
 * Bugs/Improvements
-
-** DOING carriage return at the end of dired
-
-** TODO icomplete like completion in vertical mode
