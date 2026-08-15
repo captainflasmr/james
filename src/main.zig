@@ -4053,20 +4053,18 @@ fn renderTree(
 /// The home screen shown when james starts without any file arguments.
 /// It's a plain buffer (so movement, search and every C-x command work on
 /// it) with no backing file; C-x d / C-x C-f lead somewhere real. The
-/// version line is inserted between `welcome_head` and `welcome_tail` at
-/// startup (see openWelcome), centered under the art so it's visible
-/// however short the terminal is.
+/// terminal caption is appended to the art's last line at startup (see
+/// openWelcome), so it reads as part of the banner.
 const welcome_head =
     \\      _   _    __  __ _____ ____
     \\     | | / \  |  \/  | ____/ ___|
     \\  _  | |/ _ \ | |\/| |  _| \___ \
     \\ | |_| / ___ \| |  | | |___ ___) |
     \\  \___/_/   \_\_|  |_|_____|____/
-    \\
 ;
 
-/// The greeting line under the version block: the one-line summary of
-/// what james is. Shares the caption block's three-space margin, so the
+/// The greeting line under the banner: the one-line summary of what
+/// james is. Shares the caption block's three-space margin, so the
 /// whole block under the art reads as one left-aligned column.
 const welcome_greeting =
     \\   Welcome to james, a minimal Emacs-inspired editor for the terminal.
@@ -4076,7 +4074,7 @@ const welcome_greeting =
 /// C-c, M-l) and by context (dired, pickers, prompts). Kept in sync with
 /// the dispatch in the event loop.
 const welcome_tail =
-    \\  No file was given, so this is the home screen. Get to work with:
+    \\  Get to work with:
     \\
     \\    C-x d / C-x m       browse files (dired)
     \\    C-x C-f             open or create a file
@@ -4244,11 +4242,11 @@ const welcome_tail =
 ;
 
 /// Add a fresh buffer containing the home screen to `buffers`. Used only
-/// at startup when no files were given. The greeting sits right under
-/// the art, then the caption — the terminal this instance is running in,
-/// and the version block (version, release date, and the last change,
-/// baked in at build time from CHANGELOG.org, see build.zig) with the
-/// build time and the change description below it.
+/// at startup when no files were given. The terminal caption (the
+/// terminal this instance is running in) is appended to the art's last
+/// line, then the greeting, then the version line (version, release
+/// date and build time, baked in at build time from CHANGELOG.org, see
+/// build.zig).
 fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer), environ_map: *std.process.Environ.Map) !void {
     const new_buf = try gpa.create(Buffer);
     errdefer gpa.destroy(new_buf);
@@ -4256,16 +4254,13 @@ fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer), environ
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
     try text.appendSlice(gpa, welcome_head);
-    // The greeting sits just under the banner; the terminal and version
-    // caption follow below it.
-    try text.appendSlice(gpa, welcome_greeting);
-    try text.appendSlice(gpa, "\n\n");
     // The terminal this instance is running in — TERM_PROGRAM where the
     // terminal sets it (alacritty, kitty, wezterm, vscode, ...), the
     // Windows consoles' own variables (Windows Terminal and ConEmu each
     // have one, and an interactive console session is SESSIONNAME
     // "Console"), the TERM value otherwise, so the console is easy to
-    // see and report.
+    // see and report. It rides on the art's last line, so it reads as
+    // part of the banner.
     var term_name: []const u8 = "an unknown terminal";
     if (environ_map.get("TERM_PROGRAM")) |tp| {
         term_name = tp;
@@ -4278,7 +4273,7 @@ fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer), environ
     } else if (std.mem.eql(u8, environ_map.get("SESSIONNAME") orelse "", "Console")) {
         term_name = "the Windows console";
     }
-    try text.appendSlice(gpa, "   running in ");
+    try text.appendSlice(gpa, "  running in ");
     try text.appendSlice(gpa, term_name);
     if (environ_map.get("TERM_PROGRAM_VERSION")) |v| {
         try text.appendSlice(gpa, " (");
@@ -4286,21 +4281,21 @@ fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer), environ
         try text.appendSlice(gpa, ")");
     }
     try text.appendSlice(gpa, "\n\n");
+    try text.appendSlice(gpa, welcome_greeting);
+    try text.appendSlice(gpa, "\n\n");
     if (build_options.version.len > 0) {
         // The version line shares the caption's three-space margin, so
         // the block lines up as one left-aligned column.
         try text.appendSlice(gpa, "   ");
         try text.appendSlice(gpa, build_options.version);
-        try text.appendSlice(gpa, " (");
-        try text.appendSlice(gpa, build_options.date);
-        if (build_options.built.len > 0) {
-            try text.appendSlice(gpa, " ");
-            try text.appendSlice(gpa, build_options.built);
-        }
-        try text.appendSlice(gpa, ")");
-        if (build_options.theme.len > 0) {
-            try text.appendSlice(gpa, "\n   ");
-            try text.appendSlice(gpa, build_options.theme);
+        if (build_options.date.len > 0) {
+            try text.appendSlice(gpa, " (");
+            try text.appendSlice(gpa, build_options.date);
+            if (build_options.built.len > 0) {
+                try text.appendSlice(gpa, " ");
+                try text.appendSlice(gpa, build_options.built);
+            }
+            try text.appendSlice(gpa, ")");
         }
         try text.appendSlice(gpa, "\n\n");
     }
