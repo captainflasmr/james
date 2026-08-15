@@ -10,6 +10,19 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.77.0 — <2026-08-14>
+
+=C-c j= / =C-c k= land focus on the right pane again — no more frozen cursor after flipping layouts.
+
+- Winner-mode's focused-pane index was recorded in post-order by =serializePane= (the counter ticked after recursing into the children) but looked up in pre-order by =paneAt= (check at entry, tick before recursing), so the two never agreed: after every =C-c j= / =C-c k= the focus landed on the wrong pane — often the root split itself, whose =buf_idx= defaults to 0. Buffer 0 is frequently a read-only buffer (the welcome screen, a dired), so the cursor wouldn't move, no cursor was drawn (no leaf matched the internal-node focus) and the editor looked frozen — most visible when flipping back and forth quickly, which cycled through snapshots until one landed on a read-only buffer. =serializePane= now assigns the index in pre-order, matching =paneAt= and the pre-order node list =deserializePane= already reads, so the recorded focused index and the lookup agree. The node-list layout is unchanged (it was always pre-order); only the index counter's tick moved from the end of the function to the start. The native and =x86_64-windows= cross builds compile.
+
+** 0.76.0 — <2026-08-14>
+
+=C-c j= / =C-c k= no longer go stale after a dired switch or an ibuffer kill, and a restore can no longer dangle the root.
+
+- Two buffer-switch paths were invisible to winner-mode history, so =C-c k= afterwards jumped to a stale layout: =C-x d= / =C-x m= (open a dired) and the =*Ibuffer*= =X= kill confirm now record the pre-change layout first, like every other switch-buffer path (=C-x b=, the pickers, =C-x C-f=), so =C-c j= steps back past them and the redo branch is abandoned. The ibuffer kill records once before the multi-kill (each =closeBuffer= inside it rebases the saved snapshots, but the pre-kill state must be on the undo stack to return to).
+- =restoreSnapshot= used to destroy the old pane tree before building the new one, so an allocation failure mid-build returned with the root pointing at freed memory — a use-after-free on the next frame. The new tree is now built first and the old one destroyed only once the new one exists, so a failed restore leaves the old tree intact. Restored buffer indices are also clamped to the live buffer list at the restore boundary (defense-in-depth: the kill-time rebase already covers the known shrink path, but the render path indexes =buffers[buf_idx]= unguarded, so a missed rebase or a future shrink path can no longer crash there). The native and =x86_64-windows= cross builds compile.
+
 ** 0.75.0 — <2026-08-14>
 
 Scroll-lock stays at 60 FPS on a hundred-thousand-line buffer.

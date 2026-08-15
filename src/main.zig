@@ -4501,7 +4501,19 @@ const WindowSnapshot = struct {
 };
 
 fn serializePane(gpa: std.mem.Allocator, pane: *Pane, focused: *Pane, out: *std.ArrayList(WinNode), idx: *usize, focused_idx: *usize) !void {
-    if (pane == focused) focused_idx.* = idx.*;
+    // Pre-order index of this pane — the same ordering paneAt uses to
+    // look the focused pane back up after a restore (check at entry,
+    // increment before recursing). The node list (`out`) is also built
+    // in pre-order (this pane appended before its children), which
+    // deserializePane reads back the same way, so the focused index, the
+    // node list and the lookup all agree. (Previously the increment was
+    // at the end — post-order — so the recorded focused index was off by
+    // the tree's shape and paneAt landed on the wrong pane, often the
+    // root internal node whose buf_idx defaults to 0: a read-only
+    // buffer there froze the cursor after C-c j / C-c k.)
+    const my_idx = idx.*;
+    idx.* += 1;
+    if (pane == focused) focused_idx.* = my_idx;
     if (pane.isLeaf()) {
         try out.append(gpa, .{ .is_leaf = true, .buf_idx = pane.buf_idx });
     } else {
@@ -4509,21 +4521,25 @@ fn serializePane(gpa: std.mem.Allocator, pane: *Pane, focused: *Pane, out: *std.
         try serializePane(gpa, pane.left.?, focused, out, idx, focused_idx);
         try serializePane(gpa, pane.right.?, focused, out, idx, focused_idx);
     }
-    idx.* += 1;
 }
 
-fn deserializePane(gpa: std.mem.Allocator, nodes: []const WinNode, idx: *usize) !*Pane {
+fn deserializePane(gpa: std.mem.Allocator, nodes: []const WinNode, idx: *usize, buf_len: usize) !*Pane {
     const n = nodes[idx.*];
     idx.* += 1;
     if (n.is_leaf) {
         const p = try gpa.create(Pane);
-        p.* = .{ .buf_idx = n.buf_idx };
+        // Clamp to the live buffer list: a snapshot can hold an index
+        // beyond the current end only via a missed rebase, but clamping
+        // here is cheap defense-in-depth at the restore boundary (the
+        // render path indexes buffers[buf_idx] unguarded). buf_len is
+        // always >= 1 (closeBuffer refuses to drop below one buffer).
+        p.* = .{ .buf_idx = @min(n.buf_idx, buf_len -| 1) };
         return p;
     }
     const p = try gpa.create(Pane);
     p.* = .{ .dir = n.dir, .left_frac = n.left_frac };
-    p.left = try deserializePane(gpa, nodes, idx);
-    p.right = try deserializePane(gpa, nodes, idx);
+    p.left = try deserializePane(gpa, nodes, idx, buf_len);
+    p.right = try deserializePane(gpa, nodes, idx, buf_len);
     return p;
 }
 
@@ -4574,17 +4590,30 @@ fn recordWindow(gpa: std.mem.Allocator, root: *Pane, focused: *Pane, current: us
 
 /// Rebuild the tree from `snap`, freeing the old one. Returns the buffer
 /// index the focused pane should show.
-fn restoreSnapshot(gpa: std.mem.Allocator, root: **Pane, focused: **Pane, snap_in: WindowSnapshot) ?usize {
+fn restoreSnapshot(gpa: std.mem.Allocator, root: **Pane, focused: **Pane, snap_in: WindowSnapshot, buf_len: usize) ?usize {
     var snap = snap_in;
-    const result = snap.current;
-    root.*.destroy(gpa);
+    // Clamp the focused buffer index to the live list, like each leaf's
+    // buf_idx is clamped in deserializePane.
+    const result = @min(snap.current, buf_len -| 1);
+    // Build the new tree BEFORE destroying the old one, so an allocation
+    // failure leaves the old tree intact instead of a dangling root (the
+    // previous order destroyed first, then built — an OOM mid-build
+    // returned null with root.* pointing at freed memory, a use-after-free
+    // on the next frame).
     var idx: usize = 0;
-    root.* = deserializePane(gpa, snap.nodes.items, &idx) catch blk: {
-        // Shouldn't happen; fall back to a single pane.
-        const p = gpa.create(Pane) catch return null;
+    const new_root = deserializePane(gpa, snap.nodes.items, &idx, buf_len) catch blk: {
+        // OOM mid-build: fall back to a single pane showing the focused
+        // buffer (clamped above). If even this allocation fails, leave the
+        // old tree intact and bail.
+        const p = gpa.create(Pane) catch {
+            snap.deinit(gpa);
+            return null;
+        };
         p.* = .{ .buf_idx = result };
         break :blk p;
     };
+    root.*.destroy(gpa);
+    root.* = new_root;
     idx = 0;
     const target = @min(snap.focused, snap.nodes.items.len -| 1);
     focused.* = paneAt(root.*, &idx, target) orelse root.*;
@@ -4593,25 +4622,25 @@ fn restoreSnapshot(gpa: std.mem.Allocator, root: **Pane, focused: **Pane, snap_i
 }
 
 /// C-c j: step back to the previous window layout.
-fn windowUndo(gpa: std.mem.Allocator, root: **Pane, focused: **Pane, current: usize, undo: *std.ArrayList(WindowSnapshot), redo: *std.ArrayList(WindowSnapshot)) ?usize {
+fn windowUndo(gpa: std.mem.Allocator, root: **Pane, focused: **Pane, current: usize, buf_len: usize, undo: *std.ArrayList(WindowSnapshot), redo: *std.ArrayList(WindowSnapshot)) ?usize {
     if (undo.items.len == 0) return null;
     var cur = snapshotWindow(gpa, root.*, focused.*, current) catch return null;
     redo.append(gpa, cur) catch {
         cur.deinit(gpa);
         return null;
     };
-    return restoreSnapshot(gpa, root, focused, undo.pop().?);
+    return restoreSnapshot(gpa, root, focused, undo.pop().?, buf_len);
 }
 
 /// C-c k: step forward to the next window layout.
-fn windowRedo(gpa: std.mem.Allocator, root: **Pane, focused: **Pane, current: usize, undo: *std.ArrayList(WindowSnapshot), redo: *std.ArrayList(WindowSnapshot)) ?usize {
+fn windowRedo(gpa: std.mem.Allocator, root: **Pane, focused: **Pane, current: usize, buf_len: usize, undo: *std.ArrayList(WindowSnapshot), redo: *std.ArrayList(WindowSnapshot)) ?usize {
     if (redo.items.len == 0) return null;
     var cur = snapshotWindow(gpa, root.*, focused.*, current) catch return null;
     undo.append(gpa, cur) catch {
         cur.deinit(gpa);
         return null;
     };
-    return restoreSnapshot(gpa, root, focused, redo.pop().?);
+    return restoreSnapshot(gpa, root, focused, redo.pop().?, buf_len);
 }
 
 /// Reload a dired's listing and re-mirror it into its buffer's lines
@@ -5944,11 +5973,11 @@ pub fn main(init: std.process.Init) !void {
                 if (repeat_map) |rm| {
                     if (rm == .window_history and (key.matches('j', .{}) or key.matches('k', .{}))) {
                         if (key.matches('j', .{})) {
-                            if (windowUndo(gpa, &root, &focused, current, &window_undo, &window_redo)) |_| {
+                            if (windowUndo(gpa, &root, &focused, current, buffers.items.len, &window_undo, &window_redo)) |_| {
                                 current = focused.buf_idx;
                             }
                         } else {
-                            if (windowRedo(gpa, &root, &focused, current, &window_undo, &window_redo)) |_| {
+                            if (windowRedo(gpa, &root, &focused, current, buffers.items.len, &window_undo, &window_redo)) |_| {
                                 current = focused.buf_idx;
                             }
                         }
@@ -6003,12 +6032,19 @@ pub fn main(init: std.process.Init) !void {
                 } else if (confirming_ibuffer_kill) {
                     if (key.matches('y', .{}) or key.matches('Y', .{})) {
                         // y: kill the marked buffers, the modified file
-                        // buffers without saving.
+                        // buffers without saving. Record the pre-kill
+                        // layout first so C-c j steps back past the whole
+                        // multi-kill (closeBuffer rebases saved snapshots,
+                        // but the pre-kill state must be on the undo
+                        // stack to return to).
                         confirming_ibuffer_kill = false;
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         current = ibufferKillMarked(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo, buf, 2, true, &ibuffer_buf_idx, &ibuffer_rows, ibuffer_sort, &ibuffer_gen, &status_msg, &status_buf);
                     } else if (key.matches('n', .{}) or key.matches('N', .{})) {
                         // n: keep the modified file buffers, kill the rest.
+                        // Recorded like the y path so the kill is undoable.
                         confirming_ibuffer_kill = false;
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         current = ibufferKillMarked(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo, buf, 2, false, &ibuffer_buf_idx, &ibuffer_rows, ibuffer_sort, &ibuffer_gen, &status_msg, &status_buf);
                     } else if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                         confirming_ibuffer_kill = false;
@@ -6128,7 +6164,7 @@ pub fn main(init: std.process.Init) !void {
                         // C-c j: step back through window layouts
                         // (winner-mode undo). Sticky: the plain j / k
                         // repeat (see RepeatMap).
-                        if (windowUndo(gpa, &root, &focused, current, &window_undo, &window_redo)) |_| {
+                        if (windowUndo(gpa, &root, &focused, current, buffers.items.len, &window_undo, &window_redo)) |_| {
                             // Keys act on the pane the cursor is drawn in —
                             // take its buffer rather than the snapshot's
                             // recorded index so the two never disagree.
@@ -6138,7 +6174,7 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('k', .{})) {
                         // C-c k: step forward through window layouts
                         // (winner-mode redo). Sticky like C-c j.
-                        if (windowRedo(gpa, &root, &focused, current, &window_undo, &window_redo)) |_| {
+                        if (windowRedo(gpa, &root, &focused, current, buffers.items.len, &window_undo, &window_redo)) |_| {
                             current = focused.buf_idx;
                         }
                         repeat_map = .window_history;
@@ -7105,7 +7141,11 @@ pub fn main(init: std.process.Init) !void {
                         pending_ctrl_x_r = true;
                     } else if (key.matches('d', .{}) or key.matches('m', .{})) {
                         // C-x d / C-x m: open (or switch to) a dired buffer
-                        // for the current file's directory.
+                        // for the current file's directory. Recorded like
+                        // every other buffer-switch-in-window (C-x b, the
+                        // pickers), so C-c j steps back past it and the
+                        // redo branch is abandoned.
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                         const start = try Dired.startingDir(gpa, buf.filename orelse ".");
                         defer gpa.free(start);
                         current = try openBufferOrDired(gpa, io, &buffers, &direds, &recent, start);
