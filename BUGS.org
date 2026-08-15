@@ -9,5 +9,6 @@ This document contains the current bugs/improvements, this is just for me mainly
 
 * Bugs/Improvements
 
-** TODO is it possible to theme change based on the current terminal?
+** DONE is it possible to theme change based on the current terminal?
+Yes — OSC 11 queries the terminal's background RGB at startup (and after a C-x j shell swap), and the Rec. 601 luminance sets the dark/light theme; the CSI 997n .color_scheme path remains the live-update fallback. See 0.74.0.
 

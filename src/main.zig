@@ -18,6 +18,22 @@ const IbufferSort = enum { name, order };
 /// they are acted on again.
 var buffer_list_gen: usize = 0;
 
+/// Whether the terminal's background scheme is dark (the default until
+/// the terminal reports otherwise): on a light background the terminal's
+/// dim style is a barely-visible gray-on-white, so the dim chrome —
+/// unfocused modelines, the line-number gutters, inactive tab labels —
+/// renders plain instead (see dimStyle). Follows the terminal's color
+/// scheme via the .color_scheme event.
+var theme_dark: bool = true;
+
+/// The "dim" style for unfocused chrome: the terminal's dim on a light
+/// background is unreadable gray-on-white, so it is switched off there —
+/// the reverse-video focused modeline and the bold current line still
+/// carry the visual hierarchy.
+fn dimStyle() vaxis.Style {
+    return if (theme_dark) .{ .dim = true } else .{};
+}
+
 /// Suppress vaxis's std.log output: stderr shares the terminal, so its
 /// startup chatter ("kitty keyboard capability", resize notices, ...)
 /// would otherwise be painted on top of the editor screen.
@@ -50,6 +66,22 @@ const Event = union(enum) {
     key_press: vaxis.Key,
     key_release: vaxis.Key,
     winsize: vaxis.Winsize,
+    /// The terminal lost focus (DECSET 1004 focus reporting, enabled at
+    /// startup): a key-up can be lost with it — Alt+Tab while holding
+    /// Alt drops the Alt key-up on Windows ConPTY — so the sticky
+    /// modifier and repeat states are cleared here.
+    focus_out,
+    /// The terminal's background scheme (CSI 997n, subscribed at
+    /// startup): dark or light, reported initially and on every theme
+    /// switch, so james can follow (see theme_dark / dimStyle).
+    color_scheme: vaxis.Color.Scheme,
+    /// The terminal's answer to an OSC 11 background-color query (sent at
+    /// startup and after a C-x j shell swap): the exact RGB of the
+    /// background, more precise than the .color_scheme dark/light boolean
+    /// — the luminance picks light vs dark so the dim chrome (dimStyle)
+    /// is only used where it reads. A terminal that doesn't answer OSC 11
+    /// never sends this; .color_scheme is the fallback and the live channel.
+    color_report: vaxis.Color.Report,
     /// The terminal's answer to an OSC 52 clipboard request; the text is
     /// allocated with gpa and must be freed by the handler.
     paste: []const u8,
@@ -231,6 +263,41 @@ fn wrapOffsets(line: []const u8, wrap: bool, width: usize, method: vaxis.gwidth.
 fn wrapCount(line: []const u8, wrap: bool, width: usize, method: vaxis.gwidth.Method) usize {
     var offsets: [1024]usize = undefined;
     return wrapOffsets(line, wrap, width, method, &offsets);
+}
+
+/// The cached prefix sum of per-line visual (wrapped) heights for `buf`:
+/// prefix[i] = total visual lines in lines[0..i] (so prefix.len ==
+/// lines.len + 1, prefix[0] = 0). Used by the scroll-lock viewport search
+/// so it is O(log n) instead of O(n log n) on large buffers. Rebuilt only
+/// when the lines, width, soft-wrap or gwidth method change — keyed by
+/// Buffer.lines_gen and the three cache-key fields (the method is stored
+/// as a @intFromEnum u8 tag so Buffer stays free of any vaxis dependency,
+/// the same discipline the rest of Buffer follows). Returns an empty slice
+/// if the cache can't be grown (the caller falls back to the walk).
+fn wrapPrefixSum(buf: *Buffer, gpa: std.mem.Allocator, width: usize, method: vaxis.gwidth.Method) []const usize {
+    const method_tag: u8 = @intCast(@intFromEnum(method));
+    if (buf.wrap_cache_gen == buf.lines_gen and
+        buf.wrap_cache_width == width and
+        buf.wrap_cache_soft_wrap == buf.soft_wrap and
+        buf.wrap_cache_method == method_tag and
+        buf.wrap_prefix.items.len == buf.lines.items.len + 1)
+    {
+        return buf.wrap_prefix.items;
+    }
+    const n = buf.lines.items.len;
+    buf.wrap_prefix.clearRetainingCapacity();
+    buf.wrap_prefix.ensureTotalCapacity(gpa, n + 1) catch return buf.wrap_prefix.items;
+    buf.wrap_prefix.appendAssumeCapacity(0);
+    var sum: usize = 0;
+    for (buf.lines.items) |line| {
+        sum += wrapCount(line.items, buf.soft_wrap, width, method);
+        buf.wrap_prefix.appendAssumeCapacity(sum);
+    }
+    buf.wrap_cache_width = width;
+    buf.wrap_cache_soft_wrap = buf.soft_wrap;
+    buf.wrap_cache_method = method_tag;
+    buf.wrap_cache_gen = buf.lines_gen;
+    return buf.wrap_prefix.items;
 }
 
 /// The display column of byte offset `col` within the visual segment of
@@ -527,30 +594,45 @@ fn visualRowOfCursor(buf: *const Buffer, top: usize, width: usize, method: vaxis
 /// lock on (C-x l) the cursor instead stays on its locked screen row — the
 /// text scrolls under it (Emacs scroll-lock-mode) — up to the ends of the
 /// buffer.
-fn scrollToCursorVisual(buf: *Buffer, height: usize, width: usize, method: vaxis.gwidth.Method) void {
+fn scrollToCursorVisual(buf: *Buffer, gpa: std.mem.Allocator, height: usize, width: usize, method: vaxis.gwidth.Method) void {
     if (height == 0) return;
     if (buf.scroll_lock) {
-        // The smallest top_line whose cursor visual row is still at or
-        // above the locked row, clamped to the last screenful so the
-        // window never runs past the end of the buffer. visualRowOfCursor
-        // falls as top_line rises, so the predicate is monotone and the
-        // binary search is exact.
         const max_top = buf.lines.items.len -| height;
+        // Fast path: a cached prefix sum of per-line visual (wrapped)
+        // heights turns each binary-search step from an O(n) walk into an
+        // O(1) lookup — O(log n) per frame instead of O(n log n) on large
+        // buffers. The cursor's visual segment within its line is constant
+        // across the search (it depends only on cursor_row), so it is
+        // computed once. Falls back to the walk below if the cache can't
+        // be built (alloc failure).
+        const prefix = wrapPrefixSum(buf, gpa, width, method);
+        if (prefix.len == buf.lines.items.len + 1) {
+            const crow = buf.cursor_row;
+            const cseg = cursorVisual(buf, width, method).seg;
+            // visualRowOfCursor(buf, top) = prefix[crow] - prefix[top] + cseg
+            // when top <= crow, else cseg (the cursor is above the viewport).
+            var lo: usize = 0;
+            var hi = max_top;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const vrow = if (mid <= crow) prefix[crow] - prefix[mid] + cseg else cseg;
+                if (vrow <= buf.scroll_row) hi = mid else lo = mid + 1;
+            }
+            buf.top_line = lo;
+            const final_vrow = if (buf.top_line <= crow) prefix[crow] - prefix[buf.top_line] + cseg else cseg;
+            if (final_vrow >= height) {
+                buf.top_line = @min(buf.cursor_row -| (height - 1), max_top);
+            }
+            return;
+        }
+        // Fallback (cache unavailable): the original O(n log n) search.
         var lo: usize = 0;
         var hi = max_top;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (visualRowOfCursor(buf, mid, width, method) <= buf.scroll_row) {
-                hi = mid;
-            } else {
-                lo = mid + 1;
-            }
+            if (visualRowOfCursor(buf, mid, width, method) <= buf.scroll_row) hi = mid else lo = mid + 1;
         }
         buf.top_line = lo;
-        // At the ends of the buffer (or on a line wrapped taller than the
-        // window) the locked row is unreachable and the search leaves the
-        // cursor where the text can go; if that is off the bottom of the
-        // window, bring it back like a plain scroll.
         if (visualRowOfCursor(buf, buf.top_line, width, method) >= height) {
             buf.top_line = @min(buf.cursor_row -| (height - 1), max_top);
         }
@@ -849,7 +931,7 @@ fn printModeline(win: vaxis.Window, buf: []u8, ml: PromptModeline, style: vaxis.
 /// may be the whole screen or one pane of a split. An active isearch shows
 /// its match highlight and prompt in this pane, exactly as if the pane were
 /// the whole screen.
-fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, grep_view: ?GrepView, files_view: ?FilesView, occur_view: ?GrepView, grep_hl: ?GrepHl, search: ?IsearchView, replace: ?ReplaceView, status: ?[]const u8) void {
+fn renderPane(win: vaxis.Window, frame: *FrameAllocs, gpa: std.mem.Allocator, buf: *Buffer, is_focused: bool, row_base: u16, height: u16, modeline_buf: []u8, find_file: ?FindFileView, bookmark_prompt: ?BookmarkPromptView, goto_prompt: ?GotoPromptView, grep_prompt: ?GrepPromptView, grep_view: ?GrepView, files_view: ?FilesView, occur_view: ?GrepView, grep_hl: ?GrepHl, search: ?IsearchView, replace: ?ReplaceView, status: ?[]const u8) void {
     const text_height: usize = if (height > 1) height - 1 else height;
     // C-z n: the line-number gutter (Emacs display-line-numbers-mode) —
     // one column per digit of the largest line number, plus a space, so
@@ -864,7 +946,7 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
     else
         win;
     const method = win.screen.width_method;
-    scrollToCursorVisual(buf, text_height, text_win.width, method);
+    scrollToCursorVisual(buf, gpa, text_height, text_win.width, method);
     scrollToCursorHorizontal(buf, text_win.width, method);
 
     const searching = search != null;
@@ -885,7 +967,7 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
                 frame.gpa.free(n);
                 continue;
             };
-            _ = win.printSegment(.{ .text = n, .style = .{ .dim = true } }, .{ .row_offset = row_base + row, .col_offset = @intCast(line_num_width - 1 - n.len) });
+            _ = win.printSegment(.{ .text = n, .style = dimStyle() }, .{ .row_offset = row_base + row, .col_offset = @intCast(line_num_width - 1 - n.len) });
         }
         const raw = buf.lines.items[i].items;
         // Tabs render as spaces up to the next tab stop — vaxis drops a
@@ -1092,7 +1174,7 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, is_focused: 
     // alive until after render — vaxis stores grapheme slices, not copies,
     // so a stack-local fill buffer would dangle and show garbage once this
     // frame returns.
-    const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true };
+    const style: vaxis.Style = if (is_focused) highlight_style else dimStyle();
     printModeline(win, modeline_buf, ml, style, row_base + (height -| 1));
 
     if (is_focused) {
@@ -1251,7 +1333,7 @@ fn renderTabBar(win: vaxis.Window, labels: *[MAX_TABS][16]u8, tabs_len: usize, a
     var i: usize = 0;
     while (i < shown) : (i += 1) {
         const label = std.fmt.bufPrint(&labels[i], "[ {d} ]", .{i + 1}) catch break;
-        const style: vaxis.Style = if (i == active) highlight_style else .{ .dim = true };
+        const style: vaxis.Style = if (i == active) highlight_style else dimStyle();
         _ = win.printSegment(.{ .text = label, .style = style }, .{ .row_offset = 0, .col_offset = col });
         col += win.gwidth(label) + 1;
     }
@@ -1673,6 +1755,16 @@ fn procWorker(io: std.Io, gpa: std.mem.Allocator, loop: *vaxis.Loop(Event), run:
         _ = loop.tryPostEvent(.{ .proc_done = run }) catch {};
         return;
     }
+    // The main loop's cancel path kills by this id, so it must be
+    // published before the first (potentially blocking) read below. The
+    // id is a pid on POSIX and a process handle on Windows.
+    if (child.?.id) |id| {
+        if (comptime builtin.os.tag == .windows) {
+            run.child_id.store(@intFromPtr(id), .release);
+        } else {
+            run.child_id.store(@intCast(id), .release);
+        }
+    }
     var lines: usize = 0;
     var last_posted: usize = 0;
     var last_post_at: i128 = std.Io.Clock.now(.real, io).nanoseconds;
@@ -1710,7 +1802,33 @@ fn procWorker(io: std.Io, gpa: std.mem.Allocator, loop: *vaxis.Loop(Event), run:
         run.state.store(state, .release);
         procLog(io, gpa, run, true, term, state);
     }
+    // The child is gone (killed or reaped): the main loop must not kill
+    // a stale id, however briefly the run outlives it.
+    run.child_id.store(0, .release);
     _ = loop.tryPostEvent(.{ .proc_done = run }) catch {};
+}
+
+/// Cancel a background grep / find from the main loop: set the cancel
+/// flag AND kill the tool's child by its recorded id. The flag alone
+/// relies on the worker's next read, and a child that produces no output
+/// at all would leave the worker blocked in the read forever — the
+/// direct kill closes the pipe (the child dies, its stdout write end
+/// goes away) so the worker's read returns and it finalizes as
+/// cancelled. POSIX: SIGKILL (nothing can ignore it); Windows:
+/// NtTerminateProcess on the handle the spawn recorded. Killing an
+/// already-dead or reaped child is a harmless no-op, and the worker
+/// clears `child_id` once it is reaped.
+fn cancelProcRun(run: *ProcRun) void {
+    run.cancel.store(true, .release);
+    const id = run.child_id.load(.acquire);
+    if (id != 0) {
+        if (comptime builtin.os.tag == .windows) {
+            const handle: std.os.windows.HANDLE = @ptrFromInt(id);
+            _ = std.os.windows.ntdll.NtTerminateProcess(handle, @enumFromInt(1));
+        } else {
+            std.posix.kill(@intCast(id), std.posix.SIG.KILL) catch {};
+        }
+    }
 }
 
 /// Kick off a background grep / find: the worker thread runs the tool
@@ -1727,7 +1845,7 @@ fn startProc(
     proc_run: *?*ProcRun,
     proc_current: *std.atomic.Value(?*ProcRun),
 ) bool {
-    if (proc_run.*) |old| old.cancel.store(true, .release);
+    if (proc_run.*) |old| cancelProcRun(old);
     run.future = io.concurrent(procWorker, .{ io, gpa, loop, run }) catch return false;
     proc_run.* = run;
     proc_current.store(run, .release);
@@ -2169,6 +2287,17 @@ fn winFlushConsoleInput(tty: *vaxis.Tty) void {
     _ = FlushConsoleInputBuffer(tty.stdin);
 }
 
+/// Enable (on) or disable (off) terminal focus reporting (DECSET 1004):
+/// the terminal then sends CSI I / CSI O on focus gain / loss, which
+/// vaxis delivers as .focus_out events (see Event). Plain CSI sequences
+/// pass through Windows Terminal's ConPTY like any other, so the
+/// sticky-alt fix works there too. Enabled whenever the editor owns the
+/// terminal (startup, after a shell), disabled while a shell does —
+/// focus reports would otherwise leak into the shell as stray input.
+fn setFocusReporting(tty: *vaxis.Tty, on: bool) void {
+    tty.writer().writeAll(if (on) "\x1b[?1004h" else "\x1b[?1004l") catch {};
+}
+
 /// C-x j: hand the terminal to a real shell. Returns the pid of a shell
 /// suspended with C-z (to resume on the next C-x j), or null when the
 /// shell exited or none could be started. The shell starts in
@@ -2202,6 +2331,7 @@ fn enterShell(
     // Give the shell a pristine terminal: show the cursor, reset SGR and
     // mouse/bracketed-paste modes, leave the alternate screen, and
     // restore the original cooked termios (job control, echo, ...).
+    setFocusReporting(tty, false);
     vx.resetState(tty.writer()) catch {};
     std.posix.tcsetattr(tty.fd.handle, .FLUSH, tty.termios) catch {};
 
@@ -2267,6 +2397,7 @@ fn enterShellWindows(
 
     // Reset the editor's terminal state and hand the console back to the
     // user's normal mode and codepage, so cmd.exe behaves as usual.
+    setFocusReporting(tty, false);
     vx.resetState(tty.writer()) catch {};
     vaxis.Tty.setConsoleMode(tty.stdin, tty.initial_input_mode) catch {};
     vaxis.Tty.setConsoleMode(tty.stdout, tty.initial_output_mode) catch {};
@@ -2305,6 +2436,9 @@ fn restoreEditorWindows(gpa: std.mem.Allocator, vx: *vaxis.Vaxis, tty: *vaxis.Tt
     vaxis.Tty.setConsoleMode(tty.stdout, vaxis.Tty.output_raw_mode) catch {};
     if (vaxis.Tty.SetConsoleOutputCP(65001) == .FALSE) {}
     try vx.enterAltScreen(tty.writer());
+    setFocusReporting(tty, true);
+    vx.subscribeToColorSchemeUpdates(tty.writer()) catch {};
+    vx.queryColor(tty.writer(), .bg) catch {};
     if (tty.getWinsize() catch null) |ws| {
         if (ws.cols > 0 and ws.rows > 0) {
             vx.resize(gpa, tty.writer(), ws) catch {};
@@ -2316,6 +2450,9 @@ fn restoreEditor(gpa: std.mem.Allocator, vx: *vaxis.Vaxis, tty: *vaxis.Tty) !voi
     if (comptime builtin.os.tag == .windows) return;
     _ = vaxis.Tty.makeRaw(tty.fd.handle) catch {};
     try vx.enterAltScreen(tty.writer());
+    setFocusReporting(tty, true);
+    vx.subscribeToColorSchemeUpdates(tty.writer()) catch {};
+    vx.queryColor(tty.writer(), .bg) catch {};
     if (tty.getWinsize() catch null) |ws| {
         if (ws.cols > 0 and ws.rows > 0) {
             vx.resize(gpa, tty.writer(), ws) catch {};
@@ -3049,8 +3186,15 @@ const ProcRun = struct {
     state: std.atomic.Value(ProcState) = .init(.running),
     /// Set by the main loop to cancel; the worker sees it at its next
     /// read and kills the child (a silent child is noticed at its next
-    /// output or exit).
+    /// output or exit — or, when it produces none at all, the main loop
+    /// kills it directly via `child_id`, see cancelProcRun).
     cancel: std.atomic.Value(bool) = .init(false),
+    /// The child's id (the pid on POSIX, the process handle on Windows),
+    /// recorded by the worker right after spawn so the main loop can kill
+    /// the tool directly on C-g — a worker blocked reading from a silent
+    /// child would otherwise never see the cancel flag. Zero once the
+    /// child is reaped.
+    child_id: std.atomic.Value(usize) = .init(0),
     /// The worker thread, joined when the .proc_done event lands.
     future: ?std.Io.Future(void) = null,
     /// When the run started, for the modeline's elapsed time.
@@ -3328,7 +3472,7 @@ fn renderDiredPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, dired: 
                 frame.gpa.free(n);
                 continue;
             };
-            _ = win.printSegment(.{ .text = n, .style = .{ .dim = true } }, .{ .row_offset = row_base + row, .col_offset = @intCast(line_num_width - 1 - n.len) });
+            _ = win.printSegment(.{ .text = n, .style = dimStyle() }, .{ .row_offset = row_base + row, .col_offset = @intCast(line_num_width - 1 - n.len) });
         }
         // Column 0 of the entries is the mark column, like Emacs: "*" for
         // a marked entry, a blank otherwise.
@@ -3432,7 +3576,7 @@ fn renderDiredPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, dired: 
         const n = std.fmt.bufPrint(modeline_buf, "Dired: {s}{s}{s}", .{ dired.display_path.items, if (dired.hide_details) " (Hide-Details)" else "", if (buf.show_line_numbers) " [linum]" else "" }) catch break :blk .{ .len = 0, .label_len = 0 };
         break :blk .{ .len = n.len, .label_len = 0 };
     };
-    const style: vaxis.Style = if (is_focused) highlight_style else .{ .dim = true };
+    const style: vaxis.Style = if (is_focused) highlight_style else dimStyle();
     printModeline(win, modeline_buf, ml, style, row_base + (height -| 1));
 
     if (is_focused) {
@@ -3557,7 +3701,7 @@ fn renderPicker(
             _ = win.printSegment(.{ .text = name, .style = .{} }, .{ .row_offset = list_row });
         }
         if (dir) |d| {
-            _ = win.printSegment(.{ .text = d, .style = .{ .dim = true } }, .{ .row_offset = list_row, .col_offset = win.gwidth(name) + 2 });
+            _ = win.printSegment(.{ .text = d, .style = dimStyle() }, .{ .row_offset = list_row, .col_offset = win.gwidth(name) + 2 });
         }
         list_row += 1;
     }
@@ -3605,6 +3749,7 @@ fn renderPicker(
 fn renderTree(
     win: vaxis.Window,
     frame: *FrameAllocs,
+    gpa: std.mem.Allocator,
     pane: *Pane,
     x_off: i17,
     y_off: u16,
@@ -3676,7 +3821,7 @@ fn renderTree(
         } else if (direds[pane.buf_idx]) |*d| {
             renderDiredPane(child, frame, buffers[pane.buf_idx], d, pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_compress_menu, pane_archive_query, pane_prompt, pane_status);
         } else {
-            renderPane(child, frame, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_status);
+            renderPane(child, frame, gpa, buffers[pane.buf_idx], pane == focused, 0, height, &modeline_bufs[slot % MAX_PANES], pane_find_file, pane_bookmark_prompt, pane_goto_prompt, pane_grep_prompt, pane_grep_view, pane_files_view, pane_occur_view, pane_grep_hl, pane_search, pane_replace, pane_status);
         }
         // The M-o quick-jump label in the pane's top-left corner, on top
         // of the pane's own content (the slots count leaves in render
@@ -3694,8 +3839,8 @@ fn renderTree(
             const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
             // The one blank column between the panes gets the separator.
             drawVLine(win, @intCast(x_off + @as(i17, @intCast(left_w))), y_off, height);
-            renderTree(win, frame, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, quick_jump, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, quick_jump, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, gpa, pane.left.?, x_off, y_off, left_w, height, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, quick_jump, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, gpa, pane.right.?, right_x, y_off, right_w, height, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, quick_jump, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
         },
         .horizontal => {
             const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
@@ -3703,8 +3848,8 @@ fn renderTree(
             // a blank row between the panes for the separator (mirroring
             // the one blank column of a vertical split).
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
-            renderTree(win, frame, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, quick_jump, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
-            renderTree(win, frame, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, quick_jump, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, gpa, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, quick_jump, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+            renderTree(win, frame, gpa, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, quick_jump, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
         },
     }
 }
@@ -3877,7 +4022,7 @@ const welcome_tail =
     \\    n / p               next / previous buffer (arrows too)
     \\    Enter               open the buffer
     \\    m / u / U / t       mark / unmark rows
-    \\    X                   kill the marked buffers
+    \\    X                   kill the marked buffers (modified ones ask)
     \\    s                   toggle the sort (name / list order)
     \\    g                   re-read the listing
     \\    q / C-g             close the ibuffer
@@ -4699,6 +4844,74 @@ fn ibufferSetMark(buf: *Buffer, row: usize, on: bool) void {
     if (line.len > 1) line[1] = if (on) '*' else ' ';
 }
 
+/// X in the *Ibuffer*: kill the marked buffers (Emacs
+/// ibuffer-do-kill-on-deletion-marks). The kills run largest index first
+/// so earlier indices don't shift underfoot; the *Ibuffer*'s own index
+/// shifts with them, so it is re-found and re-focused, and the listing
+/// is rebuilt. `include_dirty` is the y / n of the modified-file
+/// confirmation: true kills a modified file buffer without saving, false
+/// keeps it (reporting "Modified buffers kept"). Returns the new current
+/// buffer index.
+fn ibufferKillMarked(
+    gpa: std.mem.Allocator,
+    buffers: *std.ArrayList(*Buffer),
+    direds: *std.ArrayList(?Dired),
+    root: *Pane,
+    focused: *Pane,
+    current: usize,
+    window_undo: *std.ArrayList(WindowSnapshot),
+    window_redo: *std.ArrayList(WindowSnapshot),
+    buf: *Buffer,
+    first_row: usize,
+    include_dirty: bool,
+    ibuffer_buf_idx: *?usize,
+    ibuffer_rows: *std.ArrayList(usize),
+    ibuffer_sort: IbufferSort,
+    ibuffer_gen: *usize,
+    status_msg: *?[]const u8,
+    status_buf: []u8,
+) usize {
+    var kill_list: std.ArrayList(usize) = .empty;
+    defer kill_list.deinit(gpa);
+    var kept_dirty = false;
+    for (ibuffer_rows.items, 0..) |bi, r| {
+        const line: []u8 = buf.lines.items[r + first_row].items;
+        if (line.len > 1 and line[1] == '*') {
+            if (buffers.items[bi].dirty and buffers.items[bi].filename != null and !include_dirty) {
+                kept_dirty = true;
+            } else {
+                kill_list.append(gpa, bi) catch {};
+            }
+        }
+    }
+    std.mem.sort(usize, kill_list.items, {}, std.sort.desc(usize));
+    var next = current;
+    for (kill_list.items) |k| {
+        next = closeBuffer(gpa, buffers, direds, root, focused, k, window_undo, window_redo);
+    }
+    if (kill_list.items.len > 0) {
+        // The kills shift every later index — find the *Ibuffer* again
+        // and re-focus it.
+        for (buffers.items, 0..) |b, i| {
+            if (std.mem.eql(u8, b.display_name orelse "", "*Ibuffer*")) {
+                ibuffer_buf_idx.* = i;
+                next = i;
+                focused.buf_idx = i;
+                break;
+            }
+        }
+        ibufferRebuild(gpa, buffers.items, direds.items, ibuffer_buf_idx.*.?, ibuffer_rows, ibuffer_sort, null);
+        ibuffer_gen.* = buffer_list_gen;
+    }
+    // Reported even when nothing was killed (only modified buffers were
+    // marked), so the n answer never goes silently unacknowledged.
+    if (kept_dirty) {
+        const n = std.fmt.bufPrint(status_buf, "Modified buffers kept", .{}) catch unreachable;
+        status_msg.* = status_buf[0..n.len];
+    }
+    return next;
+}
+
 /// A named (file, position) pair, like an Emacs bookmark. Persisted to
 /// ~/.james-bookmarks as "name<TAB>path<TAB>row<TAB>col" lines.
 const Bookmark = struct {
@@ -5119,6 +5332,9 @@ pub fn main(init: std.process.Init) !void {
 
     var vx = try vaxis.init(io, gpa, init.environ_map, .{ .system_clipboard_allocator = gpa });
     defer vx.deinit(null, tty.writer());
+    // Leave the terminal as it was found: focus reporting off again (the
+    // defers run in reverse order, so this lands before vx.deinit).
+    defer setFocusReporting(&tty, false);
 
     var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);
     try loop.start();
@@ -5134,7 +5350,20 @@ pub fn main(init: std.process.Init) !void {
     // blocking await is correct there.
 
     try vx.enterAltScreen(tty.writer());
+    setFocusReporting(&tty, true);
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
+    // Follow the terminal's background scheme (dark / light): the
+    // subscription reports the current scheme and every change, as
+    // .color_scheme events (theme_dark / dimStyle). Subscribed
+    // unconditionally — the queried-capability answer may still be
+    // sitting in the event queue here, and a terminal that doesn't
+    // support it simply ignores the request.
+    vx.subscribeToColorSchemeUpdates(tty.writer()) catch {};
+    // The OSC 11 query asks for the terminal's exact background RGB; the
+    // reply arrives as a .color_report event. Safe to send
+    // unconditionally — a terminal that doesn't answer simply never
+    // replies, and the .color_scheme subscription is the fallback.
+    vx.queryColor(tty.writer(), .bg) catch {};
 
     // Size the screen from the kernel's ioctl right away, before the event
     // loop drains the queue: the first winsize event may carry a stale
@@ -5410,6 +5639,10 @@ pub fn main(init: std.process.Init) !void {
     var dired_copy_query: std.ArrayList(u8) = .empty;
     defer dired_copy_query.deinit(gpa);
     var confirming_delete = false;
+    // X in the *Ibuffer* when marked file buffers have unsaved changes:
+    // the y / n confirmation — y kills them without saving, n keeps them,
+    // C-g cancels (like C-x k's own prompt).
+    var confirming_ibuffer_kill = false;
 
     // z in dired: compress / decompress the marked entries (Emacs
     // dired-compress-file, the author's my/dired-compress-transient
@@ -5523,11 +5756,50 @@ pub fn main(init: std.process.Init) !void {
                     last_winsize = real;
                 }
             },
+            .focus_out => {
+                // A focus change can swallow a key-up: Alt+Tab while
+                // holding Alt leaves Windows ConPTY without the Alt
+                // key-up, which would otherwise stick the sticky-alt
+                // state on forever (every key typed as M-<key>). An
+                // armed repeat map has the same shape — a lost key leaves
+                // n / p / j / k jumping windows — so both are cleared
+                // here.
+                windows_pending_alt = false;
+                repeat_map = null;
+            },
+            .color_scheme => |scheme| {
+                // The terminal's background scheme (CSI 997n,
+                // subscribed at startup): live updates follow the
+                // terminal's own theme switch, like Emacs's frame
+                // following a light theme. On a light background the
+                // dim chrome renders plain instead (see dimStyle).
+                theme_dark = scheme == .dark;
+            },
+            .color_report => |report| {
+                // The terminal's answer to the OSC 11 background-color
+                // query (sent at startup and after a C-x j shell swap):
+                // the exact RGB, more precise than the .color_scheme
+                // dark/light boolean. The Rec. 601 luminance picks light
+                // vs dark so the dim chrome (dimStyle) is only used where
+                // it reads. A terminal that doesn't answer OSC 11 never
+                // sends this; the .color_scheme handler above is the
+                // fallback and the live-update channel.
+                switch (report.kind) {
+                    .bg => {
+                        const v = report.value;
+                        // 0.299R + 0.587G + 0.114B, scaled by 1000 to stay
+                        // in integers; the midpoint (128000) separates a
+                        // light background from a dark one.
+                        const lum: u32 = @as(u32, v[0]) * 299 + @as(u32, v[1]) * 587 + @as(u32, v[2]) * 114;
+                        theme_dark = lum < 128_000;
+                    },
+                    else => {},
+                }
+            },
             .paste => |text| {
                 defer gpa.free(text);
                 // The terminal answered an OSC 52 clipboard request (C-y
-                // with an empty kill ring): insert the text at the cursor
-                // as a normal edit. Dired buffers are read-only.
+                // with an empty kill ring): insert the text at the cursor                // as a normal edit. Dired buffers are read-only.
                 const b: *Buffer = buffers.items[current];
                 if (direds.items[current] == null) {
                     b.insertSlice(gpa, text) catch {};
@@ -5631,12 +5903,13 @@ pub fn main(init: std.process.Init) !void {
                 } else if (key.isModifier()) {
                     continue;
                 }
-                // C-g cancels a background grep / find: the worker sees
-                // the flag at its next read and kills the child, then the
-                // .proc_done event lands the run's final state.
+                // C-g cancels a background grep / find: the flag stops the
+                // worker at its next read, and the direct kill handles a
+                // child that produces no output at all (the worker would
+                // otherwise stay blocked in the read forever).
                 if (proc_run) |run| {
                     if (key.matches('g', .{ .ctrl = true })) {
-                        run.cancel.store(true, .release);
+                        cancelProcRun(run);
                         break :key_blk;
                     }
                 }
@@ -5727,6 +6000,21 @@ pub fn main(init: std.process.Init) !void {
                     }
                     // Any other key is ignored — stay in the prompt rather
                     // than risk a stray keystroke killing the wrong buffer.
+                } else if (confirming_ibuffer_kill) {
+                    if (key.matches('y', .{}) or key.matches('Y', .{})) {
+                        // y: kill the marked buffers, the modified file
+                        // buffers without saving.
+                        confirming_ibuffer_kill = false;
+                        current = ibufferKillMarked(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo, buf, 2, true, &ibuffer_buf_idx, &ibuffer_rows, ibuffer_sort, &ibuffer_gen, &status_msg, &status_buf);
+                    } else if (key.matches('n', .{}) or key.matches('N', .{})) {
+                        // n: keep the modified file buffers, kill the rest.
+                        confirming_ibuffer_kill = false;
+                        current = ibufferKillMarked(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo, buf, 2, false, &ibuffer_buf_idx, &ibuffer_rows, ibuffer_sort, &ibuffer_gen, &status_msg, &status_buf);
+                    } else if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        confirming_ibuffer_kill = false;
+                    }
+                    // Any other key is ignored — stay in the prompt rather
+                    // than risk killing the wrong buffers.
                 } else if (pending_ctrl_c) {
                     pending_ctrl_c = false;
                     if (key.matches('b', .{})) {
@@ -7452,42 +7740,22 @@ pub fn main(init: std.process.Init) !void {
                             break :key_blk;
                         } else if (key.matches('X', .{})) {
                             // X: kill the marked buffers (Emacs
-                            // ibuffer-do-kill-on-deletion-marks). A
-                            // modified file buffer is kept, like C-x k
-                            // asking first. The kills run largest index
-                            // first so earlier indices don't shift
-                            // underfoot.
-                            var kill_list: std.ArrayList(usize) = .empty;
-                            defer kill_list.deinit(gpa);
-                            var kept_dirty = false;
+                            // ibuffer-do-kill-on-deletion-marks). Marked
+                            // file buffers with unsaved changes ask first,
+                            // like C-x k: y kills them without saving, n
+                            // keeps them, C-g cancels.
+                            var has_dirty = false;
                             for (ibuffer_rows.items, 0..) |bi, r| {
                                 const line: []u8 = buf.lines.items[r + first_row].items;
-                                if (line.len > 1 and line[1] == '*') {
-                                    if (buffers.items[bi].dirty and buffers.items[bi].filename != null) {
-                                        kept_dirty = true;
-                                    } else {
-                                        kill_list.append(gpa, bi) catch {};
-                                    }
+                                if (line.len > 1 and line[1] == '*' and buffers.items[bi].dirty and buffers.items[bi].filename != null) {
+                                    has_dirty = true;
+                                    break;
                                 }
                             }
-                            std.mem.sort(usize, kill_list.items, {}, std.sort.desc(usize));
-                            for (kill_list.items) |k| {
-                                _ = closeBuffer(gpa, &buffers, &direds, root, focused, k, &window_undo, &window_redo);
-                            }
-                            if (kill_list.items.len > 0) {
-                                // The kills shift every later index — find
-                                // the *Ibuffer* again and re-focus it.
-                                for (buffers.items, 0..) |b, i| {
-                                    if (std.mem.eql(u8, b.display_name orelse "", "*Ibuffer*")) {
-                                        ibuffer_buf_idx = i;
-                                        current = i;
-                                        focused.buf_idx = i;
-                                        break;
-                                    }
-                                }
-                                ibufferRebuild(gpa, buffers.items, direds.items, ibuffer_buf_idx.?, &ibuffer_rows, ibuffer_sort, null);
-                                ibuffer_gen = buffer_list_gen;
-                                if (kept_dirty) status_msg = "Modified buffers kept";
+                            if (has_dirty) {
+                                confirming_ibuffer_kill = true;
+                            } else {
+                                current = ibufferKillMarked(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo, buf, first_row, true, &ibuffer_buf_idx, &ibuffer_rows, ibuffer_sort, &ibuffer_gen, &status_msg, &status_buf);
                             }
                             break :key_blk;
                         } else if (key.matches('<', .{ .alt = true })) {
@@ -8345,7 +8613,7 @@ pub fn main(init: std.process.Init) !void {
         // whichever pane they apply to, leaving the window layout
         // untouched. Only the prompt-style modes take over the whole
         // screen.
-        const is_modal = confirming_quit or confirming_kill;
+        const is_modal = confirming_quit or confirming_kill or confirming_ibuffer_kill;
 
         const search_view: ?IsearchView = if (isearch_active)
             .{ .failed = isearch_failed, .match = isearch_match, .query = isearch_query.items, .backward = isearch_dir == .backward, .count = isearch_count, .pos = isearch_pos }
@@ -8475,7 +8743,7 @@ pub fn main(init: std.process.Init) !void {
         if (!is_modal and !root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][2048]u8 = undefined;
             var slot_counter: usize = 0;
-            renderTree(body, &frame_allocs, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, io, picker_view, bookmarks.items, recent.items, pending_alt_o, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+            renderTree(body, &frame_allocs, gpa, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, io, picker_view, bookmarks.items, recent.items, pending_alt_o, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
             try vx.render(tty.writer());
             frame_allocs.reset();
             continue;
@@ -8518,7 +8786,7 @@ pub fn main(init: std.process.Init) !void {
             body.child(.{ .x_off = @intCast(line_num_width), .width = body.width - @as(u16, @intCast(line_num_width)) })
         else
             body;
-        scrollToCursorVisual(buf, text_height, text_win.width, vx.screen.width_method);
+        scrollToCursorVisual(buf, gpa, text_height, text_win.width, vx.screen.width_method);
         scrollToCursorHorizontal(buf, text_win.width, vx.screen.width_method);
         var row: u16 = 0;
         var i = buf.top_line;
@@ -8533,7 +8801,7 @@ pub fn main(init: std.process.Init) !void {
                     frame_allocs.gpa.free(n);
                     continue;
                 };
-                _ = body.printSegment(.{ .text = n, .style = .{ .dim = true } }, .{ .row_offset = row, .col_offset = @intCast(line_num_width - 1 - n.len) });
+                _ = body.printSegment(.{ .text = n, .style = dimStyle() }, .{ .row_offset = row, .col_offset = @intCast(line_num_width - 1 - n.len) });
             }
             // Tabs render as spaces up to the next tab stop (see
             // renderPane); the whitespace markers (C-z e) render through
@@ -8612,7 +8880,16 @@ pub fn main(init: std.process.Init) !void {
             fillPromptModeline(&modeline_buf, "Save file {s} before exiting? (y / n / C-g cancels)", .{buf.filename orelse "?"}, "")
         else if (confirming_kill)
             fillPromptModeline(&modeline_buf, "Save file {s} before killing? (y / n / C-g cancels)", .{buf.filename orelse "?"}, "")
-        else if (status_msg) |m| blk: {
+        else if (confirming_ibuffer_kill) blk: {
+            // The number of marked file buffers with unsaved changes,
+            // for the prompt's count.
+            var n_dirty: usize = 0;
+            for (ibuffer_rows.items, 0..) |bi, r| {
+                const line: []u8 = buf.lines.items[r + 2].items;
+                if (line.len > 1 and line[1] == '*' and buffers.items[bi].dirty and buffers.items[bi].filename != null) n_dirty += 1;
+            }
+            break :blk fillPromptModeline(&modeline_buf, "Kill the marked buffers, {d} modified without saving? (y kills them, n keeps them, C-g cancels)", .{n_dirty}, "");
+        } else if (status_msg) |m| blk: {
             const n = std.fmt.bufPrint(&modeline_buf, "{s}", .{m}) catch break :blk .{ .len = 0, .label_len = 0 };
             break :blk .{ .len = n.len, .label_len = 0 };
         } else if (switching_buffer)

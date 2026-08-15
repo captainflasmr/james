@@ -12,6 +12,11 @@ top_line: usize = 0,
 /// lines never scroll horizontally, so this stays 0.
 hscroll: usize = 0,
 filename: ?[]const u8 = null,
+/// How the file's line endings are stored, detected when it is loaded:
+/// a CRLF (Windows / DOS) file keeps its \r\n line breaks on save, so
+/// editing one never silently converts the whole file to LF and dirties
+/// every line for git. New buffers default to LF.
+eol: EolMode = .lf,
 /// Name shown in the modeline for buffers with no real file (e.g. the
 /// home screen), since there's nothing to visit.
 display_name: ?[]const u8 = null,
@@ -47,10 +52,30 @@ undo_group: UndoKind = .none,
     scroll_lock: bool = false,
     /// The screen row the cursor is locked to while scroll_lock is on.
     scroll_row: usize = 0,
+    /// Generation counter bumped whenever the line array or any line's
+    /// contents change, so the wrap-height cache (main.zig) knows to
+    /// rebuild. Plain u64 — no vaxis dependency.
+    lines_gen: u64 = 0,
+    /// Cached prefix sum of per-line visual (wrapped) heights, so the
+    /// scroll-lock viewport search is O(log n) instead of O(n log n) on
+    /// large buffers. wrap_prefix[i] = total visual lines in lines[0..i];
+    /// wrap_prefix.len == lines.len + 1 (wrap_prefix[0] = 0). Rebuilt by
+    /// main.zig's wrapPrefixSum when lines_gen / width / soft_wrap / the
+    /// gwidth method tag change. Plain types only — the method is stored
+    /// as a u8 tag (@intFromEnum) so the data model stays free of any
+    /// vaxis dependency, the same discipline the rest of Buffer follows.
+    wrap_prefix: std.ArrayList(usize) = .empty,
+    wrap_cache_width: usize = 0,
+    wrap_cache_soft_wrap: bool = false,
+    wrap_cache_method: u8 = 0,
+    wrap_cache_gen: u64 = 0,
 
 pub const Pos = struct { row: usize, col: usize };
 pub const Region = struct { start: Pos, end: Pos };
 const UndoKind = enum { none, typing, newline, backspace, delete_fwd, kill, yank, replace };
+
+/// The file's line-ending style (see Buffer.eol).
+pub const EolMode = enum { lf, crlf };
 
 const Snapshot = struct {
     lines: std.ArrayList(std.ArrayList(u8)),
@@ -95,6 +120,7 @@ pub fn deinit(self: *Buffer, gpa: std.mem.Allocator) void {
     self.undo_stack.deinit(gpa);
     for (self.redo_stack.items) |*snap| snap.deinit(gpa);
     self.redo_stack.deinit(gpa);
+    self.wrap_prefix.deinit(gpa);
     if (self.filename) |f| gpa.free(f);
     if (self.display_name) |d| gpa.free(d);
 }
@@ -115,6 +141,10 @@ pub fn loadFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Buffer {
         else => return err,
     };
     defer gpa.free(contents);
+
+    // A file whose raw text contains \r\n is CRLF: save it back with
+    // \r\n line breaks (a lone \r elsewhere is left alone).
+    buf.eol = if (std.mem.indexOf(u8, contents, "\r\n") != null) .crlf else .lf;
 
     var it = std.mem.splitScalar(u8, contents, '\n');
     while (it.next()) |line_slice| {
@@ -145,18 +175,60 @@ pub fn reread(self: *Buffer, gpa: std.mem.Allocator, io: std.Io) !void {
     self.undo_stack.deinit(gpa);
     for (self.redo_stack.items) |*snap| snap.deinit(gpa);
     self.redo_stack.deinit(gpa);
+    self.wrap_prefix.deinit(gpa);
     self.* = fresh;
 }
 
 pub fn save(self: *Buffer, gpa: std.mem.Allocator, io: std.Io) !void {
-    const path = self.filename orelse return error.NoFilename;
+    var path = self.filename orelse return error.NoFilename;
+    // A symlinked file saves through the link: the temp-file rename below
+    // would otherwise replace the link itself with a plain file,
+    // silently breaking it.
+    var link_target: ?[]u8 = null;
+    defer if (link_target) |t| gpa.free(t);
+    {
+        var buf: [4096]u8 = undefined;
+        if (std.Io.Dir.cwd().readLink(io, path, &buf)) |n| {
+            link_target = try gpa.dupe(u8, buf[0..n]);
+            path = link_target.?;
+        } else |_| {}
+    }
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
+    // A CRLF file is written with its original \r\n breaks, so saving
+    // never silently rewrites a Windows / DOS file in LF (see eol).
+    const br = if (self.eol == .crlf) "\r\n" else "\n";
     for (self.lines.items, 0..) |line, i| {
         try out.appendSlice(gpa, line.items);
-        if (i != self.lines.items.len - 1) try out.append(gpa, '\n');
+        if (i != self.lines.items.len - 1) try out.appendSlice(gpa, br);
     }
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+    // Save atomically: the text goes to a temp file beside the target —
+    // the same filesystem, so the final rename replaces it atomically on
+    // both POSIX and Windows — and the temp is then renamed over the
+    // original. A crash or power cut mid-write can no longer truncate the
+    // real file: it is always either the old content or the new, never a
+    // torn write. The temp inherits the original's permissions (a 0755
+    // script must not come back 0644) and is synced, so a power cut after
+    // the rename cannot leave the target pointing at unsynced data.
+    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.james-tmp", .{path});
+    defer gpa.free(tmp_path);
+    const f = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+    errdefer {
+        f.close(io);
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    }
+    try f.writeStreamingAll(io, out.items);
+    if (std.Io.Dir.cwd().statFile(io, path, .{})) |st| {
+        f.setPermissions(io, st.permissions) catch {};
+    } else |_| {}
+    f.sync(io) catch {};
+    // The handle must be closed before the rename: on Windows an open
+    // handle would block replacing the target.
+    f.close(io);
+    std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, io) catch |err| {
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        return err;
+    };
     self.dirty = false;
 }
 
@@ -192,6 +264,12 @@ fn recordUndo(self: *Buffer, gpa: std.mem.Allocator, kind: UndoKind) !void {
     self.undo_group = kind;
 }
 
+/// Bump the generation counter — call on every lines mutation so the
+/// wrap-height cache (main.zig) rebuilds.
+fn bumpGen(self: *Buffer) void {
+    self.lines_gen +%= 1;
+}
+
 /// Clone the current state onto `stack` — the counterpart of an undo or
 /// redo step. Best effort: if the clone or the append fails, the step
 /// simply has no counterpart (undo still works; that step just isn't
@@ -221,6 +299,7 @@ pub fn undo(self: *Buffer, gpa: std.mem.Allocator) void {
     for (self.lines.items) |*line| line.deinit(gpa);
     self.lines.deinit(gpa);
     self.lines = snap.lines;
+    self.bumpGen();
     self.cursor_row = snap.cursor_row;
     self.cursor_col = snap.cursor_col;
     self.mark = snap.mark;
@@ -238,6 +317,7 @@ pub fn redo(self: *Buffer, gpa: std.mem.Allocator) void {
     for (self.lines.items) |*line| line.deinit(gpa);
     self.lines.deinit(gpa);
     self.lines = snap.lines;
+    self.bumpGen();
     self.cursor_row = snap.cursor_row;
     self.cursor_col = snap.cursor_col;
     self.mark = snap.mark;
@@ -246,6 +326,7 @@ pub fn redo(self: *Buffer, gpa: std.mem.Allocator) void {
 }
 
 fn insertSliceRaw(self: *Buffer, gpa: std.mem.Allocator, text: []const u8) !void {
+    self.bumpGen();
     try self.lines.items[self.cursor_row].insertSlice(gpa, self.cursor_col, text);
     self.cursor_col += text.len;
     self.dirty = true;
@@ -282,6 +363,7 @@ pub fn insertSlice(self: *Buffer, gpa: std.mem.Allocator, text: []const u8) !voi
 }
 
 fn insertNewlineRaw(self: *Buffer, gpa: std.mem.Allocator) !void {
+    self.bumpGen();
     const current = &self.lines.items[self.cursor_row];
     const rest = try gpa.dupe(u8, current.items[self.cursor_col..]);
     defer gpa.free(rest);
@@ -303,6 +385,7 @@ pub fn insertNewline(self: *Buffer, gpa: std.mem.Allocator) !void {
 
 pub fn deleteBackward(self: *Buffer, gpa: std.mem.Allocator) !void {
     if (self.cursor_col == 0 and self.cursor_row == 0) return;
+    self.bumpGen();
     try self.recordUndo(gpa, .backspace);
     if (self.cursor_col > 0) {
         _ = self.lines.items[self.cursor_row].orderedRemove(self.cursor_col - 1);
@@ -325,6 +408,7 @@ pub fn deleteForward(self: *Buffer, gpa: std.mem.Allocator) !void {
     const at_end_of_buffer = self.cursor_row + 1 >= self.lines.items.len and
         self.cursor_col >= self.lines.items[self.cursor_row].items.len;
     if (at_end_of_buffer) return;
+    self.bumpGen();
     try self.recordUndo(gpa, .delete_fwd);
     const line = &self.lines.items[self.cursor_row];
     if (self.cursor_col < line.items.len) {
@@ -391,6 +475,7 @@ pub fn undoBoundary(self: *Buffer) void {
 /// Every replacement of a session is one undo step (see undoBoundary).
 pub fn replaceAt(self: *Buffer, gpa: std.mem.Allocator, at: Pos, len: usize, with: []const u8) !Pos {
     try self.recordUndo(gpa, .replace);
+    self.bumpGen();
     self.cursor_row = at.row;
     self.cursor_col = at.col;
     const line = &self.lines.items[at.row];
@@ -434,6 +519,7 @@ fn extractRange(self: *Buffer, gpa: std.mem.Allocator, start: Pos, end: Pos) ![]
 
 /// Remove the text between start and end, merging what's left into one line.
 fn deleteRange(self: *Buffer, gpa: std.mem.Allocator, start: Pos, end: Pos) !void {
+    self.bumpGen();
     if (start.row == end.row) {
         try self.lines.items[start.row].replaceRange(gpa, start.col, end.col - start.col, &.{});
         return;
@@ -533,6 +619,7 @@ pub fn killLine(self: *Buffer, gpa: std.mem.Allocator, kill_ring: *KillRing, app
     const col = self.cursor_col;
     const nothing_to_kill = col >= self.lines.items[row].items.len and row + 1 >= self.lines.items.len;
     if (nothing_to_kill) return;
+    self.bumpGen();
     try self.recordUndo(gpa, .kill);
 
     if (col < self.lines.items[row].items.len) {
@@ -670,6 +757,7 @@ pub fn yankPop(self: *Buffer, gpa: std.mem.Allocator, text: []const u8, start: P
 /// comment marker guessed from the file's extension. Point doesn't move.
 pub fn toggleComment(self: *Buffer, gpa: std.mem.Allocator) !void {
     try self.recordUndo(gpa, .typing);
+    self.bumpGen();
     const row = self.cursor_row;
     const line = &self.lines.items[row];
     const prefix = self.commentPrefix();

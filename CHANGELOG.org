@@ -10,6 +10,49 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.75.0 — <2026-08-14>
+
+Scroll-lock stays at 60 FPS on a hundred-thousand-line buffer.
+
+- =C-x l='s scroll-lock mode used to binary-search the whole buffer for the top line that keeps the cursor on its locked row, re-wrapping every line on every step — an O(n log n) pass per frame that dropped well below 60 FPS on a large wrapped buffer. The viewport now caches a prefix sum of the per-line visual (wrapped) heights on the buffer, keyed by a generation counter (bumped on every edit), the pane width, the soft-wrap setting and the gwidth method, so the search is O(log n) per frame instead: a handful of array lookups, each O(1). The cache is rebuilt only when the lines, the width, the wrap setting or the method change (a one-time O(n) pass after an edit or a resize), and ordinary scrolling — holding =C-n= / =C-p= in scroll-lock — never touches it. The non-scroll-lock path is unchanged (it was already viewport-bounded), and a cache that can't be grown falls back to the original search, so nothing regresses. The cache fields are plain types on =Buffer= (the gwidth method stored as a =@intFromEnum= =u8= tag), so the data model stays free of any vaxis dependency, the same discipline the rest of =Buffer= follows. Verified: the native and =x86_64-windows= cross builds compile.
+
+** 0.74.0 — <2026-08-14>
+
+The theme follows the terminal's actual background color, queried by OSC 11.
+
+- james now asks the terminal for its exact background RGB at startup (and after a =C-x j= shell swap) with an OSC 11 query (=ESC]11;?ESC\\=), and sets the dark/light theme from the reply's luminance (Rec. 601: =0.299R + 0.587G + 0.114B=) — a more precise read than the =.color_scheme= dark/light boolean, so the dim chrome (=dimStyle=, the unfocused modelines, the line-number gutters, the inactive tab labels) is only used where it actually reads against the background. The query is safe to send unconditionally: a terminal that doesn't answer OSC 11 simply never replies, and the existing =.color_scheme= path (CSI 997n) remains the fallback for the initial read and the live-update channel when the terminal's own theme switches at runtime — both just set =theme_dark=. Verified end to end: a light terminal background turns the dim chrome plain, a dark one keeps it dim, and the =x86_64-windows= cross build still compiles.
+
+** 0.73.0 — <2026-08-14>
+
+The =*Ibuffer*='s =X= kill asks before discarding unsaved changes.
+
+- =X= in the =*Ibuffer*= (kill the marked buffers) now asks when any marked file buffer has unsaved changes, exactly like =C-x k=: the modeline shows =Kill the marked buffers, N modified without saving? (y kills them, n keeps them, C-g cancels)= — =y= kills everything marked including the modified files without saving, =n= kills the clean ones and keeps the modified (=Modified buffers kept= is reported even when nothing was killed), =C-g= / Esc cancels entirely, and any other key is ignored. A marked set with no modified buffers kills straight away as before. The kill itself (largest index first, the =*Ibuffer*= re-found and re-focused, the listing rebuilt) was extracted into one shared helper used by both the prompt's answers and the direct path.
+
+** 0.72.0 — <2026-08-14>
+
+Focus reporting: losing the terminal's focus can no longer stick the Windows Alt state (or an armed repeat map) on forever.
+
+- james enables DECSET 1004 focus reporting while it owns the terminal (startup and after a =C-x j= shell; disabled again for the shell and on exit). The terminal's CSI I / CSI O focus reports — plain sequences, so Windows Terminal's ConPTY passes them through like any other — arrive as a new =focus_out= event, and the handler clears the two sticky states a lost key-up would otherwise jam permanently: the Windows sticky-Alt flag (=windows_pending_alt=, which re-applies Alt to the next key until the Alt key-up arrives — an =Alt+Tab= while holding Alt drops that key-up, so every following key would be typed as =M-<key>= forever) and the armed repeat map (=C-x o= / =C-c j= stepping, which the same lost key-up would leave jumping windows). Verified end to end: after arming the =C-x o= repeat, a focus report clears it, and the next =n= types into the buffer instead of moving windows; both the native and the x86_64-windows cross builds compile and run.
+
+** 0.71.0 — <2026-08-14>
+
+Saves are atomic: the file is written to a temp beside it and renamed over, so a crash or power cut can never truncate it.
+
+- =C-x C-s= (and the quit-confirmation save) no longer writes the file in place: the text goes to a =<name>.james-tmp= file in the same directory first — the same filesystem, so the final rename replaces the target atomically on both POSIX and Windows — and the temp is then renamed over the original. A crash, power cut or killed terminal mid-write can no longer leave the real file truncated or half-written: it is always either the old content or the new. The temp keeps the original's permissions (a =0755= script stays executable after a save) and is fsynced before the rename, so a power cut after the rename can't leave the target pointing at unsynced data; a failed save cleans the temp up. Saving through a symlink resolves the link first and writes to its target, so the link survives the rename (renaming over the link itself would have replaced it with a plain file). New files, =LF= / =CRLF= round-trips and the =[modified]= flag behave exactly as before.
+
+** 0.70.0 — <2026-08-14>
+
+=C-g= cancels a background grep / find instantly, even while the tool is silent.
+
+- C-g (and starting a new search over an old one) now kills the running tool directly: the worker records the child's id (the pid on POSIX, the process handle on Windows) right after spawning it, and the main loop's cancel path kills it by that id — SIGKILL on POSIX, =NtTerminateProcess= on Windows. Before, cancel relied on the worker noticing the flag at its next read of the tool's output — a tool that produces no output at all (a quiet =rg= / =grep= still scanning, a =find= walking a slow tree) would leave the worker blocked in the read forever, so C-g did nothing until the tool happened to finish on its own. The direct kill closes the pipe (the tool dies, its stdout write end goes away), the worker's read returns, and the run finalizes as cancelled immediately — verified at ~10ms from the C-g keypress. The worker still kills the child itself on its own path, so nothing is double-killed; the id is cleared once the child is reaped.
+
+** 0.69.0 — <2026-08-14>
+
+The =%= =m= regexp is strict Emacs syntax (a bare =(= / =)= / =|= is a literal), and CRLF files keep their line endings on save.
+
+- The =%= =m= dired regexp now follows Emacs strictly: =\(...\)= is the only group form and =\\|= the only alternation — a bare =(= =)= =|= is a literal character, exactly as in Emacs regexps, so a name like =archive_(1).zip= or =md|txt= is matchable as-is (previously both the raw and the escaped forms opened groups / alternated, making literal parentheses impossible). The prompt, README and the Dired unit tests were updated; nothing else changes — =.=, =[...]=, the =*= =+= =?= quantifiers, anchors and the =\\d= =\\w= =\\s= escapes behave as before.
+- Editing a CRLF (Windows / DOS) file no longer silently rewrites it with LF line endings on save: the buffer remembers the file's line-ending style at load (=Buffer.eol=), strips the =\\r= from each line for editing as before, and writes =\\r\\n= back on =C-x C-s=, so a CRLF file round-trips byte-for-byte and never dirties every line for git. New files and files with LF endings are untouched. (This was the review item about CRLF → LF normalization.)
+
 ** 0.68.0 — <2026-08-14>
 
 Direds show line numbers: =C-z n= now works while browsing a directory.

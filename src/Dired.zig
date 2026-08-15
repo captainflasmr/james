@@ -493,10 +493,11 @@ const Atom = struct {
 /// Match the small regexp `pat` against `s` anywhere in the string (the
 /// dired twin of Emacs string-match-p): unanchored unless the pattern
 /// starts with ^, which pins it to the beginning; $ pins the end. The
-/// supported syntax: . (any char), [...] / [^...] classes with ranges,
-/// the greedy * + ? quantifiers, | (or Emacs \|) alternation, (...) and
-/// Emacs-style \(...\) groups, ^ $ anchors, and the escapes \d \D \w \W
-/// \s \S plus any escaped literal. A simple backtracking match — no
+/// supported syntax is strict Emacs regexp: . (any char), [...] / [^...]
+/// classes with ranges, the greedy * + ? quantifiers, \(...\) groups and
+/// \| alternation (a bare ( ) | is a literal, so names containing them
+/// are matchable), ^ $ anchors, and the escapes \d \D \w \W \s \S plus
+/// any escaped literal. A simple backtracking match — no
 /// backreferences.
 fn regexMatch(s: []const u8, pat: []const u8) bool {
     const anchored = pat.len > 0 and pat[0] == '^';
@@ -509,16 +510,18 @@ fn regexMatch(s: []const u8, pat: []const u8) bool {
 }
 
 /// Match one branch of `pat[pi..end]` against `s[si..]` — a sequence of
-/// atoms, possibly split by top-level "|" (or Emacs "\|") alternation —
+/// atoms, possibly split by top-level Emacs-style "\|" alternation —
 /// and return the position in `s` just after the match, or null on
 /// failure. `end` is the end of the enclosing group's pattern (or the
 /// whole pattern), so a branch never reads past its own closing paren.
+/// Strict Emacs syntax: only the escaped "\|" alternates (a bare "|" is
+/// a literal), and only "\(" / "\)" are group markers.
 fn matchBranch(s: []const u8, si: usize, pat: []const u8, pi: usize, end: usize) ?usize {
     // Find the top-level alternation points. Nested groups and classes
     // are skipped; their own branch matching resolves the pipes inside.
     // The recorded positions are the `|` characters themselves, so the
     // alternative before a pipe is [start, pipe) and the next starts at
-    // pipe + 1, whether the pipe is plain or Emacs-style "\|".
+    // pipe + 1.
     var pipe: [16]usize = undefined;
     var npipes: usize = 0;
     var depth: usize = 0;
@@ -533,33 +536,28 @@ fn matchBranch(s: []const u8, si: usize, pat: []const u8, pi: usize, end: usize)
             } else if (e == ')') {
                 depth -|= 1;
             } else if (e == '|') {
-                if (depth == 0 and npipes < pipe.len) pipe[npipes] = q + 1;
-                npipes = @min(npipes + 1, pipe.len);
+                // Only a depth-0 pipe splits this branch; one inside a
+                // group belongs to the group's own branch matching.
+                if (depth == 0) {
+                    if (npipes < pipe.len) pipe[npipes] = q + 1;
+                    npipes = @min(npipes + 1, pipe.len);
+                }
             }
             q += 2;
-        } else if (c == '(') {
-            depth += 1;
-            q += 1;
-        } else if (c == ')') {
-            depth -|= 1;
-            q += 1;
         } else if (c == '[') {
             q = skipClass(pat, q, end) orelse break;
-        } else if (c == '|') {
-            if (depth == 0) {
-                if (npipes < pipe.len) pipe[npipes] = q;
-                npipes = @min(npipes + 1, pipe.len);
-            }
-            q += 1;
         } else {
+            // A bare ( ) | is a literal in Emacs regexps.
             q += 1;
         }
     }
     // Try each alternative from the same position in `s`: the first that
-    // matches, wins.
+    // matches, wins. A pipe recorded at position p (the `|` character
+    // itself) ends its alternative at p - 1 — just before the escape —
+    // and the next starts at p + 1.
     var start = pi;
     for (pipe[0..npipes]) |p| {
-        if (matchSequence(s, si, pat, start, p)) |m| return m;
+        if (matchSequence(s, si, pat, start, p - 1)) |m| return m;
         start = p + 1;
     }
     return matchSequence(s, si, pat, start, end);
@@ -622,7 +620,12 @@ fn parseAtom(pat: []const u8, pi: usize, end: usize) ?Atom {
         switch (e) {
             '(' => {
                 const close = findGroupEnd(pat, pi + 2, end) orelse return null;
-                return .{ .next = close + 1, .kind = .group, .a = pi + 2, .b = close };
+                // `close` is the closing paren's position; the group's
+                // inner span ends just before it, so an escaped \) — the
+                // only closing paren there is — is not part of the inner
+                // pattern (the last alternative of a trailing \| would
+                // otherwise have to match it as a literal).
+                return .{ .next = close + 1, .kind = .group, .a = pi + 2, .b = close - 1 };
             },
             'd' => return .{ .next = pi + 2, .kind = .class, .text = "0-9" },
             'D' => return .{ .next = pi + 2, .kind = .class, .negate = true, .text = "0-9" },
@@ -650,13 +653,11 @@ fn parseAtom(pat: []const u8, pi: usize, end: usize) ?Atom {
             if (body_start >= close - 1) return null; // an empty class
             return .{ .next = close, .kind = .class, .text = pat[body_start .. close - 1], .negate = negate };
         },
-        '(' => {
-            const close = findGroupEnd(pat, pi + 1, end) orelse return null;
-            return .{ .next = close + 1, .kind = .group, .a = pi + 1, .b = close };
-        },
         // A bare quantifier is a literal — there is nothing for it to
-        // quantify.
-        '*', '+', '?' => return .{ .next = pi + 1, .kind = .literal, .a = c },
+        // quantify. A bare ( or ) is a literal too, strict Emacs syntax:
+        // groups are \(...\) and alternation is \|, so names containing
+        // parentheses or pipes are matchable as-is.
+        '*', '+', '?', '(', ')' => return .{ .next = pi + 1, .kind = .literal, .a = c },
         else => return .{ .next = pi + 1, .kind = .literal, .a = c },
     }
 }
@@ -672,10 +673,10 @@ fn skipClass(pat: []const u8, pi: usize, end: usize) ?usize {
 }
 
 /// The position of the closing paren of the group whose pattern starts at
-/// `pat[pi]` (just after the opening "(" or "\("): the scan tracks nested
-/// groups (both ( and \( open, ) and \) close, classes skipped) and
-/// returns the closing paren's position, or null when the group never
-/// closes.
+/// `pat[pi]` (just after the opening "\("): the scan tracks nested
+/// Emacs-style \(...\) groups (classes skipped) and returns the closing
+/// paren's position, or null when the group never closes. A bare ( or )
+/// is a literal and never opens or closes a group.
 fn findGroupEnd(pat: []const u8, pi: usize, end: usize) ?usize {
     var depth: usize = 1;
     var q = pi;
@@ -690,13 +691,6 @@ fn findGroupEnd(pat: []const u8, pi: usize, end: usize) ?usize {
                 if (depth == 0) return q + 1;
             }
             q += 2;
-        } else if (c == '(') {
-            depth += 1;
-            q += 1;
-        } else if (c == ')') {
-            depth -= 1;
-            if (depth == 0) return q;
-            q += 1;
         } else if (c == '[') {
             q = skipClass(pat, q, end) orelse return null;
         } else {
@@ -769,17 +763,30 @@ test "regexMatch" {
     try std.testing.expect(!regexMatch("ab", "a.b"));
     try std.testing.expect(regexMatch("config.log", ".*\\.log$"));
     try std.testing.expect(regexMatch("Makefile", "^Make*f"));
-    // Alternation and groups, in both Emacs and plain syntax.
-    try std.testing.expect(regexMatch("file.txt", "md|txt"));
-    try std.testing.expect(regexMatch("README.md", "md|txt"));
+    // Alternation and groups: strict Emacs syntax — \(...\) and \| are
+    // the group and alternation markers, a bare ( ) | is a literal.
     try std.testing.expect(regexMatch("file.txt", "md\\|txt"));
+    try std.testing.expect(regexMatch("README.md", "md\\|txt"));
     try std.testing.expect(regexMatch("foo.txt", "\\(foo\\|bar\\).txt"));
-    try std.testing.expect(regexMatch("bar.txt", "(foo|bar).txt"));
-    try std.testing.expect(!regexMatch("baz.txt", "(foo|bar).txt"));
-    try std.testing.expect(regexMatch("ababab", "(ab)+"));
-    try std.testing.expect(!regexMatch("ababx", "^(ab)+$"));
-    try std.testing.expect(regexMatch("aabb", "(a|b)*"));
+    try std.testing.expect(regexMatch("bar.txt", "\\(foo\\|bar\\).txt"));
+    try std.testing.expect(!regexMatch("baz.txt", "\\(foo\\|bar\\).txt"));
+    try std.testing.expect(regexMatch("ababab", "\\(ab\\)+"));
+    try std.testing.expect(!regexMatch("ababx", "^\\(ab\\)+$"));
+    try std.testing.expect(regexMatch("aabb", "\\(a\\|b\\)*"));
+    // Nested groups, and a group with alternation at the end of the
+    // pattern — the escaped close must not leak into the last
+    // alternative.
+    try std.testing.expect(regexMatch("axby", "\\(a\\(x\\|y\\)b\\)"));
+    try std.testing.expect(regexMatch("ayby", "\\(a\\(x\\|y\\)b\\)"));
+    try std.testing.expect(!regexMatch("abz", "\\(a\\|b\\)$"));
+    try std.testing.expect(regexMatch("b", "\\(a\\|b\\)$"));
     try std.testing.expect(regexMatch("photo-2026.jpg", "photo-[0-9][0-9][0-9][0-9]"));
+    // A literal ( ) | in a name matches literally, like Emacs.
+    try std.testing.expect(regexMatch("archive_(1).zip", "(1)"));
+    try std.testing.expect(regexMatch("archive_(1).zip", "archive_(1)"));
+    try std.testing.expect(!regexMatch("bar.txt", "(foo|bar).txt"));
+    try std.testing.expect(regexMatch("md|txt", "md|txt"));
+    try std.testing.expect(regexMatch("(foo|bar).txt", "(foo|bar).txt"));
     // Escapes.
     try std.testing.expect(regexMatch("file1", "file\\d"));
     try std.testing.expect(!regexMatch("filex", "file\\d"));
