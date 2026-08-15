@@ -2490,6 +2490,180 @@ fn openExternal(io: std.Io, gpa: std.mem.Allocator, environ_map: *std.process.En
     };
 }
 
+/// Spawn `argv` detached from the editor: through a backgrounding
+/// shell, so a foreground app — a terminal emulator (alacritty,
+/// xterm), a single-instance file manager (thunar, nautilus) — never
+/// blocks the editor while it runs. The caller checks the binary on
+/// the PATH first, since a backgrounded exec failure is silent.
+/// Returns false when the shell can't spawn.
+fn spawnDetached(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) bool {
+    const bg = [_][]const u8{ "/bin/sh", "-c", "exec \"$@\" &", "sh" };
+    const full = std.mem.concat(gpa, []const u8, &.{ bg[0..], argv }) catch return false;
+    defer gpa.free(full);
+    var child = std.process.spawn(io, .{ .argv = full, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
+    _ = child.wait(io) catch return false;
+    return true;
+}
+
+/// The absolute parent directory of `path` — the folder shown for a
+/// file's "reveal". Null when the path can't be resolved or has no
+/// parent. Caller frees.
+fn revealDirOf(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const abs = Dired.absPathOf(gpa, io, path) catch return gpa.dupe(u8, path) catch null;
+    defer gpa.free(abs);
+    return Dired.parentOf(gpa, abs) catch null;
+}
+
+/// C-x E: reveal `path` in the native file manager —
+/// Explorer on Windows, Finder on macOS, a real file manager on
+/// Linux/BSD. A directory opens the manager at it; a file shows its
+/// parent folder — with the entry selected on macOS (open -R), in
+/// Nautilus / Dolphin (--select) / Nemo / Caja (a file argument
+/// selects), and plainly elsewhere (explorer.exe and thunar take a
+/// bare directory argument; explorer's /select form would need cmd's
+/// raw command-line handling). Linux/BSD skips xdg-open for the
+/// reveal: the inode/directory MIME default can be hijacked by an
+/// unrelated application (EasyTag's desktop file claims it), so the
+/// first installed manager is picked by name instead, xdg-open only
+/// as the last resort for a directory. Like openExternal, the opener
+/// runs with its stdio thrown away so the editor's terminal stays
+/// clean, and returns false when nothing could be spawned.
+fn revealInFileManager(io: std.Io, gpa: std.mem.Allocator, environ_map: *std.process.Environ.Map, path: []const u8, is_dir: bool) bool {
+    if (comptime builtin.os.tag == .windows) {
+        // Explorer: a directory opens as-is, a file shows its parent
+        // folder. A GUI process, so waiting for it never blocks on the
+        // window itself.
+        var target: []const u8 = path;
+        var owned: ?[]u8 = null;
+        defer if (owned) |o| gpa.free(o);
+        if (!is_dir) {
+            owned = revealDirOf(io, gpa, path) orelse return false;
+            target = owned.?;
+        }
+        var child = std.process.spawn(io, .{ .argv = &.{ "explorer.exe", target }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
+        _ = child.wait(io) catch return false;
+        return true;
+    }
+    if (comptime builtin.os.tag == .macos) {
+        // open -R reveals the entry in Finder; a directory opens Finder
+        // at it.
+        if (is_dir) return openExternal(io, gpa, environ_map, path);
+        const abs = Dired.absPathOf(gpa, io, path) catch (gpa.dupe(u8, path) catch return false);
+        defer gpa.free(abs);
+        var child = std.process.spawn(io, .{ .argv = &.{ "open", "-R", abs }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
+        const term = child.wait(io) catch return false;
+        return switch (term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+    }
+    // Linux/BSD: the first installed manager, each handed the entry
+    // where it selects one, the folder otherwise. File managers are
+    // single-instance apps, so they spawn detached like the terminals.
+    const owned_dir: ?[]u8 = if (is_dir) null else revealDirOf(io, gpa, path);
+    defer if (owned_dir) |d| gpa.free(d);
+    const dir = if (is_dir) path else (owned_dir orelse return false);
+    const file = if (is_dir) path else (owned_dir orelse return false);
+    const managers = [_][]const []const u8{
+        &.{ "nautilus", file },
+        &.{ "thunar", dir },
+        &.{ "dolphin", "--select", file },
+        &.{ "nemo", file },
+        &.{ "caja", file },
+        &.{ "pcmanfm", dir },
+        &.{ "pcmanfm-qt", dir },
+    };
+    for (managers) |m| {
+        if (!onPath(io, gpa, environ_map, m[0])) continue;
+        if (spawnDetached(io, gpa, m)) return true;
+    }
+    // Last resort: the freedesktop opener on the directory (it has no
+    // "reveal" for a file).
+    return openExternal(io, gpa, environ_map, dir);
+}
+
+/// Whether `name` is an executable on the PATH. The terminal picker
+/// needs the check because a backgrounded exec failure is silent.
+fn onPath(io: std.Io, gpa: std.mem.Allocator, environ_map: *std.process.Environ.Map, name: []const u8) bool {
+    const path = environ_map.get("PATH") orelse return false;
+    var it = std.mem.splitScalar(u8, path, std.fs.path.delimiter);
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const full = std.fs.path.join(gpa, &.{ dir, name }) catch continue;
+        defer gpa.free(full);
+        std.Io.Dir.accessAbsolute(io, full, .{ .execute = true }) catch continue;
+        return true;
+    }
+    return false;
+}
+
+/// T in dired / C-x T: open a *new* native terminal window at `dir` —
+/// Windows Terminal where installed (a new cmd.exe window via
+/// PowerShell's Start-Process as the fallback), Terminal.app on macOS,
+/// and the first installed desktop emulator on Linux/BSD (gnome-terminal,
+/// konsole, xfce4-terminal, kitty, alacritty, wezterm, then the generic
+/// x-terminal-emulator and xterm with a cd-and-exec shell). Unlike C-x j
+/// the editor keeps the terminal: the child is spawned through a
+/// backgrounding shell, so a foreground emulator (alacritty, xterm)
+/// never blocks the editor while it runs. Returns false when no
+/// terminal could be started.
+fn openTerminalHere(io: std.Io, gpa: std.mem.Allocator, environ_map: *std.process.Environ.Map, dir: []const u8) bool {
+    if (comptime builtin.os.tag == .windows) {
+        // wt.exe opens a new Windows Terminal window at `dir` and
+        // exits; where it isn't installed, Start-Process launches a new
+        // cmd.exe window in the directory (the single quotes keep the
+        // path one argument — a quote in the path doubles, PowerShell's
+        // escape — and the /k keeps the window open after exit).
+        var child = std.process.spawn(io, .{ .argv = &.{ "wt.exe", "-d", dir }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch null;
+        if (child) |*c| {
+            _ = c.wait(io) catch return false;
+            return true;
+        }
+        var escaped: std.ArrayList(u8) = .empty;
+        defer escaped.deinit(gpa);
+        for (dir) |ch| {
+            if (ch == '\'') {
+                escaped.appendSlice(gpa, "''") catch return false;
+            } else {
+                escaped.append(gpa, ch) catch return false;
+            }
+        }
+        const cmd = std.fmt.allocPrint(gpa, "Start-Process cmd.exe -ArgumentList @('/k','cd','/d','{s}')", .{escaped.items}) catch return false;
+        defer gpa.free(cmd);
+        var ps = std.process.spawn(io, .{ .argv = &.{ "powershell.exe", "-NoProfile", "-Command", cmd }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
+        _ = ps.wait(io) catch return false;
+        return true;
+    }
+    if (comptime builtin.os.tag == .macos) {
+        // open -a Terminal hands the directory to Terminal.app, which
+        // opens a new window in it.
+        var child = std.process.spawn(io, .{ .argv = &.{ "open", "-a", "Terminal", dir }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
+        const term = child.wait(io) catch return false;
+        return switch (term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+    }
+    // Linux/BSD: the first installed emulator from the list, each with
+    // its working-directory option; the generic -e pair falls back to a
+    // cd-and-exec shell (a plain /bin/sh, so it always exists).
+    const candidates = [_][]const []const u8{
+        &.{ "gnome-terminal", "--working-directory", dir },
+        &.{ "konsole", "--workdir", dir },
+        &.{ "xfce4-terminal", "--working-directory", dir },
+        &.{ "kitty", "--directory", dir },
+        &.{ "alacritty", "--working-directory", dir },
+        &.{ "wezterm", "start", "--cwd", dir },
+        &.{ "x-terminal-emulator", "-e", "/bin/sh", "-c", "cd \"$1\" && exec \"$2\"", "sh", dir, environ_map.get("SHELL") orelse "/bin/sh" },
+        &.{ "xterm", "-e", "/bin/sh", "-c", "cd \"$1\" && exec \"$2\"", "sh", dir, environ_map.get("SHELL") orelse "/bin/sh" },
+    };
+    for (candidates) |c| {
+        if (!onPath(io, gpa, environ_map, c[0])) continue;
+        if (spawnDetached(io, gpa, c)) return true;
+    }
+    return false;
+}
+
 /// Run `argv` and capture its stdout, trailing whitespace trimmed.
 /// Returns null if the command can't spawn or writes nothing.
 fn runCapture(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
@@ -3906,6 +4080,8 @@ const welcome_tail =
     \\    C-x +               balance the windows
     \\    C-x o               move to the next window (n / p / o repeat)
     \\    C-x j / C-x c       drop to a shell (C-z suspends, C-x j resumes)
+    \\    C-x T               open a new terminal window in this directory
+    \\    C-x E               reveal in the file manager
     \\    C-x r m             set a bookmark at point
     \\    C-x r b             jump to a bookmark
     \\    C-x r l             list the bookmarks
@@ -7224,6 +7400,51 @@ pub fn main(init: std.process.Init) !void {
                             null;
                         defer if (shell_dir) |sd| gpa.free(sd);
                         shell_pid = try enterShell(gpa, io, init.environ_map, &loop, &vx, &tty, shell_pid, editor_pgrp, shell_dir);
+                    } else if (key.matches('T', .{})) {
+                        // C-x T: open a new native terminal window in
+                        // the current context's directory — the dired's
+                        // own while browsing, the file's directory
+                        // otherwise, the working directory when the
+                        // buffer has no file. Like C-x j, but a separate
+                        // desktop window instead of taking over this
+                        // terminal. The absolute directory survives the
+                        // round trip to the external tools (their cd /
+                        // --working-directory resolve against their own
+                        // cwd, not the editor's).
+                        const raw = if (direds.items[current]) |*d|
+                            try gpa.dupe(u8, d.path.items)
+                        else
+                            try Dired.startingDir(gpa, buf.filename orelse ".");
+                        defer gpa.free(raw);
+                        const term_dir = Dired.absPathOf(gpa, io, raw) catch raw;
+                        defer if (term_dir.ptr != raw.ptr) gpa.free(term_dir);
+                        if (!openTerminalHere(io, gpa, init.environ_map, term_dir))
+                            status_msg = "No terminal emulator found";
+                    } else if (key.matches('E', .{})) {
+                        // C-x E: reveal the current context in the
+                        // native file manager — the selected entry while
+                        // browsing a dired (".." skipped like W), the
+                        // file itself in a file buffer, the working
+                        // directory for a buffer with no file.
+                        if (direds.items[current]) |*d| {
+                            const e = d.entries.items[d.selected];
+                            if (!std.mem.eql(u8, e.name, "..")) {
+                                if (std.fs.path.join(gpa, &.{ d.path.items, e.name }) catch null) |full| {
+                                    defer gpa.free(full);
+                                    if (!revealInFileManager(io, gpa, init.environ_map, full, e.is_dir))
+                                        status_msg = "Failed to open file manager";
+                                }
+                            }
+                        } else if (buf.filename) |f| {
+                            if (!revealInFileManager(io, gpa, init.environ_map, f, false))
+                                status_msg = "Failed to open file manager";
+                        } else {
+                            if (Dired.absPathOf(gpa, io, ".") catch (gpa.dupe(u8, ".") catch null)) |cwd| {
+                                defer gpa.free(cwd);
+                                if (!revealInFileManager(io, gpa, init.environ_map, cwd, true))
+                                    status_msg = "Failed to open file manager";
+                            }
+                        }
                     }
                 } else if (pending_ctrl_x_r) {
                     pending_ctrl_x_r = false;

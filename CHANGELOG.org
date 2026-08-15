@@ -10,6 +10,14 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.78.0 — <2026-08-15>
+
+=C-x E= opens the native file manager at the current context, and =C-x T= opens a new native terminal window in its directory — from a dired, from a file buffer, from anywhere.
+
+- =C-x E= reveals the current context in the file manager: the selected entry while browsing a dired (=".."= never), the file itself in a file buffer, the working directory when the buffer has no file. A directory opens the manager at it; a file opens its folder — with the entry selected on macOS (=open -R=), in Nautilus / Dolphin (=--select=) / Nemo / Caja (a file argument selects), and plainly in Explorer (which takes a bare directory argument; its =/select= form would need cmd's raw command-line handling) and Thunar. Linux/BSD deliberately skips the freedesktop =xdg-open= for the reveal: the =inode/directory= MIME default can be hijacked by an unrelated application (EasyTag's desktop file claims it — seen in the wild), so the first installed manager is picked by name instead — nautilus, thunar, dolphin, nemo, caja, pcmanfm, pcmanfm-qt — with =xdg-open= only as the directory-only last resort (it has no "reveal").
+- =C-x T= opens a *new* native terminal window in the current context's directory — the dired's own while browsing, the file's directory otherwise, the working directory with no file: Windows Terminal where installed (=wt.exe -d=; a new =cmd.exe= window via PowerShell's =Start-Process= is the fallback, both built into Windows), Terminal.app on macOS (=open -a Terminal=), and the first installed desktop emulator on Linux/BSD (gnome-terminal, konsole, xfce4-terminal, kitty, alacritty, wezterm, then the generic =x-terminal-emulator= / =xterm= with a cd-and-exec shell). The directory is absolutized before it goes out, so a relative dired path (say =.=) survives the round trip to the tools' =cd= / =--working-directory= handling. It is the sibling of =C-x j=, which takes over this terminal instead of opening a new one.
+- Both spawn detached — through a backgrounding shell (=sh -c 'exec "$@" &'=, reaped immediately), so a foreground app (alacritty, xterm, a single-instance file manager) never blocks the editor while it runs. The binary is checked on the PATH first, since a backgrounded exec failure is silent; a missing file manager or terminal reports =Failed to open file manager= / =No terminal emulator found= on the modeline. The native and =x86_64-windows= cross builds compile.
+
 ** 0.77.0 — <2026-08-14>
 
 =C-c j= / =C-c k= land focus on the right pane again — no more frozen cursor after flipping layouts.
