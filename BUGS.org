@@ -9,8 +9,6 @@ This document contains the current bugs/improvements, this is just for me mainly
 
 * Bugs/Improvements
 
-** TODO carriage return at the end of dired
+** DOING carriage return at the end of dired
 
 ** TODO icomplete like completion in vertical mode
-
-** DOING truncate on in ibuffer

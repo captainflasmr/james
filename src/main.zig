@@ -2106,7 +2106,7 @@ fn diredOpIndices(gpa: std.mem.Allocator, d: *const Dired, out: *std.ArrayList(u
             out.append(gpa, i) catch return;
         }
     }
-    if (out.items.len == 0 and !std.mem.eql(u8, d.entries.items[d.selected].name, "..")) {
+    if (out.items.len == 0 and d.selected < d.entries.items.len and !std.mem.eql(u8, d.entries.items[d.selected].name, "..")) {
         out.append(gpa, d.selected) catch {};
     }
 }
@@ -2118,9 +2118,11 @@ fn diredOpIndices(gpa: std.mem.Allocator, d: *const Dired, out: *std.ArrayList(u
 /// full dwim target path of that single entry (the marked one when exactly
 /// one is marked, else the selected one).
 fn openDiredTargetPrompt(gpa: std.mem.Allocator, direds: *std.ArrayList(?Dired), root: *Pane, focused: *Pane, d: *Dired, prompt: *bool, query: *std.ArrayList(u8)) void {
-    const e = d.entries.items[d.selected];
     const marked = diredMarkedCount(d);
-    if (marked == 0 and std.mem.eql(u8, e.name, "..")) return;
+    // The selection on the trailing newline acts like "..": nothing to
+    // copy or rename, unless real entries are marked.
+    if (marked == 0 and (d.selected >= d.entries.items.len or std.mem.eql(u8, d.entries.items[d.selected].name, ".."))) return;
+    const e = if (d.selected < d.entries.items.len) d.entries.items[d.selected] else d.entries.items[0];
     prompt.* = true;
     query.clearRetainingCapacity();
     if (marked > 1) {
@@ -3690,6 +3692,14 @@ fn renderDiredPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, dired: 
         }
         row += 1;
     }
+    // The listing ends with a newline, like Emacs dired: the selection
+    // past the last entry (M->, n at the end) rests on the trailing
+    // empty row — the same shape as a file buffer's final line, only
+    // visible when the cursor is there. Numbered entries stop at the
+    // last real one.
+    if (dired.selected == dired.entries.items.len and row < text_height) {
+        _ = win.printSegment(.{ .text = " ", .style = .{ .bold = true } }, .{ .row_offset = row_base + row, .col_offset = @intCast(line_num_width) });
+    }
 
     const ml: PromptModeline = if (find_file) |f|
         fillPromptModeline(modeline_buf, "Find file: ", .{}, f.query)
@@ -4327,16 +4337,13 @@ fn openBufferOrDired(
         try d.open(gpa, io, path);
 
         // Mirror the listing into the buffer's lines (name, with a "/"
-        // for directories) so incremental search and the prompt-mode
-        // rendering see the file names like any other buffer. The listing
-        // never changes while the dired is open, so this stays in sync.
-        for (d.entries.items) |e| {
-            var line: std.ArrayList(u8) = .empty;
-            errdefer line.deinit(gpa);
-            try line.appendSlice(gpa, e.name);
-            if (e.is_dir) try line.append(gpa, '/');
-            try new_buf.lines.append(gpa, line);
-        }
+        // for directories, and the trailing newline an Emacs dired ends
+        // with — mirrorDiredLines owns that shape, and refresh /
+        // isearch sync keep it that way) so incremental search and the
+        // prompt-mode rendering see the file names like any other
+        // buffer. The listing never changes while the dired is open, so
+        // this stays in sync.
+        mirrorDiredLines(gpa, new_buf, &d);
 
         try direds.append(gpa, d);
         errdefer {
@@ -4835,6 +4842,12 @@ fn mirrorDiredLines(gpa: std.mem.Allocator, buf: *Buffer, d: *const Dired) void 
         if (e.is_dir) line.append(gpa, '/') catch return;
         buf.lines.append(gpa, line) catch return;
     }
+    // An Emacs dired ends with a newline: a trailing empty line, so
+    // C-c b and C-x h + M-w copies of the listing carry the final line
+    // break (the last entry's line otherwise has none). The listing
+    // renders from the dired's entries, so the line is never drawn,
+    // and isearch never matches it.
+    buf.lines.append(gpa, .empty) catch return;
     // Keep the mirror's cursor on the dired selection (isearch in dired
     // syncs it anyway, but the two should never drift).
     buf.cursor_row = @min(d.selected, buf.lines.items.len -| 1);
@@ -6243,7 +6256,7 @@ pub fn main(init: std.process.Init) !void {
                         // is skipped like C and D.
                         if (direds.items[current]) |*d| {
                             const en = d.entries.items[d.selected];
-                            if (!std.mem.eql(u8, en.name, "..")) blk: {
+                            if (d.selected < d.entries.items.len and !std.mem.eql(u8, en.name, "..")) blk: {
                                 const path = std.fs.path.join(gpa, &.{ d.path.items, en.name }) catch break :blk;
                                 defer gpa.free(path);
                                 const parts = duplicateNameParts(en.name);
@@ -7432,7 +7445,7 @@ pub fn main(init: std.process.Init) !void {
                         // directory for a buffer with no file.
                         if (direds.items[current]) |*d| {
                             const e = d.entries.items[d.selected];
-                            if (!std.mem.eql(u8, e.name, "..")) {
+                            if (d.selected < d.entries.items.len and !std.mem.eql(u8, e.name, "..")) {
                                 if (std.fs.path.join(gpa, &.{ d.path.items, e.name }) catch null) |full| {
                                     defer gpa.free(full);
                                     if (!revealInFileManager(io, gpa, init.environ_map, full, e.is_dir))
@@ -8075,7 +8088,7 @@ pub fn main(init: std.process.Init) !void {
                                 // m: mark the selected entry (Emacs
                                 // dired-mark) and move down, so a run of
                                 // m's marks a block.
-                                d.entries.items[d.selected].marked = true;
+                                if (d.selected < d.entries.items.len) d.entries.items[d.selected].marked = true;
                                 d.moveDown();
                             }
                         } else if (key.matches('%', .{})) {
@@ -8086,7 +8099,7 @@ pub fn main(init: std.process.Init) !void {
                         } else if (key.matches('u', .{})) {
                             // u: unmark the selected entry (Emacs
                             // dired-unmark) and move down.
-                            d.entries.items[d.selected].marked = false;
+                            if (d.selected < d.entries.items.len) d.entries.items[d.selected].marked = false;
                             d.moveDown();
                         } else if (key.matches('U', .{})) {
                             // U: unmark every entry (Emacs
@@ -8199,11 +8212,14 @@ pub fn main(init: std.process.Init) !void {
                             // M-<: beginning of the listing.
                             d.selected = 0;
                         } else if (key.matches('>', .{ .alt = true })) {
-                            // M->: end of the listing.
-                            d.selected = d.entries.items.len -| 1;
+                            // M->: end of the listing — the trailing
+                            // newline row, like end of buffer in Emacs
+                            // dired (one more press of M-< brings the
+                            // selection back to the top).
+                            d.selected = d.entries.items.len;
                         } else if (key.matches('j', .{ .alt = true })) {
                             // M-j: 5 entries down.
-                            d.selected = @min(d.selected + 5, d.entries.items.len -| 1);
+                            d.selected = @min(d.selected + 5, d.entries.items.len);
                         } else if (key.matches('k', .{ .alt = true })) {
                             // M-k: 5 entries up.
                             d.selected -|= 5;
@@ -8211,7 +8227,7 @@ pub fn main(init: std.process.Init) !void {
                             // M-J: a page down the listing (Emacs
                             // scroll-up): the selection moves one
                             // screenful of entries.
-                            d.selected = @min(d.selected + (focused_text_height -| 1), d.entries.items.len -| 1);
+                            d.selected = @min(d.selected + (focused_text_height -| 1), d.entries.items.len);
                         } else if (key.matches('K', .{ .alt = true })) {
                             // M-K: a page up the listing.
                             d.selected -|= focused_text_height -| 1;
@@ -8257,7 +8273,7 @@ pub fn main(init: std.process.Init) !void {
                             // elsewhere — or just the selected one when
                             // nothing is marked (Emacs dired-do-delete
                             // with delete-by-moving-to-trash).
-                            if (diredMarkedCount(d) > 0 or !std.mem.eql(u8, d.entries.items[d.selected].name, "..")) {
+                            if (diredMarkedCount(d) > 0 or (d.selected < d.entries.items.len and !std.mem.eql(u8, d.entries.items[d.selected].name, ".."))) {
                                 confirming_delete = true;
                             }
                         } else if (key.matches('W', .{})) {
@@ -8270,7 +8286,7 @@ pub fn main(init: std.process.Init) !void {
                             // use is looked up first and shown in the
                             // modeline; y / n confirms before anything runs.
                             const e = d.entries.items[d.selected];
-                            if (!std.mem.eql(u8, e.name, "..")) {
+                            if (d.selected < d.entries.items.len and !std.mem.eql(u8, e.name, "..")) {
                                 if (std.fs.path.join(gpa, &.{ d.path.items, e.name }) catch null) |full| {
                                     open_confirm_path = full;
                                     open_confirm_app = defaultOpenApp(io, gpa, full);

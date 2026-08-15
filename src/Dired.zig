@@ -126,7 +126,7 @@ pub fn absPathOf(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
 pub fn refresh(self: *Dired, gpa: std.mem.Allocator, io: std.Io) !void {
     const prev_selected = self.selected;
     try self.reload(gpa, io);
-    self.selected = @min(prev_selected, self.entries.items.len -| 1);
+    self.selected = @min(prev_selected, self.entries.items.len);
 }
 
 fn reload(self: *Dired, gpa: std.mem.Allocator, io: std.Io) !void {
@@ -392,8 +392,12 @@ pub fn moveUp(self: *Dired) void {
     if (self.selected > 0) self.selected -= 1;
 }
 
+/// Move the selection down, onto the listing's trailing newline after
+/// the last entry (the empty line an Emacs dired ends with — the
+/// mirror buffer's final line), so the cursor can rest there like any
+/// buffer's end.
 pub fn moveDown(self: *Dired) void {
-    if (self.selected + 1 < self.entries.items.len) self.selected += 1;
+    if (self.selected < self.entries.items.len) self.selected += 1;
 }
 
 pub fn scrollToSelected(self: *Dired, height: usize) void {
@@ -433,9 +437,10 @@ pub fn upPath(self: *Dired, gpa: std.mem.Allocator) !?[]u8 {
 /// Act on the selected entry: report a directory for the caller to open as
 /// its own dired buffer, or a file to be opened. Never mutates the listing
 /// itself — the caller decides what to do with the path, so dired behaves
-/// like a buffer rather than a one-shot picker.
+/// like a buffer rather than a one-shot picker. The listing's trailing
+/// newline (the selection at == entries.len) is nothing to open.
 pub fn choose(self: *Dired, gpa: std.mem.Allocator) !Choice {
-    if (self.entries.items.len == 0) return .none;
+    if (self.selected >= self.entries.items.len) return .none;
     const entry = self.entries.items[self.selected];
 
     var target: std.ArrayList(u8) = .empty;
