@@ -18,6 +18,11 @@ const IbufferSort = enum { name, order };
 /// they are acted on again.
 var buffer_list_gen: usize = 0;
 
+/// Bumped every time the bookmark list changes (set or reloaded), so an
+/// open *Bookmarks* buffer can tell (at the next render) that its rows
+/// have gone stale and must be rebuilt.
+var bookmark_list_gen: usize = 0;
+
 /// Whether the terminal's background scheme is dark (the default until
 /// the terminal reports otherwise): on a light background the terminal's
 /// dim style is a barely-visible gray-on-white, so the dim chrome —
@@ -4175,7 +4180,7 @@ const welcome_tail =
     \\    C-x E               reveal in the file manager
     \\    C-x r m             set a bookmark at point
     \\    C-x r b             jump to a bookmark
-    \\    C-x r l             list the bookmarks
+    \\    C-x r l             list the bookmarks in a buffer
     \\    C-z e               show spaces / tabs / newlines (whitespace)
     \\    C-z n               show / hide the line numbers
     \\
@@ -4185,7 +4190,7 @@ const welcome_tail =
     \\    C-c d               duplicate the selected entry in dired
     \\    C-c w               copy the region
     \\    C-c C-k             close the dired buffer
-    \\    C-c o               open the bookmark list
+    \\    C-c o               pick a bookmark (type to filter)
     \\    C-c f               find files (fuzzy list)
     \\    C-c g               grep the current directory (Enter opens, F follows)
     \\    C-c j / C-c k       step back / forward through window layouts (j / k repeat)
@@ -4201,7 +4206,7 @@ const welcome_tail =
     \\    M-l i               the Emacs-vanilla config
     \\    M-l y               the Emacs-DIYer config
     \\    M-l r               the scratch buffer
-    \\    M-l o               the bookmark list
+    \\    M-l o               pick a bookmark (type to filter)
     \\    M-l l               pick a recently opened file
     \\    M-l = / M-l -       new / close tab
     \\
@@ -4293,6 +4298,13 @@ const welcome_tail =
     \\    s                   toggle the sort (name / list order)
     \\    g                   re-read the listing
     \\    q / C-g             close the ibuffer
+    \\
+    \\  Bookmarks (C-x r l):
+    \\
+    \\    n / p               next / previous bookmark (arrows too)
+    \\    Enter               jump to the bookmark
+    \\    g                   re-read the listing
+    \\    q / C-g             close the bookmark list
     \\
     \\  Pickers (buffers, bookmarks and recent files):
     \\
@@ -4528,7 +4540,7 @@ fn syncDiredSelection(direds: []?Dired, current: usize, buf: *Buffer) void {
 }
 
 /// The row source of the modal picker: the open buffers (C-x b), the
-/// bookmark list (C-x r l / C-c o / M-l o), or the recent files (M-l l).
+/// bookmarks (C-c o / M-l o), or the recent files (M-l l).
 const PickerKind = enum { buffers, bookmarks, recent };
 
 /// The picker state for rendering: the row kind, the visible rows
@@ -4989,6 +5001,7 @@ fn ibufferModeOf(buffers: []*Buffer, direds: []?Dired, i: usize) []const u8 {
         if (std.mem.eql(u8, dn, "*occur*")) return "Occur";
         if (std.mem.eql(u8, dn, "*welcome*")) return "Home";
         if (std.mem.eql(u8, dn, "*Ibuffer*")) return "Ibuffer";
+        if (std.mem.eql(u8, dn, "*Bookmarks*")) return "Bookmarks";
     }
     return "Fundamental";
 }
@@ -5130,6 +5143,81 @@ fn ibufferRebuild(gpa: std.mem.Allocator, buffers: []*Buffer, direds: []?Dired, 
     }
 }
 
+/// Rebuild the *Bookmarks* buffer's listing: the header and dashes
+/// ruler, one row per bookmark — the name elided like the ibuffer's,
+/// then the full path — and a footer of the total count, mirroring the
+/// ibuffer's summary line. `rows` gets the bookmark index of each entry
+/// row in order, so the entry at line r sits at rows[r - 2]. The row
+/// under the cursor is re-selected afterwards — the previously selected
+/// row's bookmark, found by name, since bookmark names are unique here —
+/// so a rebuild after setting or reloading bookmarks keeps the cursor
+/// put.
+fn bookmarksRebuild(gpa: std.mem.Allocator, bookmarks: []const Bookmark, buf: *Buffer, rows: *std.ArrayList(usize)) void {
+    // The row to reselect: the previously selected row's bookmark name.
+    // The old rows may be stale after the list changed — guard the
+    // bounds.
+    const prev_name: ?[]const u8 = if (buf.cursor_row >= 2 and buf.cursor_row - 2 < rows.items.len and rows.items[buf.cursor_row - 2] < bookmarks.len)
+        bookmarks[rows.items[buf.cursor_row - 2]].name
+    else
+        null;
+
+    for (buf.lines.items) |*l| l.deinit(gpa);
+    buf.lines.clearRetainingCapacity();
+    rows.clearRetainingCapacity();
+
+    const append_line = struct {
+        fn run(alloc: std.mem.Allocator, target: *Buffer, text: []const u8) bool {
+            var line: std.ArrayList(u8) = .empty;
+            errdefer line.deinit(alloc);
+            line.appendSlice(alloc, text) catch return false;
+            target.lines.append(alloc, line) catch return false;
+            return true;
+        }
+    }.run;
+
+    // The header and its dashes ruler, the bookmark-bmenu columns: the
+    // name 20 wide, then the full path taking the rest of the line.
+    const header = std.fmt.allocPrint(gpa, " {s:<20} {s}", .{ "Name", "Path" }) catch return;
+    defer gpa.free(header);
+    const ruler = std.fmt.allocPrint(gpa, " {s:<20} {s}", .{ "--------------------", "----------------" }) catch return;
+    defer gpa.free(ruler);
+    if (!append_line(gpa, buf, header)) return;
+    if (!append_line(gpa, buf, ruler)) return;
+
+    for (bookmarks, 0..) |b, i| {
+        // A long name elides with ... like Emacs's elide.
+        const name_w: usize = 20;
+        var owned_name: ?[]u8 = null;
+        defer if (owned_name) |o| gpa.free(o);
+        const name_disp: []const u8 = if (b.name.len > name_w) blk: {
+            owned_name = std.fmt.allocPrint(gpa, "{s}...", .{b.name[0 .. name_w - 3]}) catch return;
+            break :blk owned_name.?;
+        } else b.name;
+        const row = std.fmt.allocPrint(gpa, " {s:<20} {s}", .{ name_disp, b.path }) catch return;
+        defer gpa.free(row);
+        if (!append_line(gpa, buf, row)) return;
+        rows.append(gpa, i) catch return;
+    }
+
+    const footer = std.fmt.allocPrint(gpa, "{d:>6} bookmarks", .{bookmarks.len}) catch return;
+    defer gpa.free(footer);
+    _ = append_line(gpa, buf, footer);
+
+    // Reselect: the previously selected bookmark (its name is always
+    // found unless it was removed, in which case the cursor lands on the
+    // first row).
+    buf.cursor_row = if (rows.items.len > 0) 2 else 0;
+    buf.cursor_col = 0;
+    if (prev_name) |pn| {
+        for (rows.items, 0..) |bi, r| {
+            if (std.mem.eql(u8, bookmarks[bi].name, pn)) {
+                buf.cursor_row = r + 2;
+                break;
+            }
+        }
+    }
+}
+
 /// m / u in the ibuffer: mark (or unmark) the row under the cursor —
 /// the mark lives in the row's M column (column 1), so no separate state
 /// is needed — stepping down afterwards like dired. The header, ruler
@@ -5228,6 +5316,7 @@ fn bookmarkSet(gpa: std.mem.Allocator, bookmarks: *std.ArrayList(Bookmark), name
             b.path = new_path;
             b.row = buf.cursor_row;
             b.col = buf.cursor_col;
+            bookmark_list_gen += 1; // the *Bookmarks* listing is now stale
             return;
         }
     }
@@ -5238,6 +5327,7 @@ fn bookmarkSet(gpa: std.mem.Allocator, bookmarks: *std.ArrayList(Bookmark), name
         .col = buf.cursor_col,
     };
     bookmarks.append(gpa, b) catch return;
+    bookmark_list_gen += 1; // the *Bookmarks* listing is now stale
 }
 
 /// C-x r b / Enter in the bookmark list: open the bookmarked file (or
@@ -5287,6 +5377,7 @@ fn reloadBookmarks(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Env
     }
     bookmarks.clearRetainingCapacity();
     loadBookmarks(gpa, io, env_map, bookmarks);
+    bookmark_list_gen += 1; // the *Bookmarks* listing is now stale
 }
 
 /// After a save: when the saved buffer is the bookmarks file itself (the
@@ -5912,7 +6003,18 @@ pub fn main(init: std.process.Init) !void {
     defer ibuffer_rows.deinit(gpa);
     var ibuffer_sort: IbufferSort = .name;
     var ibuffer_gen: usize = 0;
-    // The modal picker (C-x b buffers, C-x r l / C-c o / M-l o bookmarks,
+    // The *Bookmarks* buffer (C-x r l, Emacs's bookmark-bmenu-list): the
+    // persistent buffer listing every bookmark, the buffer sibling of
+    // the C-c o / M-l o bookmark picker. `bookmarks_rows` maps each entry
+    // row (line minus the header and ruler) to its bookmark index. The
+    // listing is rebuilt whenever it is opened and whenever the bookmark
+    // list changes (see bookmark_list_gen); `bookmarks_gen` remembers
+    // the list generation the rows were last built from.
+    var bookmarks_buf_idx: ?usize = null;
+    var bookmarks_rows: std.ArrayList(usize) = .empty;
+    defer bookmarks_rows.deinit(gpa);
+    var bookmarks_gen: usize = 0;
+    // The modal picker (C-x b buffers, C-c o / M-l o bookmarks,
     // M-l l recent files): one at a time, over rows that filter as you
     // type (see pickerFilter). `picker_kind` selects the row source;
     // `picker_selected` is the full-list index of the selection and
@@ -7589,11 +7691,44 @@ pub fn main(init: std.process.Init) !void {
                         bookmark_prompt = .jump;
                         bookmark_query.clearRetainingCapacity();
                     } else if (key.matches('l', .{})) {
-                        picker_kind = .bookmarks;
-                        picker_selected = 0;
-                        picker_top = 0;
-                        picker_query.clearRetainingCapacity();
-                        pickerFilter(gpa, .bookmarks, buffers.items, bookmarks.items, recent.items, "", &picker_visible, &picker_hl);
+                        // C-x r l: open (or switch to) the *Bookmarks* —
+                        // the persistent buffer listing every bookmark,
+                        // Emacs's bookmark-bmenu-list (the C-c o / M-l o
+                        // picker is the transient quick-access list; this
+                        // is the full listing). The listing is rebuilt on
+                        // entry, and the window layout otherwise
+                        // untouched.
+                        if (bookmarks_buf_idx) |bb| {
+                            if (bb < buffers.items.len and std.mem.eql(u8, buffers.items[bb].display_name orelse "", "*Bookmarks*")) {
+                                bookmarksRebuild(gpa, bookmarks.items, buffers.items[bb], &bookmarks_rows);
+                                bookmarks_gen = bookmark_list_gen;
+                                recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                                current = bb;
+                                focused.buf_idx = current;
+                                break :key_blk;
+                            }
+                            // The tracked index is stale (the buffer was
+                            // killed) — fall through and create a fresh
+                            // one.
+                            bookmarks_buf_idx = null;
+                        }
+                        const new_buf = try gpa.create(Buffer);
+                        errdefer gpa.destroy(new_buf);
+                        new_buf.* = Buffer.initEmpty();
+                        new_buf.display_name = try gpa.dupe(u8, "*Bookmarks*");
+                        // The listing always truncates: one bookmark per
+                        // row, however long the name.
+                        new_buf.soft_wrap = false;
+                        try buffers.append(gpa, new_buf);
+                        try direds.append(gpa, null);
+                        buffer_list_gen += 1; // the new buffer is listed too
+                        bookmarks_buf_idx = buffers.items.len - 1;
+                        bookmarksRebuild(gpa, bookmarks.items, buffers.items[bookmarks_buf_idx.?], &bookmarks_rows);
+                        bookmarks_gen = bookmark_list_gen;
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                        current = bookmarks_buf_idx.?;
+                        focused.buf_idx = current;
+                        break :key_blk;
                     }
                 } else if (pending_alt_l) {
                     // M-l: the my-jump keymap from the author's Emacs
@@ -7608,7 +7743,7 @@ pub fn main(init: std.process.Init) !void {
                         // abort the prefix
                     } else if (key.matches('o', .{})) {
                         // M-l o: bookmark-jump — the bookmark picker
-                        // (the C-x r l / C-c o favorites list).
+                        // (the C-c o favorites list).
                         picker_kind = .bookmarks;
                         picker_selected = 0;
                         picker_top = 0;
@@ -7837,6 +7972,12 @@ pub fn main(init: std.process.Init) !void {
                         ib == current and std.mem.eql(u8, buffers.items[current].display_name orelse "", "*Ibuffer*")
                     else
                         false;
+                    // The *Bookmarks* buffer (C-x r l), verified the same
+                    // way.
+                    const is_bookmarks = if (bookmarks_buf_idx) |bb|
+                        bb == current and std.mem.eql(u8, buffers.items[current].display_name orelse "", "*Bookmarks*")
+                    else
+                        false;
                     // `editing` is captured BEFORE the dired block runs: it
                     // must describe the buffer this keypress actually acts
                     // on. Opening a file from dired changes `current` mid-
@@ -7845,7 +7986,7 @@ pub fn main(init: std.process.Init) !void {
                     // zero-line dired buffer. The results buffers are
                     // read-only like a dired, so keys they don't consume
                     // (kills) don't corrupt their rows.
-                    const editing = direds.items[current] == null and results_kind == null and !is_ibuffer;
+                    const editing = direds.items[current] == null and results_kind == null and !is_ibuffer and !is_bookmarks;
                     if (results_kind) |rkind| results_blk: {
                         const is_files = rkind == .files;
                         const is_occur = rkind == .occur;
@@ -8146,6 +8287,86 @@ pub fn main(init: std.process.Init) !void {
                             } else {
                                 current = ibufferKillMarked(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo, buf, first_row, true, &ibuffer_buf_idx, &ibuffer_rows, ibuffer_sort, &ibuffer_gen, &status_msg, &status_buf);
                             }
+                            break :key_blk;
+                        } else if (key.matches('<', .{ .alt = true })) {
+                            buf.cursor_row = first_row;
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches('>', .{ .alt = true })) {
+                            buf.cursor_row = last_row;
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches('j', .{ .alt = true })) {
+                            buf.cursor_row = @min(buf.cursor_row + 5, last_row);
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches('k', .{ .alt = true })) {
+                            buf.cursor_row -|= 5;
+                            if (buf.cursor_row < first_row) buf.cursor_row = first_row;
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches('J', .{ .alt = true })) {
+                            buf.cursor_row = @min(buf.cursor_row + (focused_text_height -| 1), last_row);
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches('K', .{ .alt = true })) {
+                            buf.cursor_row -|= focused_text_height -| 1;
+                            if (buf.cursor_row < first_row) buf.cursor_row = first_row;
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches(vaxis.Key.backspace, .{}) or key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.delete, .{})) {
+                            // The table is read-only: deletion keys are
+                            // swallowed rather than corrupting a row.
+                            break :key_blk;
+                        }
+                    } else if (is_bookmarks) {
+                        // The *Bookmarks* (C-x r l, Emacs's
+                        // bookmark-bmenu-list): the persistent buffer
+                        // listing every bookmark. n / p (and arrows / C-n /
+                        // C-p) move between the rows, Enter jumps to the
+                        // row's bookmark in this window (the *Bookmarks*
+                        // stays open, like a dired), and g rebuilds the
+                        // listing. C-s / C-r search the table like any
+                        // buffer. The rows start at line 2, under the
+                        // header and its dashes ruler; the entry at line r
+                        // sits at rows[r - 2]. Every key the list owns
+                        // ends with break :key_blk so the editing keys
+                        // below never also act on the table's lines; keys
+                        // it doesn't bind (C-x, C-s, C-l, ...) fall
+                        // through to the chain below, like a dired.
+                        const first_row: usize = 2;
+                        const last_row = bookmarks_rows.items.len + first_row -| 1;
+                        if (key.matches('g', .{ .ctrl = true }) or key.matches('q', .{})) {
+                            recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                            current = closeBuffer(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo);
+                            bookmarks_buf_idx = null;
+                            break :key_blk;
+                        } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
+                            if (buf.cursor_row < last_row) buf.cursor_row += 1;
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches('p', .{}) or key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
+                            if (buf.cursor_row > first_row) buf.cursor_row -= 1;
+                            buf.cursor_col = 0;
+                            break :key_blk;
+                        } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true }) or key.matches('f', .{})) {
+                            // Enter: jump to the row's bookmark in this
+                            // window. The header, ruler and footer rows are
+                            // not entries — nothing jumps.
+                            if (buf.cursor_row >= first_row and buf.cursor_row <= last_row) {
+                                const bm = bookmarks.items[bookmarks_rows.items[buf.cursor_row - first_row]];
+                                if (bookmarkJump(gpa, io, &buffers, &direds, &recent, bookmarks.items, bm.name)) |idx| {
+                                    recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                                    current = idx;
+                                    focused.buf_idx = idx;
+                                }
+                            }
+                            break :key_blk;
+                        } else if (key.matches('g', .{})) {
+                            // g: rebuild the listing (Emacs
+                            // revert-buffer), keeping the selection.
+                            bookmarksRebuild(gpa, bookmarks.items, buf, &bookmarks_rows);
+                            bookmarks_gen = bookmark_list_gen;
                             break :key_blk;
                         } else if (key.matches('<', .{ .alt = true })) {
                             buf.cursor_row = first_row;
@@ -9132,6 +9353,16 @@ pub fn main(init: std.process.Init) !void {
             if (ib < buffers.items.len and std.mem.eql(u8, buffers.items[ib].display_name orelse "", "*Ibuffer*") and ibuffer_gen != buffer_list_gen) {
                 ibufferRebuild(gpa, buffers.items, direds.items, ib, &ibuffer_rows, ibuffer_sort, null);
                 ibuffer_gen = buffer_list_gen;
+            }
+        }
+
+        // The *Bookmarks*'s rows are bookmark indices, so any bookmark set
+        // or reloaded since the last rebuild has shifted them. Rebuild
+        // the listing before rendering, the same way.
+        if (bookmarks_buf_idx) |bb| {
+            if (bb < buffers.items.len and std.mem.eql(u8, buffers.items[bb].display_name orelse "", "*Bookmarks*") and bookmarks_gen != bookmark_list_gen) {
+                bookmarksRebuild(gpa, bookmarks.items, buffers.items[bb], &bookmarks_rows);
+                bookmarks_gen = bookmark_list_gen;
             }
         }
 

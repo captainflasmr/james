@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.80.0 — <2026-08-16>
+
+=C-x r l= opens the bookmarks in a buffer — a persistent =*Bookmarks*= list like the =*Ibuffer*= — while =C-c o= / =M-l o= stay the fuzzy picker.
+
+- =C-x r l= now opens (or switches to) a =*Bookmarks*= buffer, the persistent sibling of the =C-c o= / =M-l o= bookmark picker, mirroring Emacs's =bookmark-bmenu-list= the same way =C-x C-b= mirrors ibuffer: a table under a header and dashes ruler — the bookmark's name in a 20-wide column (long names eliding with =...=), the bookmarked path taking the rest of the row — with a footer of the total count (=2 bookmarks=). It behaves like any buffer: it stays open in the list, =C-x o= / =C-x b= move around it, and the listing re-reads itself whenever a bookmark is set or reloaded (a =bookmark_list_gen= generation counter, the bookmarks' twin of =buffer_list_gen=), so a row can never be stale. In it, =n= / =p= (arrows too) move, Enter jumps to the row's bookmark in this window (the =*Bookmarks*= stays open, like a dired), =g= re-reads the listing (Emacs =revert-buffer=), =q= / =C-g= closes, and =C-s= / =C-r= search the table like any buffer. The =C-c o= / =M-l o= completing-read picker is untouched — type to filter, Enter jumps — and the =*Bookmarks*= shows in the =*Ibuffer*= as =Bookmarks= mode. The native and =x86_64-windows= cross builds compile.
+
 ** 0.79.0 — <2026-08-15>
 
 The buffer / bookmark / recent-file pickers dock at the bottom of the display icomplete-vertical-style, the dired buffer ends with a visible trailing newline, and the =*Ibuffer*= truncates by default.
