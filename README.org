@@ -34,100 +34,108 @@ Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes 
 
 * Current keybindings
 
-| Keys | Action |
-|---+---|
-| =C-f= =C-b= =C-n= =C-p= / arrows | move right / left / down / up |
-| =C-a= / =C-e= | start / end of line |
-| =M-f= =M-b= | move forward / backward by word |
-| =C-l= | recenter the window on the cursor line (middle, then top, then bottom, cycling) |
-| =C-d= / Delete | delete forward |
-| Backspace | delete backward (or the region, when the mark is set) |
-| Enter / =C-j= | new line |
-| =C-space= | set mark |
-| =M-h= | mark the whole paragraph (block): the region becomes the text between the surrounding blank lines, ready for =M-w= / =C-w= |
-| =C-k= | kill to end of line (or kill the newline, at end of line) |
-| =C-w= | save buffer (=C-x C-s= alias) |
-| =M-w= | copy region (or the current line with its newline, with no mark) |
-| =M-d= / =C-delete= | kill word forward (save to kill ring) |
-| =M-backspace= | kill word backward (save to kill ring) |
-| =C-y= | yank (insert most recent kill) |
-| =M-y= | yank-pop (after a yank, replace it with the next older kill) |
-| =C-s= / =C-r= | incremental search forward / backward |
-| =M-c= | occur: collect the buffer's lines matching a term into an =*occur*= buffer (=n= /=p= move, Enter jumps to the match, =F= follows, =g= re-runs, =q= closes; =M-c= while searching starts from the search string) |
-| =C-/= (or =C-x u=) | undo |
-| =C-g C-/= (or =M-/=) | redo |
-| =C-;= | comment / uncomment the current line (marker guessed from the file extension) |
-| =C-x b= | list open buffers and pick one (type to filter, Enter switches, arrows move, C-g/Esc closes) |
-| =C-x C-b= | open the =*Ibuffer*=, every buffer in an Emacs ibuffer-style table (MRL mark/read-only/lock, name, size, mode and filename columns): =n= /=p= move, Enter opens the row's buffer, =m= /=u= /=U= /=t= mark rows, =X= kills the marked buffers, =s= toggles the sort, =g= re-reads, =q= /=C-g= closes |
-| =C-x C-f= | open or switch to a file by path (status-line prompt) |
-| =C-x d= / =C-x m= | open directory browser (dired) |
-| =C-x g= | re-read the file from disk, discarding in-memory changes |
-| =C-x h= | select the whole buffer (mark at start, point at end) |
-| =C-x l= | toggle scroll lock: the cursor stays on its screen row while the text scrolls under it (Emacs =scroll-lock-mode=) |
-| =C-x r m= | bookmark the current position (name prompt, defaults to the file name; persisted to =~/.james-bookmarks=, =%USERPROFILE%\.james-bookmarks= on Windows) |
-| =C-x r b= | jump to a bookmark |
-| =C-x r l= | list the bookmarks in a buffer (a persistent =*Bookmarks*=, see below) |
-| =C-c o= | pick a bookmark (type to filter, C-s searches, Enter/C-m jumps, arrows move, C-g/Esc closes) |
-| =C-z e= | toggle whitespace markers (Emacs =whitespace-mode=): spaces show as =·=, tabs as =»=, line breaks as =$= at the end of each line, with =[whitespace]= in the modeline while on; per-buffer like soft wrap |
-| =C-z n= | toggle line numbers (Emacs =display-line-numbers-mode=): each line's number in a dim right-aligned gutter — file buffers and direds alike (a dired's header line stays unnumbered, the entries carry 1..N matching the mirror's lines) — with =[linum]= in the modeline while on; per-buffer like soft wrap |
-| =C-c b= | copy the whole buffer to the kill ring |
-| =C-c w= | copy the region and deselect it |
-| =C-c C-k= | close the dired browser |
-| =C-c g= | grep the current directory (ripgrep, with =grep= / =findstr= fallbacks); results open in a =*grep*= buffer where Enter jumps to the match |
-| =C-c f= | find files (a persistent =*files*= buffer like =*grep*=, type to filter, over ripgrep =--files= / =find= / Windows =dir /s /b=) |
-| =C-c j= / =C-c k= | step back / forward through window layouts (winner-mode) |
-| =C-c r= | re-render the whole frame: every cell is repainted, washing out stray characters the terminal has picked up (most noticeable on Windows, where the console can mangle background-tool output); the modeline reports =Display refreshed= so the press is visible |
-| =C-x C-s= | save |
-| =C-x C-c= | quit (asks first if there are unsaved changes) |
-| =C-x j= / =C-x c= | drop out to a real shell (=exit=/=C-d= or =C-z= returns; =C-x j= / =C-x c= resumes) |
-| =C-x T= | open a new native terminal window in the current context's directory (Windows Terminal / =cmd.exe= on Windows, Terminal.app on macOS, the first installed desktop emulator on Linux/BSD) |
-| =C-x E= | reveal the current context in the native file manager — the selected dired entry, the current file, or the working directory (Explorer on Windows, Finder on macOS, the first installed file manager on Linux/BSD — nautilus, thunar, dolphin, nemo, caja, pcmanfm) |
-
+| Keys                 | Action                                                                                                                                                                |
+|----------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| =C-f= =C-b= =C-n=    | move right / left / down / up                                                                                                                                         |
+| =C-p= / arrows       |                                                                                                                                                                       |
+| =C-a= / =C-e=        | start / end of line                                                                                                                                                   |
+| =M-f= =M-b=          | move forward / backward by word                                                                                                                                       |
+| =C-l=                | recenter the window on the cursor line (middle, then top, then bottom, cycling)                                                                                       |
+| =C-d= / Delete       | delete forward                                                                                                                                                        |
+| Backspace            | delete backward (or the region, when the mark is set)                                                                                                                 |
+| Enter / =C-j=        | new line                                                                                                                                                              |
+| =C-space=            | set mark                                                                                                                                                              |
+| =M-h=                | mark the whole paragraph (block): the region becomes the text between the surrounding blank lines, ready for =M-w= / =C-w=                                            |
+| =C-k=                | kill to end of line (or kill the newline, at end of line)                                                                                                             |
+| =C-w=                | save buffer (=C-x C-s= alias)                                                                                                                                         |
+| =M-w=                | copy region (or the current line with its newline, with no mark)                                                                                                      |
+| =M-d= / =C-delete=   | kill word forward (save to kill ring)                                                                                                                                 |
+| =M-backspace=        | kill word backward (save to kill ring)                                                                                                                                |
+| =C-y=                | yank (insert most recent kill)                                                                                                                                        |
+| =M-y=                | yank-pop (after a yank, replace it with the next older kill)                                                                                                          |
+| =C-s= / =C-r=        | incremental search forward / backward                                                                                                                                 |
+| =M-c=                | occur: collect the buffer's lines matching a term into an =*occur*= buffer ( =n= / =p= move, Enter jumps to the match, =F= follows, =g= re-runs, =q= closes; =M-c=    |
+|                      | while searching starts from the search string)                                                                                                                        |
+| =C-/= (or =C-x u=)   | undo                                                                                                                                                                  |
+| =C-g C-/= (or =M-/=) | redo                                                                                                                                                                  |
+| =C-;=                | comment / uncomment the current line (marker guessed from the file extension)                                                                                         |
+| =C-x b=              | list open buffers and pick one (type to filter, Enter switches, arrows move, C-g/Esc closes)                                                                          |
+| =C-x C-b=            | open the =*Ibuffer*=, every buffer in an Emacs ibuffer-style table (MRL mark/read-only/lock, name, size, mode and filename columns): =n= / =p= move, Enter opens the  |
+|                      | row's buffer, =m= / =u= / =U= / =t= mark rows, =X= kills the marked buffers, =s= toggles the sort, =g= re-reads, =q= / =C-g= closes                                   |
+| =C-x C-f=            | open or switch to a file by path (status-line prompt)                                                                                                                 |
+| =C-x d= / =C-x m=    | open directory browser (dired)                                                                                                                                        |
+| =C-x g=              | re-read the file from disk, discarding in-memory changes                                                                                                              |
+| =C-x h=              | select the whole buffer (mark at start, point at end)                                                                                                                 |
+| =C-x l=              | toggle scroll lock: the cursor stays on its screen row while the text scrolls under it (Emacs =scroll-lock-mode=)                                                     |
+| =C-x r m=            | bookmark the current position (name prompt, defaults to the file name; persisted to =~/.james-bookmarks=, =%USERPROFILE%\.james-bookmarks= on Windows)                |
+| =C-x r b=            | jump to a bookmark                                                                                                                                                    |
+| =C-x r l=            | list the bookmarks in a buffer (a persistent =*Bookmarks*=, see below)                                                                                                |
+| =C-c o=              | pick a bookmark (type to filter, C-s searches, Enter/C-m jumps, arrows move, C-g/Esc closes)                                                                          |
+| =C-z e=              | toggle whitespace markers (Emacs =whitespace-mode=): spaces show as =·=, tabs as =»=, line breaks as =$= at the end of each line, with =[whitespace]= in the modeline |
+|                      | while on; per-buffer like soft wrap                                                                                                                                   |
+| =C-z n=              | toggle line numbers (Emacs =display-line-numbers-mode=): each line's number in a dim right-aligned gutter — file buffers and direds alike (a dired's header line      |
+|                      | stays unnumbered, the entries carry 1..N matching the mirror's lines) — with =[linum]= in the modeline while on; per-buffer like soft wrap                            |
+| =C-c b=              | copy the whole buffer to the kill ring                                                                                                                                |
+| =C-c w=              | copy the region and deselect it                                                                                                                                       |
+| =C-c C-k=            | close the dired browser                                                                                                                                               |
+| =C-c g=              | grep the current directory (ripgrep, with =grep= / =findstr= fallbacks); results open in a =*grep*= buffer where Enter jumps to the match                             |
+| =C-c f=              | find files (a persistent =*files*= buffer like =*grep*=, type to filter, over ripgrep =--files= / =find= / Windows =dir /s /b=)                                       |
+| =C-c j= / =C-c k=    | step back / forward through window layouts (winner-mode)                                                                                                              |
+| =C-c r=              | re-render the whole frame: every cell is repainted, washing out stray characters the terminal has picked up (most noticeable on Windows, where the console can mangle |
+|                      | background-tool output); the modeline reports =Display refreshed= so the press is visible                                                                             |
+| =C-x C-s=            | save                                                                                                                                                                  |
+| =C-x C-c=            | quit (asks first if there are unsaved changes)                                                                                                                        |
+| =C-x j= / =C-x c=    | drop out to a real shell (=exit=/=C-d= or =C-z= returns; =C-x j= / =C-x c= resumes)                                                                                   |
+| =C-x T=              | open a new native terminal window in the current context's directory (Windows Terminal / =cmd.exe= on Windows, Terminal.app on macOS, the first installed desktop     |
+|                      | emulator on Linux/BSD)                                                                                                                                                |
+| =C-x E=              | reveal the current context in the native file manager — the selected dired entry, the current file, or the working directory (Explorer on Windows, Finder on macOS,   |
+|                      | the first installed file manager on Linux/BSD — nautilus, thunar, dolphin, nemo, caja, pcmanfm)                                                                       |
 Window keys (mostly aliases of the =C-x= window commands, plus a few extras):
 
-| Keys | Action |
-|---+---|
-| =C-x 2= / =M-m= | split horizontally (stacked) — =M-m= also moves to the new window |
-| =C-x 3= / =M-;= | split vertically (side-by-side) — =M-;= also moves to the new window |
-| =C-x o= / =M-n= | move to the next window (=n= / =p= / =o= repeat after =C-x o=) |
-| =M-o= | jump straight to a window: with two windows it moves across at once, with more each window shows a one-char corner label (=j= =k= =l= =;= =a= =s= =d= =f=, in render order) and the label key jumps there (=C-g= / Esc cancels) |
-| =M-p= | move to the previous window |
-| =C-x 0= / =M-q= / =M-'= | delete the current window |
-| =C-x 1= / =M-a= | collapse back to a single window |
-| =C-x += | balance the window sizes (all windows equal, like Emacs) |
-| =C-M-h= / =C-M-l= | resize the window's width (direction adapts to the window's side, like the author's Emacs) |
-| =C-M-j= / =C-M-k= | resize the window's height (direction adapts to the window's position) |
-| =M-e= | in a file: open dired at the file's directory; in dired: go up a directory |
+| Keys                    | Action                                                                                                                                                               |
+|-------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| =C-x 2= / =M-m=         | split horizontally (stacked) — =M-m= also moves to the new window                                                                                                    |
+| =C-x 3= / =M-;=         | split vertically (side-by-side) — =M-;= also moves to the new window                                                                                                 |
+| =C-x o= / =M-n=         | move to the next window (=n= / =p= / =o= repeat after =C-x o=)                                                                                                       |
+| =M-o=                   | jump straight to a window: with two windows it moves across at once, with more each window shows a one-char corner label (=j= =k= =l= =;= =a= =s= =d= =f=, in render |
+|                         | order) and the label key jumps there (=C-g= / Esc cancels)                                                                                                           |
+| =M-p=                   | move to the previous window                                                                                                                                          |
+| =C-x 0= / =M-q= / =M-'= | delete the current window                                                                                                                                            |
+| =C-x 1= / =M-a=         | collapse back to a single window                                                                                                                                     |
+| =C-x +=                 | balance the window sizes (all windows equal, like Emacs)                                                                                                             |
+| =C-M-h= / =C-M-l=       | resize the window's width (direction adapts to the window's side, like the author's Emacs)                                                                           |
+| =C-M-j= / =C-M-k=       | resize the window's height (direction adapts to the window's position)                                                                                               |
+| =M-e=                   | in a file: open dired at the file's directory; in dired: go up a directory                                                                                           |
 
 Buffer keys:
 
-| Keys | Action |
-|---+---|
-| =M-<= / =M->= | beginning / end of buffer |
-| =M-j= / =M-k= | 5 lines down / up |
-| =M-J= / =M-K= | page down / up (one screenful) |
-| =M-g= | go to a line number (prompt in the modeline) |
-| =M-z= | toggle soft wrap: long lines wrap at the window edge, or truncate (movement steps visual / logical lines) |
-| =C-x k= | kill (close) the current buffer (modified file buffers ask first) |
-| =C-x C-k= | kill region (point to mark) |
+| Keys          | Action                                                                                                    |
+|---------------+-----------------------------------------------------------------------------------------------------------|
+| =M-<= / =M->= | beginning / end of buffer                                                                                 |
+| =M-j= / =M-k= | 5 lines down / up                                                                                         |
+| =M-J= / =M-K= | page down / up (one screenful)                                                                            |
+| =M-g=         | go to a line number (prompt in the modeline)                                                              |
+| =M-z=         | toggle soft wrap: long lines wrap at the window edge, or truncate (movement steps visual / logical lines) |
+| =C-x k=       | kill (close) the current buffer (modified file buffers ask first)                                         |
+| =C-x C-k=     | kill region (point to mark)                                                                               |
 
 Jump keys (the =my-jump-keymap= prefix from the author's Emacs setup: =M-l=, then a key):
 
-| Keys | Action |
-|---+---|
-| =M-l b= | jump to =~/bin= |
-| =M-l d= | jump to the Downloads directory (=%USERPROFILE%\Downloads= on Windows, =~/Downloads= elsewhere) |
-| =M-l g= | jump to the config directory (=%APPDATA%= on Windows, =~/.config= elsewhere) |
-| =M-l h= | jump to the home directory (=%USERPROFILE%= on Windows, =~= elsewhere) |
-| =M-l i= | jump to =~/.emacs.d/Emacs-vanilla= |
-| =M-l l= | pick a recently opened file (fuzzy picker over =~/.james-recent=, my/fido-recentf) |
-| =M-l o= | pick a bookmark and jump (the C-c o picker) |
-| =M-l r= | switch to the scratch buffer (=scratch.txt=, created if missing) |
-| =M-l s= | jump to =~/source= |
-| =M-l y= | jump to =~/.emacs.d/Emacs-DIYer= |
-| =M-l == | open a new tab at the right end of the tab set (numbered tabs; see below) |
-| =M-l -= | close the current tab |
-| =C-g= / Esc | cancel the =M-l= prefix |
+| Keys        | Action                                                                                          |
+|-------------+-------------------------------------------------------------------------------------------------|
+| =M-l b=     | jump to =~/bin=                                                                                 |
+| =M-l d=     | jump to the Downloads directory (=%USERPROFILE%\Downloads= on Windows, =~/Downloads= elsewhere) |
+| =M-l g=     | jump to the config directory (=%APPDATA%= on Windows, =~/.config= elsewhere)                    |
+| =M-l h=     | jump to the home directory (=%USERPROFILE%= on Windows, =~= elsewhere)                          |
+| =M-l i=     | jump to =~/.emacs.d/Emacs-vanilla=                                                              |
+| =M-l l=     | pick a recently opened file (fuzzy picker over =~/.james-recent=, my/fido-recentf)              |
+| =M-l o=     | pick a bookmark and jump (the C-c o picker)                                                     |
+| =M-l r=     | switch to the scratch buffer (=scratch.txt=, created if missing)                                |
+| =M-l s=     | jump to =~/source=                                                                              |
+| =M-l y=     | jump to =~/.emacs.d/Emacs-DIYer=                                                                |
+| =M-l ==     | open a new tab at the right end of the tab set (numbered tabs; see below)                       |
+| =M-l -=     | close the current tab                                                                           |
+| =C-g= / Esc | cancel the =M-l= prefix                                                                         |
 
 The path resolution mirrors the elisp's =system-type= checks exactly: on Windows =M-l d= consults =%USERPROFILE%\Downloads= (with the =~/Downloads= fallback), =M-l g= consults =%APPDATA%= (with the =~/AppData/Roaming= fallback), and =M-l h= consults =%USERPROFILE%=; elsewhere they are plain =~/Downloads=, =~/.config= and =~=. A jump that can't be opened (a missing =~/bin=, say) just leaves the window alone, and every jump is recorded in the winner-mode history, so =C-c j= steps back out of it.
 
