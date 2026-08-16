@@ -9001,10 +9001,13 @@ pub fn main(init: std.process.Init) !void {
         // recenter and wrap within the right window.
         focused_text_height = text_height;
         focused_text_width = body.width;
-        // Dired, isearch and the picker are not modal: they render inside
-        // whichever pane they apply to, leaving the window layout
-        // untouched. Only the prompt-style modes take over the whole
-        // screen.
+        // Dired, isearch, the picker and the prompt-style confirmations
+        // all render inside whichever pane they apply to, leaving the
+        // window layout untouched — a quit / kill prompt shows in the
+        // focused pane's modeline rather than taking over the screen.
+        // `is_modal` still gates the single-pane dired path below (a
+        // prompt renders through the normal buffer renderer, not the
+        // dired one).
         const is_modal = confirming_quit or confirming_kill or confirming_ibuffer_kill;
 
         const search_view: ?IsearchView = if (isearch_active)
@@ -9132,7 +9135,36 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        if (!is_modal and !root.isLeaf()) {
+        // The modal prompt (quit / kill confirmations) renders through the
+        // focused pane's status slot, so the split layout stays put while
+        // the question is up. Computed into the status scratch here; the
+        // single-pane path below recomputes the same text for its own
+        // modeline.
+        const modal_status: ?[]const u8 = if (is_modal) blk: {
+            if (confirming_quit) {
+                if (buf.dirty and buf.filename != null) {
+                    const n = std.fmt.bufPrint(&status_buf, "Save file {s} before exiting? (y / n / C-g cancels)", .{buf.filename orelse "?"}) catch break :blk null;
+                    break :blk status_buf[0..n.len];
+                }
+                break :blk "Really quit james? (y / n / C-g cancels)";
+            }
+            if (confirming_kill) {
+                const n = std.fmt.bufPrint(&status_buf, "Save file {s} before killing? (y / n / C-g cancels)", .{buf.filename orelse "?"}) catch break :blk null;
+                break :blk status_buf[0..n.len];
+            }
+            if (confirming_ibuffer_kill) {
+                var n_dirty: usize = 0;
+                for (ibuffer_rows.items, 0..) |bi, r| {
+                    const line: []u8 = buf.lines.items[r + 2].items;
+                    if (line.len > 1 and line[1] == '*' and buffers.items[bi].dirty and buffers.items[bi].filename != null) n_dirty += 1;
+                }
+                const n = std.fmt.bufPrint(&status_buf, "Kill the marked buffers, {d} modified without saving? (y kills them, n keeps them, C-g cancels)", .{n_dirty}) catch break :blk null;
+                break :blk status_buf[0..n.len];
+            }
+            break :blk null;
+        } else null;
+
+        if (!root.isLeaf()) {
             var modeline_bufs: [MAX_PANES][2048]u8 = undefined;
             var slot_counter: usize = 0;
             if (picker_view) |pv| {
@@ -9144,7 +9176,7 @@ pub fn main(init: std.process.Init) !void {
                 const panes_h = body.height -| ph;
                 if (panes_h >= 1) {
                     const panes_win = body.child(.{ .x_off = 0, .y_off = 0, .width = body.width, .height = panes_h });
-                    renderTree(panes_win, &frame_allocs, gpa, root, 0, 0, panes_win.width, panes_h, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, io, picker_view, bookmarks.items, recent.items, pending_alt_o, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+                    renderTree(panes_win, &frame_allocs, gpa, root, 0, 0, panes_win.width, panes_h, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, io, picker_view, bookmarks.items, recent.items, pending_alt_o, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, (modal_status orelse status_msg), &focused_text_height, &focused_text_width);
                 }
                 if (ph >= 1) {
                     const picker_win = body.child(.{ .x_off = 0, .y_off = panes_h, .width = body.width, .height = ph });
@@ -9152,7 +9184,7 @@ pub fn main(init: std.process.Init) !void {
                     renderPicker(picker_win, io, pv, buffers.items, bookmarks.items, recent.items, &picker_ml_buf, search_view);
                 }
             } else {
-                renderTree(body, &frame_allocs, gpa, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, io, picker_view, bookmarks.items, recent.items, pending_alt_o, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, status_msg, &focused_text_height, &focused_text_width);
+                renderTree(body, &frame_allocs, gpa, root, 0, 0, body.width, body.height, &modeline_bufs, &slot_counter, buffers.items, direds.items, focused, io, picker_view, bookmarks.items, recent.items, pending_alt_o, find_file_view, bookmark_prompt_view, goto_prompt_view, grep_prompt_view, grep_view, files_view, occur_view, grep_hl_view, search_view, replace_view, compress_menu_view, archive_query_view, dired_prompt_view, (modal_status orelse status_msg), &focused_text_height, &focused_text_width);
             }
             try vx.render(tty.writer());
             frame_allocs.reset();
