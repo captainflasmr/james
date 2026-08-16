@@ -2277,6 +2277,42 @@ fn shellForegroundPgrp(tty: *vaxis.Tty) ?std.posix.pid_t {
     return std.posix.tcgetpgrp(tty.fd.handle) catch null;
 }
 
+/// True when james's parent process is running a one-shot command — the
+/// shape a .desktop launch with Terminal=true takes. The desktop
+/// environment opens a terminal whose shell runs the Exec line via
+/// `sh -c "..."` (and even when that shell `exec`s james, the terminal's
+/// own argv still carries the `sh -c ...` it was told to run). A `-c` in
+/// the parent's argv is the mark: quitting then kills that parent so the
+/// terminal closes with the editor. An interactive `james` typed at your
+/// own shell prompt has no such flag — the shell is long-lived and
+/// interactive — so it's left alone. Linux-only: /proc is the source, so
+/// on other platforms this returns false (the JAMES_KILL_PARENT_ON_EXIT
+/// env var remains the opt-in there).
+fn parentLaunchedViaDashC(io: std.Io) bool {
+    if (comptime builtin.os.tag != .linux) return false;
+    const ppid = std.posix.getppid();
+    if (ppid <= 1) return false;
+    var path_buf: [32]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cmdline", .{ppid}) catch return false;
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+    defer file.close(io);
+    // /proc/<pid>/cmdline reports st_size = 0, so the Io Dir.readFileAlloc
+    // helper (which pre-sizes from fstat) reads nothing. A streaming read
+    // asks the kernel directly and gets the real bytes; the argv is small
+    // (a single page on Linux), so one read into a fixed buffer is enough.
+    var data: [4096]u8 = undefined;
+    const n = file.readStreaming(io, &[_][]u8{data[0..]}) catch return false;
+    // /proc/<pid>/cmdline is the argv, NUL-separated, with a trailing NUL.
+    var it = std.mem.splitScalar(u8, data[0..n], 0);
+    while (it.next()) |arg| {
+        if (arg.len < 2) continue;
+        if (arg[0] != '-') continue;
+        if (arg[1] == '-') continue; // long option (e.g. --login)
+        if (std.mem.indexOfScalar(u8, arg, 'c') != null) return true;
+    }
+    return false;
+}
+
 // --- Windows console input flush ----------------------------------------
 //
 // loop.stop() wakes the input thread by sending a Device Status Report
@@ -3602,9 +3638,15 @@ fn sizeWatchdogMain(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event), proc_
 }
 
 fn armSizeWatchdog(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event), proc_current: *std.atomic.Value(?*ProcRun)) void {
-    // The future is deliberately dropped: its thread runs for the life of
-    // the editor, and the dropped wrapper keeps the context alive.
-    _ = io.concurrent(sizeWatchdogMain, .{ io, tty, loop, proc_current }) catch {};
+    // Spawned as a detached raw thread rather than via io.concurrent: the
+    // runtime joins io.concurrent workers at process exit (Threaded.deinit),
+    // and this thread's io.sleep would deadlock that join once the io event
+    // loop stops pumping during shutdown. A detached thread is killed when
+    // the process exits instead, so the editor can actually terminate. The
+    // thread holds no locks across the C-x j fork (spawn does no allocation
+    // between fork and exec), so the shell swap stays safe.
+    const t = std.Thread.spawn(.{}, sizeWatchdogMain, .{ io, tty, loop, proc_current }) catch return;
+    t.detach();
 }
 
 /// Render one dired listing plus its own compact modeline into `win`, which
@@ -5542,13 +5584,24 @@ pub fn main(init: std.process.Init) !void {
     // When launched from a .desktop file with Terminal=true (e.g. via
     // rofi drun or a similar launcher), the desktop environment opens a
     // terminal whose shell runs james. On quit that shell is the blank
-    // remnant left behind — killing it closes the terminal window. Gated
-    // by an env var so an interactive `james` from your own shell never
-    // touches it; only the .desktop launch sets the var.
+    // remnant left behind — killing it closes the terminal window. The
+    // env var below is the explicit opt-in; parentLaunchedViaDashC
+    // auto-detects the same condition from the parent's argv, so a
+    // .desktop with a plain `Exec=.../james` (no env var) still closes
+    // its terminal on quit. An interactive `james` from your own shell
+    // is left alone either way.
     const kill_parent_on_exit = blk: {
+        // Explicit opt-in still wins, for setups the auto-detect below
+        // doesn't cover (a terminal that execs james with no shell in
+        // the chain, or a non-Linux platform).
         if (init.environ_map.get("JAMES_KILL_PARENT_ON_EXIT")) |v| {
             if (std.mem.eql(u8, v, "1")) break :blk true;
         }
+        // Otherwise auto-detect: a .desktop launch (Terminal=true) runs
+        // james through a non-interactive `sh -c "..."` shell, so a `-c`
+        // in the parent's argv marks it. An interactive `james` typed
+        // at your own shell prompt has no such flag and is left alone.
+        if (parentLaunchedViaDashC(io)) break :blk true;
         break :blk false;
     };
     defer if (comptime builtin.os.tag != .windows) {
@@ -6233,12 +6286,20 @@ pub fn main(init: std.process.Init) !void {
                         // scratch buffer has nothing to save; the catch
                         // below is the error.NoFilename path.
                         buf.save(gpa, io) catch {};
+                        // Stop the input thread before returning: the
+                        // runtime joins io.concurrent workers at process
+                        // exit, and the input thread's read would otherwise
+                        // block that join forever (the editor would tear
+                        // down its screen but never exit). The terminal is
+                        // alive here, so the DSR wakes the thread cleanly.
+                        loop.stop();
                         return;
                     } else if (key.matches('n', .{}) or key.matches('N', .{})) {
                         // n: quit without saving a modified file buffer —
                         // but when there's nothing at stake, treat it as
                         // "don't quit" and cancel.
                         if (buf.dirty and buf.filename != null) {
+                            loop.stop();
                             return;
                         }
                         confirming_quit = false;
