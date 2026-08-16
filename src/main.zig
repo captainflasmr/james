@@ -85,6 +85,13 @@ const Event = union(enum) {
     /// The terminal's answer to an OSC 52 clipboard request; the text is
     /// allocated with gpa and must be freed by the handler.
     paste: []const u8,
+    /// The terminal this instance ran in is gone (its window closed, or
+    /// the pty master was closed): posted by the size watchdog when the
+    /// tty's ioctl keeps failing, so the editor exits instead of
+    /// lingering forever as an orphan. No cleanup can reach the terminal
+    /// anymore — the defers below restore what they can and the rest
+    /// fails silently.
+    terminal_gone,
     /// A background grep / find made progress — posted by the worker as
     /// its output grows, and by the size watchdog every ~100ms while a
     /// run is active so the modeline's spinner ticks even when the tool
@@ -3551,8 +3558,21 @@ fn syncClipboard(vx: *vaxis.Vaxis, tty: *vaxis.Tty, gpa: std.mem.Allocator, kill
 // queue critical section would deadlock on it. The thread holds no
 // locks across the editor's fork for the C-x j shell (spawn does no
 // allocation between fork and exec), so the swap stays safe too.
+//
+// The same ioctl doubles as a death watch: when the terminal's window
+// closes, the pty master dies and TIOCGWINSZ on the slave starts
+// returning EIO (verified on Linux). The winsize check then fails every
+// tick, and after a few consecutive failures the watchdog posts
+// .terminal_gone so the main loop exits — without it, an editor whose
+// terminal vanished would sit blocked on an input read forever, an
+// orphan nobody can reach. Consecutive failures rather than one: a
+// single transient error (a console API hiccup on Windows, say) must
+// not kill a live session.
 fn sizeWatchdogMain(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event), proc_current: *std.atomic.Value(?*ProcRun)) void {
     var last: vaxis.Winsize = tty.getWinsize() catch std.mem.zeroes(vaxis.Winsize);
+    // Consecutive tty-ioctl failures; the terminal is declared gone
+    // once it passes the threshold below (5 ticks = 500ms).
+    var ioctl_failures: u8 = 0;
     while (true) {
         io.sleep(std.Io.Duration.fromMilliseconds(100), .real) catch continue;
         // The running-search heartbeat: a tick keeps the live status
@@ -3561,7 +3581,16 @@ fn sizeWatchdogMain(io: std.Io, tty: *vaxis.Tty, loop: *vaxis.Loop(Event), proc_
         if (proc_current.load(.acquire)) |run| {
             _ = loop.tryPostEvent(.{ .proc_progress = run }) catch {};
         }
-        const ws = tty.getWinsize() catch continue;
+        const ws = tty.getWinsize() catch {
+            ioctl_failures += 1;
+            if (ioctl_failures >= 5) {
+                // The terminal is gone: wake the main loop so the
+                // editor exits instead of waiting on input forever.
+                _ = loop.tryPostEvent(.{ .terminal_gone = {} }) catch {};
+            }
+            continue;
+        };
+        ioctl_failures = 0;
         if (ws.cols == 0 or ws.rows == 0) continue;
         if (last.cols == ws.cols and last.rows == ws.rows) continue;
         // Only remember the size if the event actually got posted, so a
@@ -4084,7 +4113,7 @@ const welcome_tail =
     \\  C-x — files, buffers and windows:
     \\
     \\    C-x C-s             save the buffer (C-w saves too)
-    \\    C-x C-c             quit (asks first if modified)
+    \\    C-x C-c             quit (asks first; saves a modified file)
     \\    C-x u               undo
     \\    C-x k               kill the current buffer
     \\    C-x C-f             open or create a file
@@ -5981,6 +6010,13 @@ pub fn main(init: std.process.Init) !void {
                     last_winsize = real;
                 }
             },
+            .terminal_gone => {
+                // The watchdog gave up on the tty (see sizeWatchdogMain):
+                // the terminal is gone, so no key will ever come. Exit
+                // and let the defers put the terminal back — writes to
+                // the dead pty just fail silently.
+                return;
+            },
             .focus_out => {
                 // A focus change can swallow a key-up: Alt+Tab while
                 // holding Alt leaves Windows ConPTY without the Alt
@@ -6193,10 +6229,19 @@ pub fn main(init: std.process.Init) !void {
 
                 if (confirming_quit) {
                     if (key.matches('y', .{}) or key.matches('Y', .{})) {
+                        // y: save a modified file buffer, then quit. A
+                        // scratch buffer has nothing to save; the catch
+                        // below is the error.NoFilename path.
                         buf.save(gpa, io) catch {};
                         return;
                     } else if (key.matches('n', .{}) or key.matches('N', .{})) {
-                        return;
+                        // n: quit without saving a modified file buffer —
+                        // but when there's nothing at stake, treat it as
+                        // "don't quit" and cancel.
+                        if (buf.dirty and buf.filename != null) {
+                            return;
+                        }
+                        confirming_quit = false;
                     } else if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                         confirming_quit = false;
                     }
@@ -7247,13 +7292,10 @@ pub fn main(init: std.process.Init) !void {
                         };
                         refreshBookmarksAfterSave(gpa, io, init.environ_map, &bookmarks, buf);
                     } else if (key.matches('c', .{ .ctrl = true })) {
-                        // Buffers with no backing file (the home screen) are
-                        // scratch space — quitting them never prompts.
-                        if (buf.dirty and buf.filename != null) {
-                            confirming_quit = true;
-                        } else {
-                            return;
-                        }
+                        // Quit always asks first: a modified file buffer
+                        // prompts to save it, anything else just
+                        // confirms. C-g cancels either way.
+                        confirming_quit = true;
                     } else if (key.matches('u', .{}) or key.matches('u', .{ .ctrl = true })) {
                         buf.undo(gpa);
                     } else if (key.matches('b', .{})) {
@@ -9202,7 +9244,12 @@ pub fn main(init: std.process.Init) !void {
         var count_buf: [32]u8 = undefined;
 
         const ml: PromptModeline = if (confirming_quit)
-            fillPromptModeline(&modeline_buf, "Save file {s} before exiting? (y / n / C-g cancels)", .{buf.filename orelse "?"}, "")
+            // A modified file buffer asks to save it; a clean or scratch
+            // buffer just confirms the quit.
+            (if (buf.dirty and buf.filename != null)
+                fillPromptModeline(&modeline_buf, "Save file {s} before exiting? (y / n / C-g cancels)", .{buf.filename orelse "?"}, "")
+            else
+                fillPromptModeline(&modeline_buf, "Really quit james? (y / n / C-g cancels)", .{}, ""))
         else if (confirming_kill)
             fillPromptModeline(&modeline_buf, "Save file {s} before killing? (y / n / C-g cancels)", .{buf.filename orelse "?"}, "")
         else if (confirming_ibuffer_kill) blk: {
