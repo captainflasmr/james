@@ -8,3 +8,13 @@
 This document contains the current bugs/improvements, this is just for me mainly but does include any Issues reported.
 
 * Bugs/Improvements
+
+** TODO async for file copy
+
+** TODO "g" in file search enters a key
+
+** TODO regex search in file search
+
+** TODO add C-x C-w to write to new buffer
+
+** TODO Allow *files* to be saved to a buffer
