@@ -30,30 +30,21 @@ if (-not (Test-Path $ShortcutPath)) {
 }
 $full = (Resolve-Path $ShortcutPath).Path
 
-# The COM interfaces and structs needed to reach the shortcut's property
-# store. IShellLinkW is declared empty because we never call its methods —
-# we only CoCreateInstance it, then QueryInterface for IPersistFile (to load
-# and save the .lnk) and IPropertyStore (to write the AppUserModel_ID key).
-Add-Type @"
+# All COM interop lives in the C# block below — PowerShell's
+# [IPersistFile]$obj cast does a .NET type conversion, not a COM
+# QueryInterface, so it fails on an RCW with "Cannot convert". In C# the
+# CLR's cast operator does QueryInterface automatically, so the casts
+# (IPersistFile)shellLink and (IPropertyStore)shellLink work correctly.
+if (-not ([System.Management.Automation.PSTypeName]'AppIdSetter').Type) {
+    Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 
-[StructLayout(LayoutKind.Sequential, Pack = 4)]
-public struct PROPERTYKEY { public Guid fmtid; public int pid; }
-
-[StructLayout(LayoutKind.Explicit, Size = 16)]
-public struct PROPVARIANT {
-    [FieldOffset(0)] public ushort vt;
-    [FieldOffset(8)] public IntPtr pwszVal;
-    public void SetString(string s) { vt = 31; pwszVal = Marshal.StringToCoTaskMemUni(s); }
-    public void Clear() { if (vt == 31 && pwszVal != IntPtr.Zero) Marshal.FreeCoTaskMem(pwszVal); vt = 0; pwszVal = IntPtr.Zero; }
-}
-
 [ComImport, Guid("00021401-0000-0000-C000-000000000046"), ClassInterface(ClassInterfaceType.None)]
-public class ShellLink { }
+class ShellLink { }
 
 [ComImport, Guid("0000010B-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-public interface IPersistFile {
+interface IPersistFile {
     void GetClassID(out Guid pClassID);
     [PreserveSig] int IsDirty();
     void Load([In, MarshalAs(UnmanagedType.LPWStr)] string pszFileName, uint dwMode);
@@ -62,37 +53,55 @@ public interface IPersistFile {
     void GetCurFile([Out, MarshalAs(UnmanagedType.LPWStr)] out string ppszFileName);
 }
 
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
+struct PROPERTYKEY { public Guid fmtid; public int pid; }
+
+[StructLayout(LayoutKind.Explicit, Size = 16)]
+struct PROPVARIANT {
+    [FieldOffset(0)] public ushort vt;
+    [FieldOffset(8)] public IntPtr pwszVal;
+}
+
 [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-public interface IPropertyStore {
-    uint GetCount(out uint cProps);
-    uint GetAt(uint i, out PROPERTYKEY pkey);
-    uint GetValue(ref PROPERTYKEY key, out PROPVARIANT pv);
-    uint SetValue(ref PROPERTYKEY key, ref PROPVARIANT pv);
-    uint Commit();
+interface IPropertyStore {
+    void GetCount(out uint cProps);
+    void GetAt(uint i, out PROPERTYKEY pkey);
+    void GetValue(ref PROPERTYKEY key, out PROPVARIANT pv);
+    void SetValue(ref PROPERTYKEY key, ref PROPVARIANT pv);
+    void Commit();
+}
+
+public static class AppIdSetter {
+    public static void Set(string shortcutPath, string appId) {
+        var shellLink = new ShellLink();
+        var pf = (IPersistFile)shellLink;
+        pf.Load(shortcutPath, 0);   // STGM_READ = 0
+
+        var ps = (IPropertyStore)shellLink;
+        var key = new PROPERTYKEY {
+            fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"),
+            pid   = 5
+        };
+        // VT_LPWSTR = 31; the CLR marshals the IntPtr as a raw pointer,
+        // so we allocate the native string ourselves and free it after
+        // SetValue copies it into the property store.
+        var pv = new PROPVARIANT {
+            vt      = 31,
+            pwszVal = Marshal.StringToCoTaskMemUni(appId)
+        };
+        try {
+            ps.SetValue(ref key, ref pv);
+            ps.Commit();
+        } finally {
+            if (pv.pwszVal != IntPtr.Zero) Marshal.FreeCoTaskMem(pv.pwszVal);
+        }
+        pf.Save(shortcutPath, true);
+    }
 }
 "@
-
-# PKEY_AppUserModel_ID = {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, pid 5
-$key = New-Object PROPERTYKEY
-$key.fmtid = [Guid]"9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"
-$key.pid   = 5
-
-$link  = New-Object ShellLink
-$pf    = [IPersistFile]$link
-$pf.Load($full, 0)            # STGM_READ
-
-$ps    = [IPropertyStore]$link
-$pv    = New-Object PROPVARIANT
-$pv.SetString($AppId)
-$hr = $ps.SetValue([ref]$key, [ref]$pv)
-if ($hr -ne 0) {
-    $pv.Clear()
-    throw "IPropertyStore::SetValue failed: 0x$($hr.ToString('X8'))"
 }
-$ps.Commit() | Out-Null
-$pv.Clear()
 
-$pf.Save($full, $true)        # fRemember — persist back to the same .lnk
+[AppIdSetter]::Set($full, $AppId)
 
 Write-Host "Set AppUserModel.ID = '$AppId' on $full"
 Write-Host "Unpin and re-pin the shortcut so the taskbar picks up the new ID."
