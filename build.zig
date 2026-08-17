@@ -39,9 +39,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
     // The native Win32 clipboard API (the console's OSC 52 support is
-    // spotty), used only on Windows.
+    // spotty), plus SetCurrentProcessExplicitAppUserModelID for taskbar
+    // grouping — used only on Windows.
     if (target.result.os.tag == .windows) {
         exe.root_module.linkSystemLibrary("user32", .{});
+        exe.root_module.linkSystemLibrary("shell32", .{});
     }
 
     // The welcome screen's version line: the newest CHANGELOG.org entry

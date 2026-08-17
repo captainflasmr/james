@@ -32,6 +32,18 @@ zig build   # native, already ReleaseSmall and stripped
 
 Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes to its own folder (=zig-out/windows/=, =zig-out/macos/=, =zig-out/linux/=) so it never overwrites the native binary — running one of those on the wrong host fails with an "exec format error". Use =-p some/dir= to override the output folder.
 
+* Pinning to the Windows taskbar
+
+Windows groups taskbar buttons by an =AppUserModelID=: a string the running process reports, and that a pinned =.lnk= shortcut can carry. When the two don't match, launching a pinned terminal app spawns a *separate* button at the end of the taskbar (a =cmd.exe= button, since the console host is what Windows sees) instead of grouping under the pinned one — so =Super+1= / =Super+2= / =...= no longer activates it. james fixes this by calling =SetCurrentProcessExplicitAppUserModelID(L"JamesDyer.James")= at the top of =main()= (in =src/main.zig=, gated on =builtin.os.tag == .windows=) before anything creates a window, and linking =shell32= in =build.zig=.
+
+That's only half of it: the pinned =.lnk= must carry the *same* ID, or the running process still won't group under it. Create a shortcut to =james.exe= (right-click the =.exe= → *Create shortcut*, or drag it while holding Alt), give it an icon via *Properties* → *Change Icon...*, then stamp it with the matching ID using the bundled =set-appid.ps1=:
+
+#+begin_src powershell
+powershell -ExecutionPolicy Bypass -File set-appid.ps1 path\to\james.lnk
+#+end_src
+
+The script reaches the shortcut's property store via =IShellLinkW= + =IPersistFile= + =IPropertyStore= (the canonical path the Windows Shell docs document for =AppUserModel_ID=), writes =JamesDyer.James=, and saves the =.lnk= back. Then unpin and re-pin the shortcut so the taskbar picks up the new ID — after that, launching james groups its running button under the pinned one, and =Super+N= activates it. If you change the AppID string in =src/main.zig=, pass the same string to =set-appid.ps1= with =-AppId=, or the two sides will drift and the grouping breaks again.
+
 * Current keybindings
 
 | Keys                 | Action                                                                                                                                                                |

@@ -3513,6 +3513,13 @@ extern "kernel32" fn GlobalUnlock(hMem: windows.HANDLE) callconv(.winapi) window
 extern "kernel32" fn GlobalFree(hMem: windows.HANDLE) callconv(.winapi) ?windows.HANDLE;
 extern "kernel32" fn GlobalSize(hMem: windows.HANDLE) callconv(.winapi) usize;
 
+// Tags the running process with an explicit AppUserModelID so Windows
+// groups its taskbar button with the pinned shortcut that shares the ID
+// (and Super+N activates it), instead of spawning a separate cmd.exe
+// button at the end of the taskbar. The HRESULT return is ignored: a
+// failure leaves the default grouping, which is no worse than before.
+extern "shell32" fn SetCurrentProcessExplicitAppUserModelID(appID: [*:0]const u16) callconv(.winapi) i32;
+
 /// Put `text` on the Win32 clipboard as CF_UNICODETEXT. The clipboard
 /// owns the allocated block once SetClipboardData succeeds; on any
 /// failure the block is freed here. Returns whether the clipboard was
@@ -5600,6 +5607,16 @@ fn fixupSnapshot(snap: *WindowSnapshot, removed: usize, len: usize) void {
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
+
+    // Tag the process with an explicit AppUserModelID before anything
+    // creates a window, so Windows groups the running button with the
+    // pinned shortcut that shares the ID (Super+N then activates it)
+    // instead of showing a separate cmd.exe button at the end of the
+    // taskbar. The .lnk shortcut must set the same ID — see README.org.
+    if (comptime builtin.os.tag == .windows) {
+        const app_id = std.unicode.utf8ToUtf16LeStringLiteral("JamesDyer.James");
+        _ = SetCurrentProcessExplicitAppUserModelID(app_id);
+    }
 
     // Every non-program argument is a file to open as its own buffer.
     var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
