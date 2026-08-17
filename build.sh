@@ -117,6 +117,17 @@ build_one() {
     else
         echo "  -> zig-out/bin/$bin_name"
     fi
+
+    # Generate a .lnk shortcut with the matching AppUserModelID baked
+    # in, so Windows groups the running button with the pinned shortcut
+    # (Super+N activates it). The .lnk uses a relative target path, so
+    # it works wherever james.exe + james.lnk are copied together.
+    if [[ "$name" == "windows" ]]; then
+        local lnk_path="${prefix:-zig-out}/bin/james.lnk"
+        zig run tools/make-lnk.zig -- "$lnk_path" "james.exe" "james.exe" "JamesDyer.James"
+        echo "  -> $lnk_path"
+    fi
+
     echo ""
 }
 
@@ -133,6 +144,9 @@ case "$TARGET" in
                 ls -lh "$bin" | awk -v t="$t" '{printf "  %-8s %s %s\n", t, $5, $9}'
             else
                 printf "  %-8s (missing)\n" "$t"
+            fi
+            if [[ "$t" == "windows" ]] && [[ -f "zig-out/$t/bin/james.lnk" ]]; then
+                ls -lh "zig-out/$t/bin/james.lnk" | awk '{printf "  %-8s %s %s\n", "lnk", $5, $9}'
             fi
         done
         ;;
