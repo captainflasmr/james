@@ -232,6 +232,47 @@ pub fn save(self: *Buffer, gpa: std.mem.Allocator, io: std.Io) !void {
     self.dirty = false;
 }
 
+/// C-x C-w: write the buffer's text to `path` (Emacs write-file), then
+/// make the buffer visit that file — the path becomes its filename, so a
+/// later C-x C-s saves there from now on. The write is atomic like save:
+/// the text goes to a temp beside the target, then renames over it, so an
+/// existing file is replaced without the risk of a torn write.
+pub fn saveAs(self: *Buffer, gpa: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    // The new target is visited by this buffer, so it is never a symbolic
+    // link this save follows — keep the path as typed.
+    const new_path = try gpa.dupe(u8, path);
+    errdefer gpa.free(new_path);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const br = if (self.eol == .crlf) "\r\n" else "\n";
+    for (self.lines.items, 0..) |line, i| {
+        try out.appendSlice(gpa, line.items);
+        if (i != self.lines.items.len - 1) try out.appendSlice(gpa, br);
+    }
+    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.james-tmp", .{path});
+    defer gpa.free(tmp_path);
+    const f = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+    errdefer {
+        f.close(io);
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    }
+    try f.writeStreamingAll(io, out.items);
+    if (std.Io.Dir.cwd().statFile(io, path, .{})) |st| {
+        f.setPermissions(io, st.permissions) catch {};
+    } else |_| {}
+    f.sync(io) catch {};
+    f.close(io);
+    std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, io) catch |err| {
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        return err;
+    };
+    if (self.filename) |old| gpa.free(old);
+    if (self.display_name) |old_dn| gpa.free(old_dn);
+    self.filename = new_path;
+    self.display_name = null;
+    self.dirty = false;
+}
+
 fn cloneLines(self: Buffer, gpa: std.mem.Allocator) !std.ArrayList(std.ArrayList(u8)) {
     var out: std.ArrayList(std.ArrayList(u8)) = .empty;
     errdefer {

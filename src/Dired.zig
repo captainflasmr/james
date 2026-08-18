@@ -503,8 +503,8 @@ const Atom = struct {
 /// \| alternation (a bare ( ) | is a literal, so names containing them
 /// are matchable), ^ $ anchors, and the escapes \d \D \w \W \s \S plus
 /// any escaped literal. A simple backtracking match — no
-/// backreferences.
-fn regexMatch(s: []const u8, pat: []const u8) bool {
+/// backreferences. Also used by the *files* buffer's regexp filter (M-r).
+pub fn regexMatch(s: []const u8, pat: []const u8) bool {
     const anchored = pat.len > 0 and pat[0] == '^';
     var i: usize = 0;
     while (i <= s.len) : (i += 1) {

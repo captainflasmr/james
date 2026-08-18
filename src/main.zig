@@ -797,8 +797,10 @@ const DiredPromptView = struct {
 /// An in-pane find-file prompt (C-x C-f): the current buffer stays in its
 /// window and the path prompt appears in that pane's modeline, so the
 /// layout never changes — the same shape as the isearch and dired prompts.
+/// The write-file prompt (C-x C-w) reuses it with a different label.
 const FindFileView = struct {
     query: []const u8,
+    label: []const u8,
 };
 
 /// The bookmark name prompt (C-x r m) / jump prompt (C-x r b) rendered
@@ -1067,7 +1069,7 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, gpa: std.mem.Allocator, bu
     }
 
     const ml: PromptModeline = if (find_file) |f|
-        fillPromptModeline(modeline_buf, "Find file: ", .{}, f.query)
+        fillPromptModeline(modeline_buf, "{s}", .{f.label}, f.query)
     else if (bookmark_prompt) |p| blk: {
         if (p.set) break :blk fillPromptModeline(modeline_buf, "Bookmark name (C-g cancels): ", .{}, p.query);
         break :blk fillPromptModeline(modeline_buf, "Jump to bookmark (C-g cancels): ", .{}, p.query);
@@ -1121,17 +1123,37 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, gpa: std.mem.Allocator, bu
         if (files_view) |fv| {
             if (buf == fv.buf) {
                 const n = if (fv.filter.len > 0)
-                    std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}{s}   filter: {s}   (C-n/C-p move, C-g/Esc clears, Enter opens, F follows, g rerun)", .{
+                    if (fv.regex)
+                        std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}{s}   regexp filter: {s}   (Enter opens, F follows, M-r toggles, C-g/Esc clears)", .{
+                            fv.buf.display_name orelse "?",
+                            if (fv.follow) " [follow]" else "",
+                            buf.cursor_row + 1,
+                            fv.count,
+                            if (!buf.soft_wrap) " [truncate]" else "",
+                            if (buf.scroll_lock) " [scroll-lock]" else "",
+                            fv.filter,
+                        }) catch break :blk .{ .len = 0, .label_len = 0 }
+                    else
+                        std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}{s}   filter: {s}   (C-n/C-p move, C-g/Esc clears, Enter opens, F follows, M-r regexp)", .{
+                            fv.buf.display_name orelse "?",
+                            if (fv.follow) " [follow]" else "",
+                            buf.cursor_row + 1,
+                            fv.count,
+                            if (!buf.soft_wrap) " [truncate]" else "",
+                            if (buf.scroll_lock) " [scroll-lock]" else "",
+                            fv.filter,
+                        }) catch break :blk .{ .len = 0, .label_len = 0 }
+                else if (fv.regex)
+                    std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}{s}   (type a regexp to filter, M-r toggles, C-s searches, Enter opens, F follows, C-g/Esc closes)", .{
                         fv.buf.display_name orelse "?",
                         if (fv.follow) " [follow]" else "",
                         buf.cursor_row + 1,
                         fv.count,
                         if (!buf.soft_wrap) " [truncate]" else "",
                         if (buf.scroll_lock) " [scroll-lock]" else "",
-                        fv.filter,
                     }) catch break :blk .{ .len = 0, .label_len = 0 }
                 else
-                    std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}{s}   (type to filter, C-n/C-p move, C-s searches, Enter opens, F follows, g rerun, C-g/Esc closes)", .{
+                    std.fmt.bufPrint(modeline_buf, "{s}{s} {d}/{d}{s}{s}   (type to filter, M-r regexp, C-s searches, Enter opens, F follows, C-g/Esc closes)", .{
                         fv.buf.display_name orelse "?",
                         if (fv.follow) " [follow]" else "",
                         buf.cursor_row + 1,
@@ -1689,8 +1711,10 @@ fn fuzzySegments(line: []const u8, fh: FuzzyHl, current: bool, storage: *[129]va
 /// Mirror the *files* buffer's rows into its lines — the filtered subset
 /// when a filter is active, the whole list otherwise — with the matched
 /// character positions per row. The buffer's cursor_row is a position in
-/// the mirrored rows.
-fn filesMirror(gpa: std.mem.Allocator, buf: *Buffer, paths: []const []const u8, filter: []const u8, visible: *std.ArrayList(usize), hl_out: *std.ArrayList(FuzzyHl)) void {
+/// the mirrored rows. `regex` switches the filter from fuzzy
+/// (partial-completion) to a strict Emacs regexp (see Dired.regexMatch),
+/// which matches whole paths and leaves the rows unhightlighted.
+fn filesMirror(gpa: std.mem.Allocator, buf: *Buffer, paths: []const []const u8, filter: []const u8, regex: bool, visible: *std.ArrayList(usize), hl_out: *std.ArrayList(FuzzyHl)) void {
     for (buf.lines.items) |*l| l.deinit(gpa);
     buf.lines.clearRetainingCapacity();
     visible.clearRetainingCapacity();
@@ -1698,11 +1722,17 @@ fn filesMirror(gpa: std.mem.Allocator, buf: *Buffer, paths: []const []const u8, 
     var matches: std.ArrayList(PickerMatch) = .empty;
     defer matches.deinit(gpa);
     for (paths, 0..) |p, i| {
-        if (filter.len == 0 or partialMatch(filter, p) != null) {
-            matches.append(gpa, .{ .idx = i, .rank = 0, .hl = if (filter.len > 0) partialMatch(filter, p).?.hl else .{} }) catch return;
+        if (filter.len == 0) {
+            matches.append(gpa, .{ .idx = i, .rank = 0 }) catch return;
+        } else if (regex) {
+            if (Dired.regexMatch(p, filter)) matches.append(gpa, .{ .idx = i, .rank = 0 }) catch return;
+        } else {
+            if (partialMatch(filter, p)) |m| matches.append(gpa, .{ .idx = i, .rank = m.rank, .hl = m.hl }) catch return;
         }
     }
-    if (filter.len > 0) std.mem.sort(PickerMatch, matches.items, {}, PickerMatch.lessThan);
+    // Fuzzy matches rank by where the first group lands; a regexp match has
+    // no meaningful rank, so it keeps the finder's original (path) order.
+    if (!regex and filter.len > 0) std.mem.sort(PickerMatch, matches.items, {}, PickerMatch.lessThan);
     for (matches.items) |m| {
         var line: std.ArrayList(u8) = .empty;
         errdefer line.deinit(gpa);
@@ -1820,6 +1850,67 @@ fn procWorker(io: std.Io, gpa: std.mem.Allocator, loop: *vaxis.Loop(Event), run:
     _ = loop.tryPostEvent(.{ .proc_done = run }) catch {};
 }
 
+/// Copy one entry — a whole tree for a directory, a plain file otherwise
+/// — recording the first failure's name into `err_out` (best effort: a
+/// bad entry must not stop the rest of the copy).
+fn copyEntry(gpa: std.mem.Allocator, io: std.Io, p: CopyPair, cancel: *const std.atomic.Value(bool), err_out: *std.ArrayList(u8)) void {
+    if (p.is_dir) {
+        copyTree(gpa, io, p.src, p.dst, cancel, err_out);
+    } else {
+        std.Io.Dir.cwd().copyFile(p.src, std.Io.Dir.cwd(), p.dst, io, .{}) catch |err| {
+            err_out.appendSlice(gpa, @errorName(err)) catch {};
+        };
+    }
+}
+
+/// The background copy / move worker (a dired C / R result): copy each
+/// (src, dst) pair — a whole tree for a directory — deleting the source
+/// for a move, posting progress after every entry and honouring C-g
+/// between them. The editor stays responsive the whole time; the main
+/// loop's C-g cancel stops the worker at its next entry (a tree already
+/// being copied checks too, via copyTree's cancel flag, but a file being
+/// written finishes). Posts .proc_done last, after which it touches
+/// nothing but `state` / `lines` / `cancel` — the same contract as
+/// procWorker.
+fn copyWorker(io: std.Io, gpa: std.mem.Allocator, loop: *vaxis.Loop(Event), run: *ProcRun) void {
+    var done: usize = 0;
+    for (run.pairs.items) |p| {
+        if (run.cancel.load(.acquire)) break;
+        var ok = false;
+        if (run.is_move) {
+            if (std.Io.Dir.cwd().rename(p.src, std.Io.Dir.cwd(), p.dst, io)) |_| {
+                // A same-filesystem move is just a rename — no bytes moved.
+                ok = true;
+            } else |err| switch (err) {
+                error.CrossDevice => {
+                    // Across filesystems a rename can't work: copy the
+                    // tree or file, then delete the source, like Emacs's
+                    // dired-do-rename.
+                    copyEntry(gpa, io, p, &run.cancel, &run.out);
+                    if (p.is_dir) {
+                        std.Io.Dir.cwd().deleteTree(io, p.src) catch {};
+                    } else {
+                        std.Io.Dir.cwd().deleteFile(io, p.src) catch {};
+                    }
+                    ok = true;
+                },
+                else => {
+                    run.out.appendSlice(gpa, @errorName(err)) catch {};
+                },
+            }
+        } else {
+            copyEntry(gpa, io, p, &run.cancel, &run.out);
+            ok = true;
+        }
+        if (!ok) continue;
+        done += 1;
+        run.lines.store(done, .release);
+        _ = loop.tryPostEvent(.{ .proc_progress = run }) catch {};
+    }
+    run.state.store(if (run.cancel.load(.acquire)) .cancelled else if (done == run.pairs.items.len) .done else .failed, .release);
+    _ = loop.tryPostEvent(.{ .proc_done = run }) catch {};
+}
+
 /// Cancel a background grep / find from the main loop: set the cancel
 /// flag AND kill the tool's child by its recorded id. The flag alone
 /// relies on the worker's next read, and a child that produces no output
@@ -1843,12 +1934,13 @@ fn cancelProcRun(run: *ProcRun) void {
     }
 }
 
-/// Kick off a background grep / find: the worker thread runs the tool
-/// while the editor stays responsive, posting progress and a final
-/// .proc_done event. A previous run still in flight is asked to stop
-/// (its done event is recognized as stale and freed without
-/// finalizing). True when the worker was spawned; on failure the run is
-/// left intact for the caller to free.
+/// Kick off a background grep / find / copy: the worker thread (procWorker
+/// for a tool, copyWorker for a copy / move) does the work while the
+/// editor stays responsive, posting progress and a final .proc_done
+/// event. A previous run still in flight is asked to stop (its done event
+/// is recognized as stale and freed without finalizing). True when the
+/// worker was spawned; on failure the run is left intact for the caller
+/// to free.
 fn startProc(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -1858,20 +1950,29 @@ fn startProc(
     proc_current: *std.atomic.Value(?*ProcRun),
 ) bool {
     if (proc_run.*) |old| cancelProcRun(old);
-    run.future = io.concurrent(procWorker, .{ io, gpa, loop, run }) catch return false;
+    run.future = if (run.kind == .copy)
+        io.concurrent(copyWorker, .{ io, gpa, loop, run }) catch return false
+    else
+        io.concurrent(procWorker, .{ io, gpa, loop, run }) catch return false;
     proc_run.* = run;
     proc_current.store(run, .release);
     return true;
 }
 
 /// Free a ProcRun: the label (unless the finalizer took it over), every
-/// argv string, the collected output and the struct itself.
+/// argv string, the collected output, a copy run's pairs and the struct
+/// itself.
 fn freeProcRun(gpa: std.mem.Allocator, run: *ProcRun) void {
     if (run.label.len > 0) gpa.free(run.label);
     for (0..run.argv_len.len) |i| {
         for (run.argv[i][0..run.argv_len[i]]) |arg| gpa.free(arg);
     }
     run.out.deinit(gpa);
+    for (run.pairs.items) |p| {
+        gpa.free(p.src);
+        gpa.free(p.dst);
+    }
+    run.pairs.deinit(gpa);
     gpa.destroy(run);
 }
 
@@ -2022,7 +2123,7 @@ fn finishFind(
                 line.appendSlice(gpa, ls) catch return null;
                 buf.lines.append(gpa, line) catch return null;
             }
-            filesMirror(gpa, buf, find_paths.items, "", find_visible, find_hl);
+            filesMirror(gpa, buf, find_paths.items, "", false, find_visible, find_hl);
             return old;
         }
     }
@@ -2036,7 +2137,7 @@ fn finishFind(
     direds.append(gpa, null) catch return null;
     buffer_list_gen += 1; // the *Ibuffer* listing is now stale
     find_buf_idx.* = buffers.items.len - 1;
-    filesMirror(gpa, new_buf, find_paths.items, "", find_visible, find_hl);
+    filesMirror(gpa, new_buf, find_paths.items, "", false, find_visible, find_hl);
     return find_buf_idx.*;
 }
 
@@ -3377,27 +3478,44 @@ const FilesView = struct {
     count: usize,
     follow: bool,
     filter: []const u8,
+    regex: bool,
     row_hl: []const FuzzyHl,
 };
 
-/// A background grep / find (C-c g, C-c f, g): the tool runs on its own
-/// thread (procWorker) so the editor stays responsive, with the live
-/// status — a spinner, the matches / files counted so far and the
-/// elapsed time — on the modeline and C-g to cancel. Owned by the main
-/// loop, which frees it when the worker's .proc_done event is handled;
-/// the worker writes only `lines` / `state` / `cancel` (atomics) and
-/// its own `out` buffer, and touches nothing else after posting
-/// .proc_done. The finalizer takes over `label` (the last term / find
-/// directory), so freeProcRun skips it once transferred.
+/// One entry of a background copy / move (a dired C / R result): the
+/// source and destination paths — both owned by the run — and whether the
+/// entry is a directory (copied tree-and-all, deleted tree-and-all).
+const CopyPair = struct {
+    src: []u8,
+    dst: []u8,
+    is_dir: bool,
+};
+
+/// A background grep / find / copy (C-c g, C-c f, g, dired C / R): the
+/// tool or the copy/move runs on its own thread (procWorker / copyWorker)
+/// so the editor stays responsive, with the live status — a spinner, the
+/// matches / files / entries handled so far and the elapsed time — on the
+/// modeline and C-g to cancel. Owned by the main loop, which frees it
+/// when the worker's .proc_done event is handled; the worker writes only
+/// `lines` / `state` / `cancel` (atomics) and its own `out` buffer, and
+/// touches nothing else after posting .proc_done. The finalizer takes
+/// over `label` (the last term / find directory / copy destination), so
+/// freeProcRun skips it once transferred.
 const ProcRun = struct {
-    const Kind = enum { grep, find };
+    const Kind = enum { grep, find, copy };
 
     kind: Kind,
     /// Whether the results buffer takes the focus when the run lands
     /// (the C-c f / C-c g starts do; the *files* g re-run doesn't).
-    jump: bool,
-    /// The search term (grep) or directory (find), for the modeline.
+    jump: bool = false,
+    /// The search term (grep), directory (find), or copy destination (copy),
+    /// for the modeline.
     label: []u8 = &.{},
+    /// A copy / move (kind == .copy): true means the source is deleted
+    /// after the copy (a rename — the cross-filesystem fallback), false a
+    /// plain copy. The (src, dst) pairs are owned by the run.
+    is_move: bool = false,
+    pairs: std.ArrayList(CopyPair) = .empty,
     /// Two candidate command lines — the primary tool and its fallback
     /// (findstr / grep, or find / dir): the worker tries the second only
     /// when the first can't spawn. Each arg is a gpa-duped slice.
@@ -3405,13 +3523,14 @@ const ProcRun = struct {
     argv_len: [2]usize = .{ 0, 0 },
     /// The collected stdout, written by the worker only.
     out: std.ArrayList(u8) = .empty,
-    /// Matches (grep) or files (find) seen so far.
+    /// Matches (grep), files (find) or entries copied (copy) seen so far.
     lines: std.atomic.Value(usize) = .init(0),
     state: std.atomic.Value(ProcState) = .init(.running),
     /// Set by the main loop to cancel; the worker sees it at its next
     /// read and kills the child (a silent child is noticed at its next
     /// output or exit — or, when it produces none at all, the main loop
-    /// kills it directly via `child_id`, see cancelProcRun).
+    /// kills it directly via `child_id`, see cancelProcRun). A copy
+    /// worker checks it between entries (and inside a tree's walk).
     cancel: std.atomic.Value(bool) = .init(false),
     /// The child's id (the pid on POSIX, the process handle on Windows),
     /// recorded by the worker right after spawn so the main loop can kill
@@ -3785,7 +3904,7 @@ fn renderDiredPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, dired: 
     }
 
     const ml: PromptModeline = if (find_file) |f|
-        fillPromptModeline(modeline_buf, "Find file: ", .{}, f.query)
+        fillPromptModeline(modeline_buf, "{s}", .{f.label}, f.query)
     else if (bookmark_prompt) |p| blk: {
         if (p.set) break :blk fillPromptModeline(modeline_buf, "Bookmark name (C-g cancels): ", .{}, p.query);
         break :blk fillPromptModeline(modeline_buf, "Jump to bookmark (C-g cancels): ", .{}, p.query);
@@ -4136,21 +4255,21 @@ fn renderTree(
 /// The home screen shown when james starts without any file arguments.
 /// It's a plain buffer (so movement, search and every C-x command work on
 /// it) with no backing file; C-x d / C-x C-f lead somewhere real. The
-/// terminal caption is appended to the art's last line at startup (see
-/// openWelcome), so it reads as part of the banner.
+/// terminal's name rides the version line beneath the art at startup (see
+/// openWelcome).
 const welcome_head =
-    \\      _   _    __  __ _____ ____
-    \\     | | / \  |  \/  | ____/ ___|
-    \\  _  | |/ _ \ | |\/| |  _| \___ \
-    \\ | |_| / ___ \| |  | | |___ ___) |
-    \\  \___/_/   \_\_|  |_|_____|____/
+    \\   _
+    \\  (_) __ _ _ __ ___   ___  ___
+    \\  | |/ _` | '_ ` _ \ / _ \/ __|
+    \\  | | (_| | | | | | |  __/\__ \
+    \\ _/ |\__,_|_| |_| |_|\___||___/
+    \\|__/
 ;
 
 /// The greeting line under the banner: the one-line summary of what
-/// james is. Shares the caption block's three-space margin, so the
-/// whole block under the art reads as one left-aligned column.
+/// james is.
 const welcome_greeting =
-    \\   Welcome to james, a minimal Emacs-inspired editor for the terminal.
+    \\"Welcome to james, a minimal Emacs-inspired editor for the terminal."
 ;
 
 /// The keybinding reference under the greeting, grouped by prefix (C-x,
@@ -4167,6 +4286,7 @@ const welcome_tail =
     \\  C-x — files, buffers and windows:
     \\
     \\    C-x C-s             save the buffer (C-w saves too)
+    \\    C-x C-w             write the buffer to a new file
     \\    C-x C-c             quit (asks first; saves a modified file)
     \\    C-x u               undo
     \\    C-x k               kill the current buffer
@@ -4198,7 +4318,7 @@ const welcome_tail =
     \\    C-c w               copy the region
     \\    C-c C-k             close the dired buffer
     \\    C-c o               pick a bookmark (type to filter)
-    \\    C-c f               find files (fuzzy list)
+    \\    C-c f               find files (fuzzy list; M-r filters by regexp)
     \\    C-c g               grep the current directory (Enter opens, F follows)
     \\    C-c j / C-c k       step back / forward through window layouts (j / k repeat)
     \\    C-c r               re-render the whole frame (fixes display glitches)
@@ -4302,6 +4422,8 @@ const welcome_tail =
     \\    Enter               open the buffer
     \\    m / u / U / t       mark / unmark rows
     \\    X                   kill the marked buffers (modified ones ask)
+    \\    D                   delete buffers like dired's D (asks y / n;
+    \\                        the row under point when nothing is marked)
     \\    s                   toggle the sort (name / list order)
     \\    g                   re-read the listing
     \\    q / C-g             close the ibuffer
@@ -4344,13 +4466,16 @@ fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer), environ
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
     try text.appendSlice(gpa, welcome_head);
+    try text.appendSlice(gpa, "\n\n");
+    try text.appendSlice(gpa, welcome_greeting);
+    try text.appendSlice(gpa, "\n\n");
     // The terminal this instance is running in — TERM_PROGRAM where the
     // terminal sets it (alacritty, kitty, wezterm, vscode, ...), the
     // Windows consoles' own variables (Windows Terminal and ConEmu each
     // have one, and an interactive console session is SESSIONNAME
     // "Console"), the TERM value otherwise, so the console is easy to
-    // see and report. It rides on the art's last line, so it reads as
-    // part of the banner.
+    // see and report. It rides the version line, between the stack and
+    // the closing bracket.
     var term_name: []const u8 = "an unknown terminal";
     if (environ_map.get("TERM_PROGRAM")) |tp| {
         term_name = tp;
@@ -4363,32 +4488,14 @@ fn openWelcome(gpa: std.mem.Allocator, buffers: *std.ArrayList(*Buffer), environ
     } else if (std.mem.eql(u8, environ_map.get("SESSIONNAME") orelse "", "Console")) {
         term_name = "the Windows console";
     }
-    try text.appendSlice(gpa, "  running in ");
-    try text.appendSlice(gpa, term_name);
-    if (environ_map.get("TERM_PROGRAM_VERSION")) |v| {
-        try text.appendSlice(gpa, " (");
-        try text.appendSlice(gpa, v);
-        try text.appendSlice(gpa, ")");
-    }
-    try text.appendSlice(gpa, "\n\n");
-    try text.appendSlice(gpa, welcome_greeting);
-    try text.appendSlice(gpa, "\n\n");
+    try text.appendSlice(gpa, "[ Zig + libvaxis :: ");
     if (build_options.version.len > 0) {
-        // The version line shares the caption's three-space margin, so
-        // the block lines up as one left-aligned column.
-        try text.appendSlice(gpa, "   ");
+        if (build_options.version[0] != 'v') try text.appendSlice(gpa, "v");
         try text.appendSlice(gpa, build_options.version);
-        if (build_options.date.len > 0) {
-            try text.appendSlice(gpa, " (");
-            try text.appendSlice(gpa, build_options.date);
-            if (build_options.built.len > 0) {
-                try text.appendSlice(gpa, " ");
-                try text.appendSlice(gpa, build_options.built);
-            }
-            try text.appendSlice(gpa, ")");
-        }
-        try text.appendSlice(gpa, "\n\n");
+        try text.appendSlice(gpa, " :: ");
     }
+    try text.appendSlice(gpa, term_name);
+    try text.appendSlice(gpa, "]\n\n");
     try text.appendSlice(gpa, welcome_tail);
 
     new_buf.* = try Buffer.fromText(gpa, text.items);
@@ -4514,26 +4621,36 @@ fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
 /// (and symlinks, followed) are copied with std's copyFile; directories
 /// recurse. std's copyFile itself cannot copy a directory — it panics with
 /// EISDIR — so directories must come through here.
-fn copyTree(gpa: std.mem.Allocator, io: std.Io, src: []const u8, dst: []const u8) void {
+fn copyTree(gpa: std.mem.Allocator, io: std.Io, src: []const u8, dst: []const u8, cancel: ?*const std.atomic.Value(bool), err_out: ?*std.ArrayList(u8)) void {
     std.Io.Dir.cwd().createDirPath(io, dst) catch return;
     var dir = std.Io.Dir.cwd().openDir(io, src, .{ .iterate = true }) catch return;
     defer dir.close(io);
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
+        // A cancelled run stops at the next entry; a tree already being
+        // copied finishes unless it too checks in.
+        if (cancel) |c| {
+            if (c.load(.acquire)) break;
+        }
         switch (entry.kind) {
             .directory => {
                 const sub_src = std.fs.path.join(gpa, &.{ src, entry.name }) catch continue;
                 defer gpa.free(sub_src);
                 const sub_dst = std.fs.path.join(gpa, &.{ dst, entry.name }) catch continue;
                 defer gpa.free(sub_dst);
-                copyTree(gpa, io, sub_src, sub_dst);
+                copyTree(gpa, io, sub_src, sub_dst, cancel, err_out);
             },
             .file, .sym_link => {
                 const sub_src = std.fs.path.join(gpa, &.{ src, entry.name }) catch continue;
                 defer gpa.free(sub_src);
                 const sub_dst = std.fs.path.join(gpa, &.{ dst, entry.name }) catch continue;
                 defer gpa.free(sub_dst);
-                std.Io.Dir.cwd().copyFile(sub_src, std.Io.Dir.cwd(), sub_dst, io, .{}) catch {};
+                std.Io.Dir.cwd().copyFile(sub_src, std.Io.Dir.cwd(), sub_dst, io, .{}) catch |err| {
+                    // The failure is recorded (for the finalizer's status)
+                    // and the walk carries on — one unreadable file must
+                    // not stop the rest of the copy.
+                    if (err_out) |e| e.appendSlice(gpa, @errorName(err)) catch {};
+                };
             },
             else => {},
         }
@@ -4957,6 +5074,18 @@ fn refreshDired(gpa: std.mem.Allocator, io: std.Io, buffers: *std.ArrayList(*Buf
     mirrorDiredLines(gpa, buffers.items[idx], d);
 }
 
+/// Reload every open dired showing `dir`, so a background copy / move
+/// that touched that directory appears immediately — moved- or copied-in
+/// entries show up, freed ones disappear — in whichever window holds the
+/// directory.
+fn refreshDiredsUnder(gpa: std.mem.Allocator, io: std.Io, buffers: *std.ArrayList(*Buffer), direds: *std.ArrayList(?Dired), dir: []const u8) void {
+    for (direds.items, 0..) |*d, i| {
+        if (d.* == null) continue;
+        if (!std.mem.eql(u8, d.*.?.path.items, dir)) continue;
+        refreshDired(gpa, io, buffers, direds, i);
+    }
+}
+
 /// Move a dired's selection (and its buffer mirror) to the entry named
 /// `name` after a refresh — used to land on a just-created entry, like
 /// Emacs dired moving point to a newly created directory.
@@ -5301,6 +5430,26 @@ fn ibufferKillMarked(
         status_msg.* = status_buf[0..n.len];
     }
     return next;
+}
+
+/// The D confirmation's modeline text, dired-shaped: "Delete N buffers? (y
+/// / n / C-g cancels)", mentioning how many have unsaved changes when any
+/// do (a y is never blind). N counts the marked rows — the row-under-point
+/// fallback is marked before the prompt shows, so it counts itself.
+/// Written into `out`; the returned slice is the message.
+fn ibufferDelPrompt(out: []u8, buf: *const Buffer, ibuffer_rows: []const usize, buffers: []const *Buffer) []const u8 {
+    var n: usize = 0;
+    var n_dirty: usize = 0;
+    for (ibuffer_rows, 0..) |bi, r| {
+        const line: []u8 = buf.lines.items[r + 2].items;
+        if (line.len > 1 and line[1] == '*') {
+            n += 1;
+            if (buffers[bi].dirty and buffers[bi].filename != null) n_dirty += 1;
+        }
+    }
+    if (n_dirty > 0)
+        return std.fmt.bufPrint(out, "Delete {d} buffer{s}, {d} modified without saving? (y / n / C-g cancels)", .{ n, if (n == 1) "" else "s", n_dirty }) catch out[0..0];
+    return std.fmt.bufPrint(out, "Delete {d} buffer{s}? (y / n / C-g cancels)", .{ n, if (n == 1) "" else "s" }) catch out[0..0];
 }
 
 /// A named (file, position) pair, like an Emacs bookmark. Persisted to
@@ -5908,6 +6057,13 @@ pub fn main(init: std.process.Init) !void {
     var switch_query: std.ArrayList(u8) = .empty;
     defer switch_query.deinit(gpa);
 
+    // C-x C-w write-file: the same in-pane path prompt as C-x C-f, but on
+    // Enter the buffer is written to the typed file and now visits it
+    // (see seq Buffer.saveAs).
+    var writing_file = false;
+    var write_query: std.ArrayList(u8) = .empty;
+    defer write_query.deinit(gpa);
+
     // Bookmarks (C-x r m / C-x r b / C-x r l), like Emacs: a named
     // (file, position) pair, persisted to ~/.james-bookmarks. `bookmark_
     // prompt` is a modal name prompt (set or jump); `bookmark_list` is a
@@ -5990,10 +6146,11 @@ pub fn main(init: std.process.Init) !void {
     // find, or Windows dir /s /b) lists the current directory into a
     // persistent *files* buffer, exactly like the *grep* buffer: the list
     // stays open (C-x b returns to it), n/p steps through it, and typing
-    // filters it (partial-completion, see filesMirror). `find_paths` is
-    // the full list, `find_visible` the filtered subset, `find_hl` the
-    // matched characters per visible row, and `find_dir` the last search
-    // directory (for g, which re-runs the find).
+    // filters it (partial-completion by default, strict regexp with M-r
+    // toggled on — see filesMirror). `find_paths` is the full list,
+    // `find_visible` the filtered subset, `find_hl` the matched characters
+    // per visible row, `find_dir` the last search directory, and
+    // `find_regex` the fuzzy / regexp filter switch.
     var find_buf_idx: ?usize = null;
     var find_paths: std.ArrayList([]u8) = .empty;
     defer {
@@ -6002,6 +6159,9 @@ pub fn main(init: std.process.Init) !void {
     }
     var find_filter: std.ArrayList(u8) = .empty;
     defer find_filter.deinit(gpa);
+    // M-r toggles the *files* filter between fuzzy (partial-completion)
+    // and strict Emacs regexp matching; each new C-c f find starts fuzzy.
+    var find_regex = false;
     var find_visible: std.ArrayList(usize) = .empty;
     defer find_visible.deinit(gpa);
     var find_hl: std.ArrayList(FuzzyHl) = .empty;
@@ -6069,6 +6229,13 @@ pub fn main(init: std.process.Init) !void {
     // the y / n confirmation — y kills them without saving, n keeps them,
     // C-g cancels (like C-x k's own prompt).
     var confirming_ibuffer_kill = false;
+    // D in the *Ibuffer*: dired's delete with a confirmation — the marked
+    // buffers (or the row under point when nothing is marked) are asked
+    // about first, y kills them all, n / C-g cancels. `ibuffer_del_fallback`
+    // is the row marked as D's marked-or-selected fallback, so a cancelled
+    // D can unmark it again.
+    var confirming_ibuffer_del = false;
+    var ibuffer_del_fallback: ?usize = null;
 
     // z in dired: compress / decompress the marked entries (Emacs
     // dired-compress-file, the author's my/dired-compress-transient
@@ -6279,35 +6446,70 @@ pub fn main(init: std.process.Init) !void {
                 defer freeProcRun(gpa, run);
                 switch (run.state.load(.acquire)) {
                     .done => {
-                        if (run.kind == .grep) {
-                            if (finishGrep(gpa, &buffers, &direds, run, &grep_buf_idx, &grep_last_term, &grep_matches)) |idx| {
-                                recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
-                                current = idx;
-                                focused.buf_idx = current;
-                            } else {
-                                status_msg = "No matches";
-                            }
-                        } else {
-                            if (finishFind(gpa, &buffers, &direds, run, &find_paths, &find_dir, &find_filter, &find_visible, &find_hl, &find_buf_idx)) |idx| {
-                                if (run.jump) {
+                        switch (run.kind) {
+                            .grep => {
+                                if (finishGrep(gpa, &buffers, &direds, run, &grep_buf_idx, &grep_last_term, &grep_matches)) |idx| {
                                     recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                                     current = idx;
                                     focused.buf_idx = current;
-                                    kill_active = false;
+                                } else {
+                                    status_msg = "No matches";
                                 }
-                            } else {
-                                status_msg = "No files found";
-                            }
+                            },
+                            .find => {
+                                if (finishFind(gpa, &buffers, &direds, run, &find_paths, &find_dir, &find_filter, &find_visible, &find_hl, &find_buf_idx)) |idx| {
+                                    if (run.jump) {
+                                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                                        current = idx;
+                                        focused.buf_idx = current;
+                                        kill_active = false;
+                                    }
+                                } else {
+                                    status_msg = "No files found";
+                                }
+                            },
+                            .copy => {
+                                // The copy / move finished in the
+                                // background: reload every open dired that
+                                // covers the source or destination
+                                // directory, so moved/copied entries appear
+                                // and freed ones disappear, and report how
+                                // many entries landed.
+                                if (run.pairs.items.len > 0) {
+                                    if (std.fs.path.dirname(run.pairs.items[0].src)) |dir| refreshDiredsUnder(gpa, io, &buffers, &direds, dir);
+                                    if (std.fs.path.dirname(run.pairs.items[0].dst)) |dir| refreshDiredsUnder(gpa, io, &buffers, &direds, dir);
+                                }
+                                const done = run.lines.load(.acquire);
+                                const n = std.fmt.bufPrint(&status_buf, "{s} {d} entr{s}", .{
+                                    if (run.is_move) "Moved" else "Copied",
+                                    done,
+                                    if (done == 1) "y" else "ies",
+                                }) catch null;
+                                if (n) |nn| status_msg = status_buf[0..nn.len];
+                            },
                         }
                     },
                     .failed => {
-                        // An empty capture is the tool's "no match" exit
-                        // (rg exits 1); output that failed to parse means
-                        // the tool itself went wrong.
-                        status_msg = if (run.out.items.len == 0) (if (run.kind == .grep) "No matches" else "No files found") else "Search failed";
+                        status_msg = if (run.kind == .copy) blk: {
+                            const base_msg = if (run.is_move) "Move failed" else "Copy failed";
+                            if (run.out.items.len > 0) {
+                                const n = std.fmt.bufPrint(&status_buf, "{s}: {s}", .{ base_msg, run.out.items }) catch break :blk base_msg;
+                                break :blk status_buf[0..n.len];
+                            }
+                            break :blk base_msg;
+                        } else
+                            // An empty capture is the tool's "no match" exit
+                            // (rg exits 1); output that failed to parse means
+                            // the tool itself went wrong.
+                            (if (run.out.items.len == 0) (if (run.kind == .grep) "No matches" else "No files found") else "Search failed");
                     },
                     .cancelled => {
-                        status_msg = if (run.kind == .grep) "Search cancelled" else "Find cancelled";
+                        status_msg = if (run.kind == .copy)
+                            (if (run.is_move) "Move cancelled" else "Copy cancelled")
+                        else if (run.kind == .grep)
+                            "Search cancelled"
+                        else
+                            "Find cancelled";
                     },
                     .running => unreachable,
                 }
@@ -6450,6 +6652,27 @@ pub fn main(init: std.process.Init) !void {
                     }
                     // Any other key is ignored — stay in the prompt rather
                     // than risk a stray keystroke killing the wrong buffer.
+                } else if (confirming_ibuffer_del) {
+                    if (key.matches('y', .{}) or key.matches('Y', .{})) {
+                        // y: delete the marked buffers (the row-under-point
+                        // fallback is already marked), modified file buffers
+                        // without saving. Recorded like the X kills so C-c j
+                        // steps back past the whole multi-kill.
+                        confirming_ibuffer_del = false;
+                        ibuffer_del_fallback = null;
+                        recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
+                        current = ibufferKillMarked(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo, buf, 2, true, &ibuffer_buf_idx, &ibuffer_rows, ibuffer_sort, &ibuffer_gen, &status_msg, &status_buf);
+                    } else if (key.matches('n', .{}) or key.matches('N', .{}) or key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        // n / C-g: cancel. The fallback mark (if D marked
+                        // the row under point) is unmarked again.
+                        confirming_ibuffer_del = false;
+                        if (ibuffer_del_fallback) |r| {
+                            ibufferSetMark(buf, r, false);
+                            ibuffer_del_fallback = null;
+                        }
+                    }
+                    // Any other key is ignored — stay in the prompt rather
+                    // than risk deleting the wrong buffers.
                 } else if (confirming_ibuffer_kill) {
                     if (key.matches('y', .{}) or key.matches('Y', .{})) {
                         // y: kill the marked buffers, the modified file
@@ -6550,6 +6773,8 @@ pub fn main(init: std.process.Init) !void {
                         // the files counted so far, and the focus moves to
                         // the listing when it lands.
                         f_blk: {
+                            // A fresh find starts fuzzy; M-r re-arms regexp.
+                            find_regex = false;
                             const dir = if (direds.items[current]) |*d|
                                 try gpa.dupe(u8, d.path.items)
                             else
@@ -6629,6 +6854,26 @@ pub fn main(init: std.process.Init) !void {
                         try switch_query.appendSlice(gpa, t);
                     } else {
                         switching_buffer = false;
+                    }
+                } else if (writing_file) {
+                    if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        writing_file = false;
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        if (write_query.items.len > 0) _ = write_query.pop();
+                    } else if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true }) or key.matches('m', .{ .ctrl = true })) {
+                        writing_file = false;
+                        const name = std.mem.trim(u8, write_query.items, " ");
+                        if (name.len > 0) {
+                            buf.saveAs(gpa, io, name) catch {
+                                status_msg = "Write failed";
+                            };
+                            refreshBookmarksAfterSave(gpa, io, init.environ_map, &bookmarks, buf);
+                            buffer_list_gen += 1; // the buffer's name changed
+                        }
+                    } else if (key.text) |t| {
+                        try write_query.appendSlice(gpa, t);
+                    } else {
+                        writing_file = false;
                     }
                 } else if (bookmark_prompt) |mode| {
                     if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
@@ -6945,61 +7190,68 @@ pub fn main(init: std.process.Init) !void {
                                     // the query as typed (it includes the
                                     // name); a marked set treats the query
                                     // as a directory and keeps each entry's
-                                    // own name.
+                                    // own name. The actual copy / move runs
+                                    // on a background worker (copyWorker):
+                                    // the editor never blocks, the modeline
+                                    // shows live progress and C-g cancels.
                                     var idxs: std.ArrayList(usize) = .empty;
                                     defer idxs.deinit(gpa);
                                     diredOpIndices(gpa, d, &idxs);
-                                    var any = false;
+                                    const multi = idxs.items.len > 1;
+                                    var pairs: std.ArrayList(CopyPair) = .empty;
+                                    // `defer` (not errdefer) so the pairs are
+                                    // freed on every exit — including the
+                                    // break :key_blk failure paths below. On
+                                    // success they are handed to the run and
+                                    // this list stops owning them.
+                                    defer {
+                                        for (pairs.items) |p| {
+                                            gpa.free(p.src);
+                                            gpa.free(p.dst);
+                                        }
+                                        pairs.deinit(gpa);
+                                    }
                                     for (idxs.items) |i| {
                                         const en = d.entries.items[i];
                                         const src = try std.fs.path.join(gpa, &.{ d.path.items, en.name });
                                         defer gpa.free(src);
-                                        const multi = idxs.items.len > 1;
                                         const dst = if (multi)
                                             try std.fs.path.join(gpa, &.{ target, en.name })
                                         else
                                             target;
                                         defer if (multi) gpa.free(dst);
-                                        if (!std.mem.eql(u8, src, dst) and !pathStartsWith(dst, src)) {
-                                            if (dired_copy_kind == .rename) {
-                                                // R: move the entry. rename()
-                                                // is the whole job — atomic
-                                                // and copy-free — except
-                                                // across filesystems, where it
-                                                // fails with CrossDevice and
-                                                // the fallback is copy +
-                                                // delete, like Emacs's
-                                                // dired-do-rename.
-                                                if (std.Io.Dir.cwd().rename(src, std.Io.Dir.cwd(), dst, io)) |_| {
-                                                } else |err| switch (err) {
-                                                    error.CrossDevice => {
-                                                        if (en.is_dir) {
-                                                            copyTree(gpa, io, src, dst);
-                                                            std.Io.Dir.cwd().deleteTree(io, src) catch {};
-                                                        } else {
-                                                            std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), dst, io, .{}) catch {};
-                                                            std.Io.Dir.cwd().deleteFile(io, src) catch {};
-                                                        }
-                                                    },
-                                                    else => {},
-                                                }
-                                            } else if (en.is_dir) {
-                                                copyTree(gpa, io, src, dst);
-                                            } else {
-                                                std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), dst, io, .{}) catch {};
-                                            }
-                                            any = true;
-                                        }
+                                        if (std.mem.eql(u8, src, dst) or pathStartsWith(dst, src)) continue;
+                                        pairs.append(gpa, .{
+                                            .src = try gpa.dupe(u8, src),
+                                            .dst = try gpa.dupe(u8, if (multi) dst else target),
+                                            .is_dir = en.is_dir,
+                                        }) catch break;
                                     }
-                                    if (any) {
-                                        refreshDired(gpa, io, &buffers, &direds, current);
-                                        // The destination dired (the other
-                                        // window, if there is one) needs a
-                                        // refresh too, so the moved/copied
-                                        // entries show up there as well.
-                                        if (dwimTargetBuf(root, focused, direds.items)) |ti| {
-                                            refreshDired(gpa, io, &buffers, &direds, ti);
-                                        }
+                                    if (pairs.items.len == 0) {
+                                        status_msg = if (dired_copy_kind == .rename) "Nothing to rename" else "Nothing to copy";
+                                        break :key_blk;
+                                    }
+                                    const run = gpa.create(ProcRun) catch break :key_blk;
+                                    run.* = .{
+                                        .kind = .copy,
+                                        .is_move = dired_copy_kind == .rename,
+                                        .label = gpa.dupe(u8, if (multi) target else std.fs.path.basename(target)) catch {
+                                            gpa.destroy(run);
+                                            break :key_blk;
+                                        },
+                                        .started = std.Io.Clock.now(.real, io).nanoseconds,
+                                    };
+                                    // The pairs are handed to the run for the
+                                    // worker; the local list stops owning them.
+                                    run.pairs.appendSlice(gpa, pairs.items) catch {
+                                        freeProcRun(gpa, run);
+                                        break :key_blk;
+                                    };
+                                    pairs.clearRetainingCapacity();
+                                    if (!startProc(io, gpa, &loop, run, &proc_run, &proc_current)) {
+                                        freeProcRun(gpa, run);
+                                        status_msg = if (dired_copy_kind == .rename) "Move failed to start" else "Copy failed to start";
+                                        break :key_blk;
                                     }
                                 },
                             }
@@ -7471,6 +7723,41 @@ pub fn main(init: std.process.Init) !void {
                             status_msg = "Save failed";
                         };
                         refreshBookmarksAfterSave(gpa, io, init.environ_map, &bookmarks, buf);
+                    } else if (key.matches('w', .{ .ctrl = true })) {
+                        // C-x C-w: write the buffer to a new file (Emacs
+                        // write-file) — prompt for the path, prefilled with
+                        // the buffer's directory like C-x C-f; on Enter the
+                        // buffer is written there and now visits that file,
+                        // so C-x C-s saves it from then on. This works for
+                        // any text buffer — file, scratch, or the special
+                        // results buffers (*files* / *grep* / *occur* /
+                        // *Ibuffer* / *Bookmarks*): writing one makes it a
+                        // plain file buffer, its special listing dropped
+                        // (the display-name checks below release it). Only
+                        // a dired is excluded — it has no text of its own,
+                        // just a mirrored listing of a directory.
+                        if (direds.items[current] == null) {
+                            writing_file = true;
+                            write_query.clearRetainingCapacity();
+                            // The *files* listing prefills its search
+                            // directory, the natural home for the saved
+                            // list; everything else prefill the buffer's
+                            // own directory (the working directory for the
+                            // filename-less results buffers).
+                            const start = blk: {
+                                if (find_buf_idx == current) {
+                                    if (find_dir) |d| break :blk (try gpa.dupe(u8, d));
+                                }
+                                break :blk (try Dired.startingDir(gpa, buf.filename orelse "."));
+                            };
+                            defer gpa.free(start);
+                            const abs = Dired.absPathOf(gpa, io, start) catch try gpa.dupe(u8, start);
+                            defer gpa.free(abs);
+                            try write_query.appendSlice(gpa, abs);
+                            if (write_query.items.len == 0 or write_query.items[write_query.items.len - 1] != std.fs.path.sep) {
+                                try write_query.append(gpa, std.fs.path.sep);
+                            }
+                        }
                     } else if (key.matches('c', .{ .ctrl = true })) {
                         // Quit always asks first: a modified file buffer
                         // prompts to save it, anything else just
@@ -8004,7 +8291,7 @@ pub fn main(init: std.process.Init) !void {
                     // read-only like a dired, so keys they don't consume
                     // (kills) don't corrupt their rows.
                     const editing = direds.items[current] == null and results_kind == null and !is_ibuffer and !is_bookmarks;
-                    if (results_kind) |rkind| results_blk: {
+                    if (results_kind) |rkind| {
                         const is_files = rkind == .files;
                         const is_occur = rkind == .occur;
                         // Close: C-g / Esc for both (clearing the *files*
@@ -8013,7 +8300,7 @@ pub fn main(init: std.process.Init) !void {
                         if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{}) or (!is_files and key.matches('q', .{}))) {
                             if (is_files and find_filter.items.len > 0) {
                                 find_filter.clearRetainingCapacity();
-                                filesMirror(gpa, buf, find_paths.items, find_filter.items, &find_visible, &find_hl);
+                                filesMirror(gpa, buf, find_paths.items, find_filter.items, find_regex, &find_visible, &find_hl);
                             } else {
                                 recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                                 current = closeBuffer(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo);
@@ -8080,29 +8367,11 @@ pub fn main(init: std.process.Init) !void {
                             // F: toggle follow mode — stepping with n/p
                             // opens each entry in the target window.
                             results_follow = !results_follow;
-                        } else if (key.matches('g', .{})) {
-                            if (is_files) {
-                                // g: re-run the find over the last
-                                // directory, staying in the buffer. The
-                                // listing keeps its old contents while the
-                                // background find runs; it is re-mirrored
-                                // when the run lands (no focus change).
-                                if (find_dir) |d| {
-                                    const dir = gpa.dupe(u8, d) catch null;
-                                    defer if (dir) |dd| gpa.free(dd);
-                                    if (dir) |dd| {
-                                        const run = gpa.create(ProcRun) catch break :results_blk;
-                                        run.* = .{ .kind = .find, .jump = false, .started = std.Io.Clock.now(.real, io).nanoseconds };
-                                        errdefer freeProcRun(gpa, run);
-                                        run.label = gpa.dupe(u8, dd) catch break :results_blk;
-                                        if (findArgv(gpa, run, dd) == 0) break :results_blk;
-                                        if (!startProc(io, gpa, &loop, run, &proc_run, &proc_current)) {
-                                            status_msg = "No files found";
-                                            break :results_blk;
-                                        }
-                                    }
-                                }
-                            } else if (is_occur) {
+                        } else if (key.matches('g', .{}) and !is_files) {
+                            // g reruns the search — but not in *files*,
+                            // where every letter (g included) types into the
+                            // filter and narrows the list.
+                            if (is_occur) {
                                 // g: re-run the occur — the prompt reopens
                                 // prefilled with the previous term.
                                 occur_prompt = true;
@@ -8175,13 +8444,28 @@ pub fn main(init: std.process.Init) !void {
                         } else if (key.matches('K', .{ .alt = true })) {
                             // M-K: a page up the list (Emacs scroll-down).
                             buf.moveLines(-@as(isize, @intCast(focused_text_height -| 1)));
+                        } else if (is_files and key.matches('r', .{ .alt = true })) {
+                            // M-r: toggle the *files* filter between fuzzy
+                            // (partial-completion) and strict Emacs regexp
+                            // matching (Emacs's M-r in isearch; the regexp
+                            // syntax is dired % m's, see Dired.regexMatch).
+                            // The listing re-mirrors in place, the selection
+                            // kept when it still shows; regexp rows have no
+                            // per-character highlight.
+                            find_regex = !find_regex;
+                            const before_full = if (buf.cursor_row < find_visible.items.len) find_visible.items[buf.cursor_row] else 0;
+                            filesMirror(gpa, buf, find_paths.items, find_filter.items, find_regex, &find_visible, &find_hl);
+                            if (find_visible.items.len > 0) {
+                                buf.cursor_row = std.mem.indexOfScalar(usize, find_visible.items, before_full) orelse 0;
+                                buf.cursor_col = 0;
+                            }
                         } else if (is_files) {
                             if (key.matches(vaxis.Key.backspace, .{})) {
                                 // Backspace shortens the filter.
                                 if (find_filter.items.len > 0) {
                                     const before_full = if (buf.cursor_row < find_visible.items.len) find_visible.items[buf.cursor_row] else 0;
                                     _ = find_filter.pop();
-                                    filesMirror(gpa, buf, find_paths.items, find_filter.items, &find_visible, &find_hl);
+                                    filesMirror(gpa, buf, find_paths.items, find_filter.items, find_regex, &find_visible, &find_hl);
                                     if (find_visible.items.len > 0) {
                                         buf.cursor_row = std.mem.indexOfScalar(usize, find_visible.items, before_full) orelse 0;
                                         buf.cursor_col = 0;
@@ -8194,7 +8478,7 @@ pub fn main(init: std.process.Init) !void {
                                 // it still shows.
                                 const before_full = if (buf.cursor_row < find_visible.items.len) find_visible.items[buf.cursor_row] else 0;
                                 try find_filter.appendSlice(gpa, t);
-                                filesMirror(gpa, buf, find_paths.items, find_filter.items, &find_visible, &find_hl);
+                                filesMirror(gpa, buf, find_paths.items, find_filter.items, find_regex, &find_visible, &find_hl);
                                 if (find_visible.items.len > 0) {
                                     buf.cursor_row = std.mem.indexOfScalar(usize, find_visible.items, before_full) orelse 0;
                                     buf.cursor_col = 0;
@@ -8208,11 +8492,14 @@ pub fn main(init: std.process.Init) !void {
                         // buffer in this window (the *Ibuffer* stays open,
                         // like a dired), g rebuilds the listing, s toggles
                         // the sort, m / u / U / t mark rows — the * in the
-                        // M column — and X kills the marked buffers (a
-                        // modified file buffer is kept). C-s / C-r search
-                        // the table like any buffer. The rows start at line
-                        // 2, under the header and its dashes ruler; the
-                        // entry at line r sits at rows[r - 2].
+                        // M column — and X / D kill the marked buffers (a
+                        // modified file buffer is kept / asks first; D,
+                        // like dired's, deletes the row under point when
+                        // nothing is marked and always asks y / n first).
+                        // C-s / C-r search the table like any buffer. The
+                        // rows start at line 2, under the header and its
+                        // dashes ruler; the entry at line r sits at rows[r
+                        // - 2].
                         const first_row: usize = 2;
                         const last_row = ibuffer_rows.items.len + first_row -| 1;
                         // Every key the table owns ends with break :key_blk
@@ -8304,6 +8591,34 @@ pub fn main(init: std.process.Init) !void {
                             } else {
                                 current = ibufferKillMarked(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo, buf, first_row, true, &ibuffer_buf_idx, &ibuffer_rows, ibuffer_sort, &ibuffer_gen, &status_msg, &status_buf);
                             }
+                            break :key_blk;
+                        } else if (key.matches('D', .{})) {
+                            // D: delete the marked buffers, or — dired's
+                            // fallback — the row under point when nothing
+                            // is marked (Emacs ibuffer-do-delete). Always
+                            // asks first, like dired's D: y deletes them,
+                            // n / C-g cancels. The row-under-point fallback
+                            // marks the row, so the prompt counts it and
+                            // the kill path acts on it; a cancelled D
+                            // unmarks it again.
+                            var has_marks = false;
+                            for (ibuffer_rows.items, 0..) |_, r| {
+                                const line: []u8 = buf.lines.items[r + first_row].items;
+                                if (line.len > 1 and line[1] == '*') {
+                                    has_marks = true;
+                                    break;
+                                }
+                            }
+                            ibuffer_del_fallback = null;
+                            if (!has_marks) {
+                                if (buf.cursor_row >= first_row and buf.cursor_row <= last_row) {
+                                    ibuffer_del_fallback = buf.cursor_row;
+                                    ibufferSetMark(buf, buf.cursor_row, true);
+                                } else {
+                                    break :key_blk;
+                                }
+                            }
+                            confirming_ibuffer_del = true;
                             break :key_blk;
                         } else if (key.matches('<', .{ .alt = true })) {
                             buf.cursor_row = first_row;
@@ -9246,7 +9561,7 @@ pub fn main(init: std.process.Init) !void {
         // `is_modal` still gates the single-pane dired path below (a
         // prompt renders through the normal buffer renderer, not the
         // dired one).
-        const is_modal = confirming_quit or confirming_kill or confirming_ibuffer_kill;
+        const is_modal = confirming_quit or confirming_kill or confirming_ibuffer_kill or confirming_ibuffer_del;
 
         const search_view: ?IsearchView = if (isearch_active)
             .{ .failed = isearch_failed, .match = isearch_match, .query = isearch_query.items, .backward = isearch_dir == .backward, .count = isearch_count, .pos = isearch_pos }
@@ -9265,7 +9580,9 @@ pub fn main(init: std.process.Init) !void {
             null;
 
         const find_file_view: ?FindFileView = if (switching_buffer)
-            .{ .query = switch_query.items }
+            .{ .query = switch_query.items, .label = "Find file: " }
+        else if (writing_file)
+            .{ .query = write_query.items, .label = "Write file: " }
         else
             null;
 
@@ -9313,7 +9630,7 @@ pub fn main(init: std.process.Init) !void {
             const idx = find_buf_idx orelse break :blk null;
             if (idx >= buffers.items.len) break :blk null;
             if (!std.mem.eql(u8, buffers.items[idx].display_name orelse "", "*files*")) break :blk null;
-            break :blk .{ .buf = buffers.items[idx], .count = find_visible.items.len, .follow = results_follow, .filter = find_filter.items, .row_hl = find_hl.items };
+            break :blk .{ .buf = buffers.items[idx], .count = find_visible.items.len, .follow = results_follow, .filter = find_filter.items, .regex = find_regex, .row_hl = find_hl.items };
         };
 
         const dired_prompt_view: ?DiredPromptView = if (dired_copy_prompt)
@@ -9337,26 +9654,37 @@ pub fn main(init: std.process.Init) !void {
             null;
 
         if (proc_run) |run| {
-            // A background grep / find is running: the live status — a
-            // spinner, the matches / files counted so far and the elapsed
-            // time — replaces the transient status message for this frame.
-            // Each .proc_progress event (worker or heartbeat) redraws it,
-            // so the spinner always ticks.
+            // A background grep / find / copy is running: the live status —
+            // a spinner, the matches / files / entries handled so far and the
+            // elapsed time — replaces the transient status message for this
+            // frame. Each .proc_progress event (worker or heartbeat) redraws
+            // it, so the spinner always ticks.
             const now = std.Io.Clock.now(.real, io).nanoseconds;
             const elapsed_ms: u64 = @intCast(@max(now - run.started, 0) / 1_000_000);
             const frame = "|/-\\"[@mod(@divTrunc(elapsed_ms, 120), 4)];
             const count = run.lines.load(.acquire);
-            const what = if (run.kind == .grep) "match" else "file";
-            const n = std.fmt.bufPrint(&status_buf, "{c} {s}: {s} — {d} {s}{s}, {d}.{d:0>1}s", .{
-                frame,
-                if (run.kind == .grep) "grep" else "find",
-                run.label,
-                count,
-                what,
-                if (count == 1) "" else "es",
-                @divTrunc(elapsed_ms, 1000),
-                @mod(@divTrunc(elapsed_ms, 100), 10),
-            }) catch null;
+            const n: ?[]const u8 = if (run.kind == .copy)
+                (std.fmt.bufPrint(&status_buf, "{c} {s}: {s} — {d}/{d} entr{s}, {d}.{d:0>1}s", .{
+                    frame,
+                    if (run.is_move) "moving" else "copying",
+                    run.label,
+                    count,
+                    run.pairs.items.len,
+                    if (count == 1) "y" else "ies",
+                    @divTrunc(elapsed_ms, 1000),
+                    @mod(@divTrunc(elapsed_ms, 100), 10),
+                }) catch null)
+            else
+                (std.fmt.bufPrint(&status_buf, "{c} {s}: {s} — {d} {s}{s}, {d}.{d:0>1}s", .{
+                    frame,
+                    if (run.kind == .grep) "grep" else "find",
+                    run.label,
+                    count,
+                    if (run.kind == .grep) "match" else "file",
+                    if (count == 1) "" else "es",
+                    @divTrunc(elapsed_ms, 1000),
+                    @mod(@divTrunc(elapsed_ms, 100), 10),
+                }) catch null);
             if (n) |nn| status_msg = status_buf[0..nn.len];
         }
 
@@ -9408,6 +9736,10 @@ pub fn main(init: std.process.Init) !void {
                 }
                 const n = std.fmt.bufPrint(&status_buf, "Kill the marked buffers, {d} modified without saving? (y kills them, n keeps them, C-g cancels)", .{n_dirty}) catch break :blk null;
                 break :blk status_buf[0..n.len];
+            }
+            if (confirming_ibuffer_del) {
+                const msg = ibufferDelPrompt(&status_buf, buf, ibuffer_rows.items, buffers.items);
+                break :blk msg;
             }
             break :blk null;
         } else null;
@@ -9602,11 +9934,16 @@ pub fn main(init: std.process.Init) !void {
                 if (line.len > 1 and line[1] == '*' and buffers.items[bi].dirty and buffers.items[bi].filename != null) n_dirty += 1;
             }
             break :blk fillPromptModeline(&modeline_buf, "Kill the marked buffers, {d} modified without saving? (y kills them, n keeps them, C-g cancels)", .{n_dirty}, "");
+        } else if (confirming_ibuffer_del) blk: {
+            const msg = ibufferDelPrompt(&status_buf, buf, ibuffer_rows.items, buffers.items);
+            break :blk fillPromptModeline(&modeline_buf, "{s}", .{msg}, "");
         } else if (status_msg) |m| blk: {
             const n = std.fmt.bufPrint(&modeline_buf, "{s}", .{m}) catch break :blk .{ .len = 0, .label_len = 0 };
             break :blk .{ .len = n.len, .label_len = 0 };
         } else if (switching_buffer)
             fillPromptModeline(&modeline_buf, "Find file: ", .{}, switch_query.items)
+        else if (writing_file)
+            fillPromptModeline(&modeline_buf, "Write file: ", .{}, write_query.items)
         else if (bookmark_prompt) |mode| blk: {
             if (mode == .set) break :blk fillPromptModeline(&modeline_buf, "Bookmark name (C-g cancels): ", .{}, bookmark_query.items);
             break :blk fillPromptModeline(&modeline_buf, "Jump to bookmark (C-g cancels): ", .{}, bookmark_query.items);
@@ -9657,17 +9994,37 @@ pub fn main(init: std.process.Init) !void {
             if (files_view) |fv| {
                 if (buf == fv.buf) {
                     const n = if (fv.filter.len > 0)
-                        std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}{s}   filter: {s}   (C-g/Esc clears, Enter opens, F follows, g rerun) --", .{
+                        if (fv.regex)
+                            std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}{s}   regexp filter: {s}   (Enter opens, F follows, M-r toggles, C-g/Esc clears) --", .{
+                                fv.buf.display_name orelse "?",
+                                if (fv.follow) " [follow]" else "",
+                                buf.cursor_row + 1,
+                                fv.count,
+                                if (!buf.soft_wrap) " [truncate]" else "",
+                                if (buf.scroll_lock) " [scroll-lock]" else "",
+                                fv.filter,
+                            }) catch break :blk .{ .len = 0, .label_len = 0 }
+                        else
+                            std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}{s}   filter: {s}   (C-g/Esc clears, Enter opens, F follows, M-r regexp) --", .{
+                                fv.buf.display_name orelse "?",
+                                if (fv.follow) " [follow]" else "",
+                                buf.cursor_row + 1,
+                                fv.count,
+                                if (!buf.soft_wrap) " [truncate]" else "",
+                                if (buf.scroll_lock) " [scroll-lock]" else "",
+                                fv.filter,
+                            }) catch break :blk .{ .len = 0, .label_len = 0 }
+                    else if (fv.regex)
+                        std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}{s}   (type a regexp to filter, M-r toggles, C-s searches, Enter opens, F follows, C-g/Esc closes) --", .{
                             fv.buf.display_name orelse "?",
                             if (fv.follow) " [follow]" else "",
                             buf.cursor_row + 1,
                             fv.count,
                             if (!buf.soft_wrap) " [truncate]" else "",
                             if (buf.scroll_lock) " [scroll-lock]" else "",
-                            fv.filter,
                         }) catch break :blk .{ .len = 0, .label_len = 0 }
                     else
-                        std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}{s}   (type to filter, C-s searches, Enter opens, F follows, g rerun, C-g/Esc closes) --", .{
+                        std.fmt.bufPrint(&modeline_buf, "-- {s}{s} {d}/{d}{s}{s}   (type to filter, M-r regexp, C-s searches, Enter opens, F follows, C-g/Esc closes) --", .{
                             fv.buf.display_name orelse "?",
                             if (fv.follow) " [follow]" else "",
                             buf.cursor_row + 1,
