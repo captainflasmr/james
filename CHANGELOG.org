@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.81.0 — <2026-08-20>
+
+Isearch highlights every match of the query in the buffer while searching — Emacs =isearch-lazy-highlight= — not just the one under the cursor.
+
+- While an incremental search is active, every occurrence of the query in the searched buffer is highlighted in reverse video: file buffers, direds (every name containing the term), and the results buffers (=*grep*=, =*occur*=, =*files*=, =*Ibuffer*=, =*Bookmarks*= — any buffer) light up as you type, each line carrying however many matches it holds. The highlighted set is exactly the lazy count's: the same per-line, ASCII case-insensitive, non-overlapping scan, so what glows and the =(N/M)= total always agree. The match being walked keeps the block cursor and the bold current line so it stays distinct among them, and a failing search still shows the matches — =Failing I-search= now comes with the full map of where they are while you backspace the query down to something that works. The highlight belongs to the search alone: confirming or cancelling leaves the buffer exactly as before, and the pickers keep their own one-row highlight — a menu list's rows aren't a buffer. It is computed at render time — one scan of the visible rows per frame, no full-buffer pass and no state to keep in sync — so a search over a hundred-thousand-line buffer scrolls at full speed. The native and =x86_64-windows= cross builds compile.
+
 ** 0.80.0 — <2026-08-16>
 
 =C-x r l= opens the bookmarks in a buffer — a persistent =*Bookmarks*= list like the =*Ibuffer*= — while =C-c o= / =M-l o= stay the fuzzy picker.

@@ -9,20 +9,6 @@ This document contains the current bugs/improvements, this is just for me mainly
 
 * Bugs/Improvements
 
-** DONE "D" to delete in ibuffer, as currently functions in dired
-CLOSED: [2026-08-18 Tue 08:34]
+- [ ] windows check deletions are going to trash
 
-** DONE async for file copy
-<2026-08-18> CLOSED: dired =C= / =R= copy and move run on a background worker (copyWorker, like grep/find): the editor never blocks, the modeline shows live progress ("copying: <target> — n/m entries"), =C-g= cancels between entries (a tree's walk checks too; a file being written finishes), and open direds covering the source or destination directory refresh when it lands.
-
-** DONE "g" in file search enters a key
-<2026-08-17> CLOSED: in =*files*= every letter filters, so =g= now types into the filter instead of re-running the find; the =g rerun= binding (and its modeline hints) stay in =*grep*= / =*occur*= only.
-
-** DONE regex search in file search
-<2026-08-17> CLOSED: M-r toggles the =*files*= filter between fuzzy and a strict Emacs regexp (the same syntax as dired's =% m=, via Dired.regexMatch); new C-c f finds start fuzzy, and the modeline shows the mode.
-
-** DONE add C-x C-w to write to new buffer
-<2026-08-17> CLOSED: C-x C-w prompts for a path prefilled with the buffer's directory and writes the buffer there (Buffer.saveAs), then makes the buffer visit that file so C-x C-s saves it from then on.
-
-** DONE Allow *files* to be saved to a buffer
-<2026-08-17> CLOSED: C-x C-w now works on any text buffer, the results buffers included — writing a =*files*=/=*grep*=/=*occur*= listing makes it a plain file buffer visiting the file (the *files* prompt prefills the search directory).
+- [ ] touchpad/mouse scrolling not working in windows

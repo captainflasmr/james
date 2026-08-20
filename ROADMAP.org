@@ -52,6 +52,11 @@ TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =to
 - Done in 0.54.0: while searching, the modeline's =I-search:= prompt trails the query with = (N/M)= — the current match's 1-based position and the query's total, like Emacs's isearch-lazy-count. In buffers and direds the count covers the buffer's lines (the dired mirror included); in the pickers, the visible rows. A failing search shows =(0/0)=, and an empty query shows no count. The count is recomputed once per search keystroke, not per frame.
 - Effort: small.
 
+** DONE Isearch lazy highlight
+- Emacs: =isearch-lazy-highlight= — while searching, every match of the query in the buffer is highlighted, not just the one under the cursor.
+- Done in 0.81.0: an active search highlights every match of the query in the searched buffer — file buffers, direds' names, and the results buffers alike — computed per visible row at render time with the same per-line, ASCII case-insensitive scan as the lazy count, so the glowing set and the =(N/M)= totals always agree; the block cursor and bold current line mark the match being walked, a failing search still shows where all the matches are, and confirming or cancelling leaves the buffer exactly as before. The pickers keep their own single-row highlight.
+- Effort: small.
+
 ** DONE Dired trash delete
 - Emacs: =my/dired-async-do-delete= (trash instead of =D='s hard delete, with a confirm prompt like james's existing y/n) and =delete-by-moving-to-trash=.
 - Done in 0.57.0: =D= never hard-deletes — the confirm prompt now reads =Move X to the trash?= and the entries go to the platform trash: the Windows Recycle Bin through PowerShell's =Microsoft.VisualBasic= =FileSystem.DeleteFile/DeleteDirectory= with =SendToRecycleBin= (the same API the config's Windows branch calls), and the freedesktop.org trash elsewhere — =XDG_DATA_HOME=/Trash/files (or =~/.local/share/Trash/files=) with a =.trashinfo= sidecar in =Trash/info= (Path + UTC ISO 8601 DeletionDate) and the config's name-collision counter (=foo.tar.gz= → =foo.tar.1.gz=). A failed trash leaves the file alone and reports =Trash failed=.

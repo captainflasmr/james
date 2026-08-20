@@ -168,9 +168,67 @@ fn lineSegments(line: []const u8, hl: ?Highlight, empty_line_marker: bool, stora
     return storage[0..n];
 }
 
-/// The highlight range (if any) for `row`. While a search is active, only
-/// the current match is highlighted (even if there isn't one yet); otherwise
-/// falls back to the mark/point region, same as before incremental search.
+/// The segments for `line` with every range in `hls` highlighted — a line
+/// can hold several matches at once, so lineSegments' before/inside/after
+/// three segments get generalized: one segment per highlighted run with
+/// the plain text in between, at most `hls.len * 2 + 1` segments. The
+/// ranges are display offsets (already mapped through any tab / whitespace
+/// expansion), in order and non-overlapping. `current` bolds the whole line
+/// like lineSegments, so the current match's line stands out even where the
+/// block cursor is hard to see.
+fn lineSegmentsMulti(line: []const u8, hls: []const Highlight, storage: *[129]vaxis.Segment, current: bool) []const vaxis.Segment {
+    const base_style: vaxis.Style = if (current) .{ .bold = true } else .{};
+    const hl_style: vaxis.Style = if (current) .{ .reverse = true, .bold = true } else highlight_style;
+    var n: usize = 0;
+    var seg_start: usize = 0;
+    for (hls) |h| {
+        // Clamp to the line and skip ranges that collapsed to nothing (a
+        // match pulled to the line's edge).
+        if (h.end <= h.start) continue;
+        if (h.start > seg_start) {
+            storage[n] = .{ .text = line[seg_start..h.start], .style = base_style };
+            n += 1;
+        }
+        storage[n] = .{ .text = line[h.start..h.end], .style = hl_style };
+        n += 1;
+        seg_start = h.end;
+    }
+    if (seg_start < line.len) {
+        storage[n] = .{ .text = line[seg_start..], .style = base_style };
+        n += 1;
+    }
+    if (n == 0) {
+        storage[0] = .{ .text = line, .style = base_style };
+        n = 1;
+    }
+    return storage[0..n];
+}
+
+/// Every occurrence of `query` in `line` as raw byte ranges — the per-line
+/// half of isearch's lazy highlight (Emacs isearch-lazy-highlight): an
+/// active search highlights each match of the query in the searched buffer,
+/// not just the one under the cursor. Case-insensitive (ASCII) and
+/// non-overlapping within the line, exactly like Buffer.matchCount, so the
+/// highlighted set and the lazy count always agree. At most `ranges.len`
+/// matches are returned, in order; how many were found.
+fn searchMatchesOnLine(line: []const u8, query: []const u8, ranges: []Highlight) usize {
+    var n: usize = 0;
+    if (query.len == 0) return 0;
+    var col: usize = 0;
+    while (n < ranges.len) {
+        const c = std.ascii.findIgnoreCasePos(line, col, query) orelse break;
+        ranges[n] = .{ .start = c, .end = c + query.len };
+        n += 1;
+        col = c + query.len;
+    }
+    return n;
+}
+
+/// The highlight range (if any) for `row`. While a search is active only
+/// the current match counts here — and only so the region stays hidden:
+/// the search's own highlights (the lazy highlight of every match, see
+/// renderPane) are drawn by the caller. Without a search the mark/point
+/// region shows, same as before incremental search.
 fn highlightFor(
     buf: *const Buffer,
     row: usize,
@@ -1031,7 +1089,32 @@ fn renderPane(win: vaxis.Window, frame: *FrameAllocs, gpa: std.mem.Allocator, bu
         } else null;
         const segs = if (row_hl) |fh|
             fuzzySegments(line, fh, is_focused and i == buf.cursor_row, &seg_storage129)
-        else
+        else if (search) |s| blk: {
+            // The lazy highlight (Emacs isearch-lazy-highlight): every
+            // match of the query in the searched buffer is highlighted,
+            // not just the current one — the block cursor and the bold
+            // current line mark the match being walked, and the (N/M)
+            // lazy count says where it sits.
+            if (s.query.len > 0) {
+                var ranges: [16]Highlight = undefined;
+                const n = searchMatchesOnLine(raw, s.query, &ranges);
+                if (n > 0) {
+                    // Map the raw match offsets through the tab /
+                    // whitespace expansion, like h.hl above.
+                    var disp: [16]Highlight = undefined;
+                    for (ranges[0..n], 0..) |r, k| {
+                        disp[k] = if (ws_text != null)
+                            .{ .start = whitespaceDispAt(raw, r.start, method), .end = whitespaceDispAt(raw, r.end, method) }
+                        else if (expanded != null)
+                            .{ .start = tabAwareWidth(raw, 0, r.start, method), .end = tabAwareWidth(raw, 0, r.end, method) }
+                        else
+                            r;
+                    }
+                    break :blk lineSegmentsMulti(line, disp[0..n], &seg_storage129, is_focused and i == buf.cursor_row);
+                }
+            }
+            break :blk lineSegments(line, h.hl, h.empty_marker, &seg_storage3, is_focused and i == buf.cursor_row);
+        } else
             lineSegments(line, h.hl, h.empty_marker, &seg_storage3, is_focused and i == buf.cursor_row);
         // Advance by the line's wrapped height, so a soft-wrapped line
         // takes all of its visual rows instead of the next line
@@ -3865,17 +3948,46 @@ fn renderDiredPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, dired: 
         if (!dired.hide_details) {
             _ = win.printSegment(.{ .text = e.meta, .style = style }, .{ .row_offset = row_base + row, .col_offset = @intCast(line_num_width + 1) });
         }
-        const hl: ?Highlight = if (searching) blk: {
+        // The isearch lazy highlight (Emacs isearch-lazy-highlight): every
+        // name matching the query highlights, not just the current match's
+        // row — the selection marks where the walk sits. The current
+        // match's own highlight covers a search with no term yet or a row
+        // without a match of its own.
+        var hl: ?Highlight = null;
+        var lazy: [16]Highlight = undefined;
+        var lazy_n: usize = 0;
+        if (searching and query_len > 0) {
+            lazy_n = searchMatchesOnLine(e.name, search.?.query, &lazy);
+        } else if (searching) {
             if (match) |m| {
                 if (i == m.row) {
                     const start = @min(m.col, e.name.len);
                     const end = @min(m.col + query_len, e.name.len);
-                    if (end > start) break :blk .{ .start = start, .end = end };
+                    if (end > start) hl = .{ .start = start, .end = end };
                 }
             }
-            break :blk null;
-        } else null;
-        if (hl) |h| {
+        }
+        if (lazy_n > 0) {
+            var col = name_col;
+            var seg_start: usize = 0;
+            for (lazy[0..lazy_n]) |r| {
+                // Clamp to the name and skip matches squeezed to nothing
+                // at its edge.
+                const start = @min(r.start, e.name.len);
+                const end = @min(r.end, e.name.len);
+                if (end <= start) continue;
+                if (start > seg_start) {
+                    _ = win.printSegment(.{ .text = e.name[seg_start..start], .style = style }, .{ .row_offset = row_base + row, .col_offset = col });
+                    col += win.gwidth(e.name[seg_start..start]);
+                }
+                _ = win.printSegment(.{ .text = e.name[start..end], .style = hl_style }, .{ .row_offset = row_base + row, .col_offset = col });
+                col += win.gwidth(e.name[start..end]);
+                seg_start = end;
+            }
+            if (seg_start < e.name.len) {
+                _ = win.printSegment(.{ .text = e.name[seg_start..], .style = style }, .{ .row_offset = row_base + row, .col_offset = col });
+            }
+        } else if (hl) |h| {
             var col = name_col;
             if (h.start > 0) {
                 _ = win.printSegment(.{ .text = e.name[0..h.start], .style = style }, .{ .row_offset = row_base + row, .col_offset = col });
