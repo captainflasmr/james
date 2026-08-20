@@ -6618,17 +6618,26 @@ pub fn main(init: std.process.Init) !void {
                 // selection steps like n / p); over the picker's docked
                 // rows the picker's selection walks instead. The focused
                 // pane keeps its focus — only the view under the pointer
-                // scrolls.
-                if (m.button != .wheel_up and m.button != .wheel_down) break :mouse_blk;
-                const delta: isize = if (m.button == .wheel_up) -3 else 3;
+                // scrolls. A click (a touchpad tap is a left click)
+                // focuses the pane under the pointer instead, like the
+                // wheel scrolls it: the modeline flips and typing goes
+                // where the pointer is. The picker's rows and the tab
+                // bar's blocks take their own clicks — a picker row
+                // selects the candidate, a tab block switches to that
+                // tab — and the divider between two panes belongs to no
+                // pane, so a click there does nothing.
                 // The confirm prompts and the query-replace walk are
                 // modal: any other key is ignored while they are up, and
-                // the wheel is that — nothing scrolls.
+                // the wheel and clicks are that — nothing scrolls,
+                // nothing refocuses.
                 if (confirming_quit or confirming_kill or confirming_ibuffer_kill or confirming_ibuffer_del or confirming_delete or confirming_open or replace_active or replace_prompt != null) break :mouse_blk;
+                // Only button presses act — a release, pointer motion and
+                // a drag are noise (and must not, say, end a search).
+                if (m.type != .press) break :mouse_blk;
                 // An active isearch is modal too, but it ends like any
                 // other key: the search confirms where it is (the query
-                // is remembered for the next C-s), then the scroll
-                // proceeds.
+                // is remembered for the next C-s), then the scroll or
+                // focus proceeds.
                 if (isearch_active) {
                     syncDiredSelection(direds.items, current, buffers.items[current]);
                     rememberIsearch(gpa, &isearch_last, isearch_query.items);
@@ -6641,39 +6650,86 @@ pub fn main(init: std.process.Init) !void {
                 const screen_h: i17 = @intCast(vx.screen.height);
                 const body_h: u16 = if (tabs.items.len > 1) vx.screen.height -| 1 else vx.screen.height;
                 const row_body: i17 = @as(i17, @intCast(m.row)) - tab_off;
+                // A click on the tab bar's row switches to the block
+                // under the pointer (the same "[ N ]" blocks the
+                // renderTabBar draws — "[ N ]" is five cells, "[ 10 ]"
+                // six, plus the one-cell gap after each).
+                if (tabs.items.len > 1 and m.row < tab_off) {
+                    const shown = @min(tabs.items.len, MAX_TABS);
+                    var col: i17 = 0;
+                    var t: usize = 0;
+                    while (t < shown) : (t += 1) {
+                        const w: i17 = if (t + 1 < 10) 6 else 7;
+                        if (m.col < col + w) {
+                            if (t != active_tab) selectTab(&tabs, &active_tab, t, &root, &focused, &current, &window_undo, &window_redo);
+                            break;
+                        }
+                        col += w;
+                    }
+                    break :mouse_blk;
+                }
                 if (m.col < 0 or row_body < 0 or row_body >= screen_h - tab_off) break :mouse_blk;
+                if (m.button == .wheel_up or m.button == .wheel_down) {
+                    const delta: isize = if (m.button == .wheel_up) -3 else 3;
+                    if (picker_kind) |_| {
+                        // The picker (C-x b / C-c o / M-l l) docks at the
+                        // bottom of the display, icomplete-vertical style:
+                        // over its rows the wheel walks the selection, not
+                        // the buffer behind it.
+                        const ph = pickerHeight(picker_visible.items.len, body_h);
+                        if (@as(u16, @intCast(row_body)) >= body_h -| ph) {
+                            const pos = pickerSelectionPos(picker_visible.items, picker_selected);
+                            const np = @as(isize, @intCast(pos)) + delta;
+                            if (np >= 0 and np < @as(isize, @intCast(picker_visible.items.len))) {
+                                picker_selected = picker_visible.items[@intCast(np)];
+                            }
+                            break :mouse_blk;
+                        }
+                    }
+                    if (paneAtScreen(root, m.col, row_body, 0, 0, vx.screen.width, body_h)) |p| {
+                        const idx = p.buf_idx;
+                        if (idx < buffers.items.len) {
+                            if (direds.items[idx]) |*d| {
+                                if (delta > 0) {
+                                    var n: usize = @intCast(delta);
+                                    while (n > 0) : (n -= 1) d.moveDown();
+                                } else {
+                                    var n: usize = @intCast(-delta);
+                                    while (n > 0) : (n -= 1) d.moveUp();
+                                }
+                                // Keep the dired's mirror cursor on the
+                                // selection, the mirrorDiredLines invariant.
+                                buffers.items[idx].cursor_row = @min(d.selected, buffers.items[idx].lines.items.len -| 1);
+                            } else {
+                                buffers.items[idx].moveLines(delta);
+                            }
+                        }
+                    }
+                    break :mouse_blk;
+                }
+                // Clicks focus; only the left button does — the right /
+                // middle ones are paste and friends in the terminal
+                // emulators, and left is where a touchpad's tap lands.
+                if (m.button != .left) break :mouse_blk;
                 if (picker_kind) |_| {
-                    // The picker (C-x b / C-c o / M-l l) docks at the
-                    // bottom of the display, icomplete-vertical style:
-                    // over its rows the wheel walks the selection, not
-                    // the buffer behind it.
+                    // A click on a docked picker row selects the
+                    // candidate (Enter still confirms), like the wheel
+                    // stepping the selection.
                     const ph = pickerHeight(picker_visible.items.len, body_h);
-                    if (@as(u16, @intCast(row_body)) >= body_h -| ph) {
-                        const pos = pickerSelectionPos(picker_visible.items, picker_selected);
-                        const np = @as(isize, @intCast(pos)) + delta;
-                        if (np >= 0 and np < @as(isize, @intCast(picker_visible.items.len))) {
-                            picker_selected = picker_visible.items[@intCast(np)];
+                    if (@as(u16, @intCast(row_body)) >= body_h -| ph and row_body < @as(i17, @intCast(body_h))) {
+                        const pos: usize = @intCast(@as(i17, @intCast(body_h -| ph)));
+                        const rel = @as(usize, @intCast(row_body)) - pos;
+                        if (rel < picker_visible.items.len) {
+                            picker_selected = picker_visible.items[rel];
                         }
                         break :mouse_blk;
                     }
                 }
                 if (paneAtScreen(root, m.col, row_body, 0, 0, vx.screen.width, body_h)) |p| {
-                    const idx = p.buf_idx;
-                    if (idx < buffers.items.len) {
-                        if (direds.items[idx]) |*d| {
-                            if (delta > 0) {
-                                var n: usize = @intCast(delta);
-                                while (n > 0) : (n -= 1) d.moveDown();
-                            } else {
-                                var n: usize = @intCast(-delta);
-                                while (n > 0) : (n -= 1) d.moveUp();
-                            }
-                            // Keep the dired's mirror cursor on the
-                            // selection, the mirrorDiredLines invariant.
-                            buffers.items[idx].cursor_row = @min(d.selected, buffers.items[idx].lines.items.len -| 1);
-                        } else {
-                            buffers.items[idx].moveLines(delta);
-                        }
+                    const nf = @constCast(p);
+                    if (nf != focused) {
+                        focused = nf;
+                        current = nf.buf_idx;
                     }
                 }
             },
