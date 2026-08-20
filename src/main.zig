@@ -70,6 +70,11 @@ const YankState = struct {
 const Event = union(enum) {
     key_press: vaxis.Key,
     key_release: vaxis.Key,
+    /// A mouse report (SGR 1006, subscribed at startup via
+    /// vx.setMouseMode): the wheel events are the touchpad's two-finger
+    /// scroll and a mouse wheel alike. Rows and columns are screen
+    /// cells; the handler hits the pane layout (see paneAtScreen).
+    mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
     /// The terminal lost focus (DECSET 1004 focus reporting, enabled at
     /// startup): a key-up can be lost with it — Alt+Tab while holding
@@ -2671,6 +2676,7 @@ fn restoreEditorWindows(gpa: std.mem.Allocator, vx: *vaxis.Vaxis, tty: *vaxis.Tt
     if (vaxis.Tty.SetConsoleOutputCP(65001) == .FALSE) {}
     try vx.enterAltScreen(tty.writer());
     setFocusReporting(tty, true);
+    vx.setMouseMode(tty.writer(), true) catch {};
     vx.subscribeToColorSchemeUpdates(tty.writer()) catch {};
     vx.queryColor(tty.writer(), .bg) catch {};
     if (tty.getWinsize() catch null) |ws| {
@@ -2685,6 +2691,7 @@ fn restoreEditor(gpa: std.mem.Allocator, vx: *vaxis.Vaxis, tty: *vaxis.Tty) !voi
     _ = vaxis.Tty.makeRaw(tty.fd.handle) catch {};
     try vx.enterAltScreen(tty.writer());
     setFocusReporting(tty, true);
+    vx.setMouseMode(tty.writer(), true) catch {};
     vx.subscribeToColorSchemeUpdates(tty.writer()) catch {};
     vx.queryColor(tty.writer(), .bg) catch {};
     if (tty.getWinsize() catch null) |ws| {
@@ -4112,9 +4119,9 @@ fn renderDiredPane(win: vaxis.Window, frame: *FrameAllocs, buf: *Buffer, dired: 
 /// candidate rows plus the prompt row, capped to leave at least one row
 /// for the panes above (and never more than half the display). Emacs's
 /// icomplete-vertical shrinks the windows the same way.
-fn pickerHeight(pv: PickerView, body_height: u16) u16 {
+fn pickerHeight(visible_len: usize, body_height: u16) u16 {
     const max_rows: u16 = @max(1, @min(10, body_height / 2));
-    const cand_rows: u16 = @intCast(@min(pv.visible.len, @as(usize, max_rows)));
+    const cand_rows: u16 = @intCast(@min(visible_len, @as(usize, max_rows)));
     const cap: u16 = if (body_height > 2) body_height - 1 else body_height;
     return @min(cand_rows + 1, cap);
 }
@@ -4360,6 +4367,34 @@ fn renderTree(
             drawHLine(win, @intCast(x_off), y_off + top_h, width);
             renderTree(win, frame, gpa, pane.left.?, x_off, y_off, width, top_h, modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, quick_jump, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
             renderTree(win, frame, gpa, pane.right.?, x_off, y_off + top_h + 1, width, height -| (top_h + 1), modeline_bufs, slot_counter, buffers, direds, focused, io, picker, bookmarks, recent, quick_jump, find_file, bookmark_prompt, goto_prompt, grep_prompt, grep_view, files_view, occur_view, grep_hl, search, replace, compress_menu, archive_query, dired_prompt, status, focused_h, focused_w);
+        },
+    }
+}
+
+/// The leaf pane that owns the screen cell (col, row) — renderTree's
+/// layout math mirrored so the wheel scrolls exactly the pane under the
+/// pointer: a vertical split's left child takes [x_off, x_off + left_w),
+/// its right child the rest after the one divider column; a horizontal
+/// split's top child takes [y_off, y_off + top_h), its bottom child the
+/// rows after the divider. The divider column / row belongs to no pane,
+/// and a cell outside the area entirely (the tab bar, the picker dock)
+/// matches nothing.
+fn paneAtScreen(pane: *const Pane, col: i17, row: i17, x_off: i17, y_off: i17, width: u16, height: u16) ?*const Pane {
+    if (pane.isLeaf()) {
+        if (col >= x_off and col < x_off + @as(i17, @intCast(width)) and row >= y_off and row < y_off + @as(i17, @intCast(height))) return pane;
+        return null;
+    }
+    switch (pane.dir) {
+        .vertical => {
+            const left_w: u16 = @intCast((@as(u32, width) * pane.left_frac) / 256);
+            const right_x: i17 = x_off + @as(i17, @intCast(left_w)) + 1;
+            return paneAtScreen(pane.left.?, col, row, x_off, y_off, left_w, height) orelse
+                paneAtScreen(pane.right.?, col, row, right_x, y_off, width -| (left_w + 1), height);
+        },
+        .horizontal => {
+            const top_h: u16 = @intCast((@as(u32, height) * pane.left_frac) / 256);
+            return paneAtScreen(pane.left.?, col, row, x_off, y_off, width, top_h) orelse
+                paneAtScreen(pane.right.?, col, row, x_off, y_off + @as(i17, @intCast(top_h)) + 1, width, height -| (top_h + 1));
         },
     }
 }
@@ -6028,6 +6063,12 @@ pub fn main(init: std.process.Init) !void {
     try vx.enterAltScreen(tty.writer());
     setFocusReporting(&tty, true);
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
+    // Mouse reporting on: the wheel (mouse wheel and a touchpad's
+    // two-finger scroll) arrives as .mouse events, hitting the pane
+    // under the pointer (see the .mouse arm). The enable sequence is
+    // plain SGR — every modern terminal speaks it; one that doesn't
+    // report the mouse simply never sends a .mouse event.
+    vx.setMouseMode(tty.writer(), true) catch {};
     // Follow the terminal's background scheme (dark / light): the
     // subscription reports the current scheme and every change, as
     // .color_scheme events (theme_dark / dimStyle). Subscribed
@@ -6478,6 +6519,73 @@ pub fn main(init: std.process.Init) !void {
                 // here.
                 windows_pending_alt = false;
                 repeat_map = null;
+            },
+            .mouse => |m| mouse_blk: {
+                // The wheel scrolls the pane under the pointer — a
+                // touchpad's two-finger swipe and a mouse wheel alike.
+                // The editor's scrolling is cursor-driven, so the wheel
+                // walks the cursor of the pane it lands on (a dired's
+                // selection steps like n / p); over the picker's docked
+                // rows the picker's selection walks instead. The focused
+                // pane keeps its focus — only the view under the pointer
+                // scrolls.
+                if (m.button != .wheel_up and m.button != .wheel_down) break :mouse_blk;
+                const delta: isize = if (m.button == .wheel_up) -3 else 3;
+                // The confirm prompts and the query-replace walk are
+                // modal: any other key is ignored while they are up, and
+                // the wheel is that — nothing scrolls.
+                if (confirming_quit or confirming_kill or confirming_ibuffer_kill or confirming_ibuffer_del or confirming_delete or confirming_open or replace_active or replace_prompt != null) break :mouse_blk;
+                // An active isearch is modal too, but it ends like any
+                // other key: the search confirms where it is (the query
+                // is remembered for the next C-s), then the scroll
+                // proceeds.
+                if (isearch_active) {
+                    syncDiredSelection(direds.items, current, buffers.items[current]);
+                    rememberIsearch(gpa, &isearch_last, isearch_query.items);
+                    isearch_active = false;
+                }
+                // Screen rows count from the top of the display; the
+                // pane layout is body-relative (a tab bar takes the top
+                // row once a second tab is open).
+                const tab_off: i17 = if (tabs.items.len > 1) 1 else 0;
+                const screen_h: i17 = @intCast(vx.screen.height);
+                const body_h: u16 = if (tabs.items.len > 1) vx.screen.height -| 1 else vx.screen.height;
+                const row_body: i17 = @as(i17, @intCast(m.row)) - tab_off;
+                if (m.col < 0 or row_body < 0 or row_body >= screen_h - tab_off) break :mouse_blk;
+                if (picker_kind) |_| {
+                    // The picker (C-x b / C-c o / M-l l) docks at the
+                    // bottom of the display, icomplete-vertical style:
+                    // over its rows the wheel walks the selection, not
+                    // the buffer behind it.
+                    const ph = pickerHeight(picker_visible.items.len, body_h);
+                    if (@as(u16, @intCast(row_body)) >= body_h -| ph) {
+                        const pos = pickerSelectionPos(picker_visible.items, picker_selected);
+                        const np = @as(isize, @intCast(pos)) + delta;
+                        if (np >= 0 and np < @as(isize, @intCast(picker_visible.items.len))) {
+                            picker_selected = picker_visible.items[@intCast(np)];
+                        }
+                        break :mouse_blk;
+                    }
+                }
+                if (paneAtScreen(root, m.col, row_body, 0, 0, vx.screen.width, body_h)) |p| {
+                    const idx = p.buf_idx;
+                    if (idx < buffers.items.len) {
+                        if (direds.items[idx]) |*d| {
+                            if (delta > 0) {
+                                var n: usize = @intCast(delta);
+                                while (n > 0) : (n -= 1) d.moveDown();
+                            } else {
+                                var n: usize = @intCast(-delta);
+                                while (n > 0) : (n -= 1) d.moveUp();
+                            }
+                            // Keep the dired's mirror cursor on the
+                            // selection, the mirrorDiredLines invariant.
+                            buffers.items[idx].cursor_row = @min(d.selected, buffers.items[idx].lines.items.len -| 1);
+                        } else {
+                            buffers.items[idx].moveLines(delta);
+                        }
+                    }
+                }
             },
             .color_scheme => |scheme| {
                 // The terminal's background scheme (CSI 997n,
@@ -9864,7 +9972,7 @@ pub fn main(init: std.process.Init) !void {
                 // display (the echo area), and the panes shrink up to
                 // make room — their modelines sit just above the picker,
                 // not buried under it.
-                const ph = pickerHeight(pv, body.height);
+                const ph = pickerHeight(pv.visible.len, body.height);
                 const panes_h = body.height -| ph;
                 if (panes_h >= 1) {
                     const panes_win = body.child(.{ .x_off = 0, .y_off = 0, .width = body.width, .height = panes_h });
@@ -9890,7 +9998,7 @@ pub fn main(init: std.process.Init) !void {
             // the bottom of the display, and the buffer/dired shrinks up
             // to make room — its modeline sits just above the picker.
             const pv = picker_view.?;
-            const ph = pickerHeight(pv, body.height);
+            const ph = pickerHeight(pv.visible.len, body.height);
             const panes_h = body.height -| ph;
             if (panes_h >= 1) {
                 const panes_win = body.child(.{ .x_off = 0, .y_off = 0, .width = body.width, .height = panes_h });

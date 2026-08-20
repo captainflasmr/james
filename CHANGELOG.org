@@ -10,6 +10,12 @@ This document contains the release notes for james.
 
 * Versions
 
+** 0.82.0 — <2026-08-20>
+
+The mouse wheel scrolls — a touchpad's two-finger swipe and a hardware wheel alike, which closes the "touchpad/mouse scrolling not working in windows" report.
+
+- james's scrolling is cursor-driven, so the wheel walks the cursor of the pane under the pointer, three lines per notch, the view following. The focused pane keeps its focus: hovering over the other side of a split scrolls it without taking you out of the window you're typing in. Over a dired the wheel steps the selection instead — three entries per notch, the trailing newline row where =M->= rests included, like =n= / =p= — and over a docked picker's rows (=C-x b=, the bookmark / recent-files pickers) it steps the picker's selection through the visible candidates. An active isearch confirms on the wheel exactly as it does on any other key, and the confirm prompts (=C-x C-c=, dired =D=, ibuffer kills, the query-replace walk) ignore it outright. The terminal's mouse reporting is switched on as the editor starts, restored on exit, and re-enabled after a =C-x j= shell swap, which resets it. The scroll target is found with the same per-pane geometry the renderer uses, so what you point at is what moves. The native and =x86_64-windows= cross builds compile.
+
 ** 0.81.0 — <2026-08-20>
 
 Isearch highlights every match of the query in the buffer while searching — Emacs =isearch-lazy-highlight= — not just the one under the cursor.

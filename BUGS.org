@@ -10,5 +10,3 @@ This document contains the current bugs/improvements, this is just for me mainly
 * Bugs/Improvements
 
 - [ ] windows check deletions are going to trash
-
-- [ ] touchpad/mouse scrolling not working in windows
