@@ -3045,11 +3045,13 @@ fn trashFile(io: std.Io, gpa: std.mem.Allocator, environ_map: *std.process.Envir
         // two silent holes, though: the Recycle Bin disabled for the
         // volume, or an entry larger than the volume's bin size limit,
         // both of which permanently delete without throwing — so after
-        // the delete the script also asks the Shell whether the item is
-        // actually in the Recycle Bin, and reports and exits nonzero when
-        // it is not rather than let james claim a recycle that destroyed
-        // the file. (The check queries the bin by the original path, which
-        // the Shell keeps on its items; PowerShell -eq is case-insensitive.)
+        // the delete the script scans the volume's $Recycle.Bin metadata
+        // ($I files, which record the original full path of every
+        // recycled item — hidden and system ones like desktop.ini
+        // included, unlike a Shell.Namespace enumeration) and reports
+        // and exits nonzero when the path appears in none of them
+        // rather than let james claim a recycle that destroyed the
+        // file. (PowerShell -eq compares case-insensitively.)
         const q = psQuote(gpa, path) catch return false;
         defer gpa.free(q);
         const ps = std.fmt.allocPrint(
@@ -3068,9 +3070,25 @@ fn trashFile(io: std.Io, gpa: std.mem.Allocator, environ_map: *std.process.Envir
             \\  [Console]::Error.WriteLine($_.Exception.Message)
             \\  exit 1
             \\}}
-            \\$shell = New-Object -ComObject Shell.Application
-            \\foreach ($item in $shell.Namespace(10).Items()) {{
-            \\  if ($item.Path -eq $full) {{ exit 0 }}
+            \\$root = [System.IO.Path]::GetPathRoot($full)
+            \\$bin = Join-Path $root '$Recycle.Bin'
+            \\foreach ($sid in Get-ChildItem -LiteralPath $bin -Directory -Force -ErrorAction SilentlyContinue) {{
+            \\  foreach ($info in Get-ChildItem -LiteralPath $sid.FullName -File -Filter '$I*' -Force -ErrorAction SilentlyContinue) {{
+            \\    try {{
+            \\      $stream = [System.IO.File]::OpenRead($info.FullName)
+            \\      try {{
+            \\        $stream.Position = 24
+            \\        $reader = New-Object System.IO.BinaryReader($stream)
+            \\        $len = $reader.ReadUInt32()
+            \\        if ($len -gt 0 -and $len -lt 32768) {{
+            \\          $orig = [System.Text.Encoding]::Unicode.GetString($reader.ReadBytes([int]($len * 2)))
+            \\          if ($orig.TrimEnd([char]0) -eq $full) {{ exit 0 }}
+            \\        }}
+            \\      }} finally {{
+            \\        $stream.Dispose()
+            \\      }}
+            \\    }} catch {{}}
+            \\  }}
             \\}}
             \\[Console]::Error.WriteLine('not in the Recycle Bin (disabled or larger than the bin''s size limit?): ' + $p)
             \\exit 3
@@ -7641,7 +7659,6 @@ pub fn main(init: std.process.Init) !void {
                             var idxs: std.ArrayList(usize) = .empty;
                             defer idxs.deinit(gpa);
                             diredOpIndices(gpa, d, &idxs);
-                            var any = false;
                             var failed = false;
                             // The reason for a failed trash — the locked
                             // file, or the Windows check that found the
@@ -7652,13 +7669,16 @@ pub fn main(init: std.process.Init) !void {
                                 const en = d.entries.items[i];
                                 const path = try std.fs.path.join(gpa, &.{ d.path.items, en.name });
                                 defer gpa.free(path);
-                                if (trashFile(io, gpa, init.environ_map, path, &trash_reason)) {
-                                    any = true;
-                                } else {
+                                if (!trashFile(io, gpa, init.environ_map, path, &trash_reason)) {
                                     failed = true;
                                 }
                             }
-                            if (any) refreshDired(gpa, io, &buffers, &direds, current);
+                            // Refresh the listing even when every entry
+                            // "failed" — a failed trash may still have moved
+                            // the file (a desktop.ini that went to the
+                            // Recycle Bin but flunked the check), so a stale
+                            // listing would invite a doomed second delete.
+                            refreshDired(gpa, io, &buffers, &direds, current);
                             if (failed) {
                                 const why = std.mem.sliceTo(&trash_reason, 0);
                                 if (why.len > 0) {
