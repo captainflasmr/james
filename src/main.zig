@@ -4554,7 +4554,6 @@ const welcome_tail =
     \\    C-c d               duplicate the selected entry in dired
     \\    C-c w               copy the region
     \\    C-c C-k             close the dired buffer
-    \\    C-c l               pick a bookmark (type to filter)
     \\    C-c f               find files (fuzzy list; M-r filters by regexp)
     \\    C-c g               grep the current directory (Enter opens, F follows)
     \\    C-c j / C-c k       step back / forward through window layouts (j / k repeat)
@@ -4569,9 +4568,9 @@ const welcome_tail =
     \\    M-l g               the config directory
     \\    M-l i               the Emacs-vanilla config
     \\    M-l y               the Emacs-DIYer config
-    \\    M-l l               the scratch buffer
-    \\    M-l o               pick a bookmark (type to filter)
+    \\    M-l o               the scratch buffer
     \\    M-l ;               pick a recently opened file
+    \\    M-l l               pick a bookmark (type to filter)
     \\    M-l = / M-l -       new / close tab
     \\
     \\  Tabs and windows:
@@ -4901,7 +4900,7 @@ fn syncDiredSelection(direds: []?Dired, current: usize, buf: *Buffer) void {
 }
 
 /// The row source of the modal picker: the open buffers (C-x b), the
-/// bookmarks (C-c l / M-l o), or the recent files (M-l ;).
+/// bookmarks (M-l l), or the recent files (M-l ;).
 const PickerKind = enum { buffers, bookmarks, recent };
 
 /// The picker state for rendering: the row kind, the visible rows
@@ -6425,7 +6424,7 @@ pub fn main(init: std.process.Init) !void {
     var ibuffer_gen: usize = 0;
     // The *Bookmarks* buffer (C-x r l, Emacs's bookmark-bmenu-list): the
     // persistent buffer listing every bookmark, the buffer sibling of
-    // the C-c l / M-l o bookmark picker. `bookmarks_rows` maps each entry
+    // the M-l l bookmark picker. `bookmarks_rows` maps each entry
     // row (line minus the header and ruler) to its bookmark index. The
     // listing is rebuilt whenever it is opened and whenever the bookmark
     // list changes (see bookmark_list_gen); `bookmarks_gen` remembers
@@ -6434,7 +6433,7 @@ pub fn main(init: std.process.Init) !void {
     var bookmarks_rows: std.ArrayList(usize) = .empty;
     defer bookmarks_rows.deinit(gpa);
     var bookmarks_gen: usize = 0;
-    // The modal picker (C-x b buffers, C-c l / M-l o bookmarks,
+    // The modal picker (C-x b buffers, M-l l bookmarks,
     // M-l ; recent files): one at a time, over rows that filter as you
     // type (see pickerFilter). `picker_kind` selects the row source;
     // `picker_selected` is the full-list index of the selection and
@@ -6672,7 +6671,7 @@ pub fn main(init: std.process.Init) !void {
                 if (m.button == .wheel_up or m.button == .wheel_down) {
                     const delta: isize = if (m.button == .wheel_up) -3 else 3;
                     if (picker_kind) |_| {
-                        // The picker (C-x b / C-c l / M-l ;) docks at the
+                        // The picker (C-x b / M-l l / M-l ;) docks at the
                         // bottom of the display, icomplete-vertical style:
                         // over its rows the wheel walks the selection, not
                         // the buffer behind it.
@@ -7118,16 +7117,6 @@ pub fn main(init: std.process.Init) !void {
                             recordWindow(gpa, root, focused, current, &window_undo, &window_redo);
                             current = closeBuffer(gpa, &buffers, &direds, root, focused, current, &window_undo, &window_redo);
                         }
-                    } else if (key.matches('l', .{})) {
-                        // C-c l: open the bookmark picker (the "favorites"
-                        // key from the Jasspa setup — bookmarks are this
-                        // editor's favourites; l sits under the left hand
-                        // next to the C-c prefix).
-                        picker_kind = .bookmarks;
-                        picker_selected = 0;
-                        picker_top = 0;
-                        picker_query.clearRetainingCapacity();
-                        pickerFilter(gpa, .bookmarks, buffers.items, bookmarks.items, recent.items, "", &picker_visible, &picker_hl);
                     } else if (key.matches('f', .{})) {
                         // C-c f: find files (the my/find-file key from the
                         // author's Emacs) — the platform's file-finder
@@ -8378,7 +8367,7 @@ pub fn main(init: std.process.Init) !void {
                     } else if (key.matches('l', .{})) {
                         // C-x r l: open (or switch to) the *Bookmarks* —
                         // the persistent buffer listing every bookmark,
-                        // Emacs's bookmark-bmenu-list (the C-c l / M-l o
+                        // Emacs's bookmark-bmenu-list (the M-l l
                         // picker is the transient quick-access list; this
                         // is the full listing). The listing is rebuilt on
                         // entry, and the window layout otherwise
@@ -8427,15 +8416,7 @@ pub fn main(init: std.process.Init) !void {
                     if (key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                         // abort the prefix
                     } else if (key.matches('o', .{})) {
-                        // M-l o: bookmark-jump — the bookmark picker
-                        // (the C-c l favorites list).
-                        picker_kind = .bookmarks;
-                        picker_selected = 0;
-                        picker_top = 0;
-                        picker_query.clearRetainingCapacity();
-                        pickerFilter(gpa, .bookmarks, buffers.items, bookmarks.items, recent.items, "", &picker_visible, &picker_hl);
-                    } else if (key.matches('l', .{})) {
-                        // M-l l: switch to the *scratch* buffer — the
+                        // M-l o: switch to the *scratch* buffer — the
                         // scratch.txt file the home-screen layout also
                         // opens (created here if missing, never truncated).
                         var found: ?usize = null;
@@ -8464,11 +8445,19 @@ pub fn main(init: std.process.Init) !void {
                             // silently doing nothing.
                             status_msg = "Can't open scratch buffer";
                         }
+                    } else if (key.matches('l', .{})) {
+                        // M-l l: bookmark-jump — the bookmark picker
+                        // (the favorites list, on the key nearest the
+                        // M-l prefix).
+                        picker_kind = .bookmarks;
+                        picker_selected = 0;
+                        picker_top = 0;
+                        picker_query.clearRetainingCapacity();
+                        pickerFilter(gpa, .bookmarks, buffers.items, bookmarks.items, recent.items, "", &picker_visible, &picker_hl);
                     } else if (key.matches(';', .{})) {
                         // M-l ;: pick a recently opened file (the
-                        // my/fido-recentf picker, demoted from l — the
-                        // key the author actually uses often is l, and
-                        // this one is just the next jump in the map).
+                        // my/fido-recentf picker — rarely used, parked at
+                        // the far key).
                         if (recent.items.len > 0) {
                             picker_kind = .recent;
                             picker_selected = 0;
