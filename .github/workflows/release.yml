@@ -1,0 +1,50 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Locked to what build.zig.zon pins; setup-zig also persists the Zig
+      # cache between runs, so repeat releases rebuild in seconds.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Fetch dependencies
+        run: zig build --fetch
+
+      - name: Build the portable set
+        run: ./build.sh -t dist
+
+      - name: Attach to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ver=$(grep -m1 '^\*\* ' CHANGELOG.org | sed -E 's/^\*\*[[:space:]]+//; s/<.*$//; s/[^0-9A-Za-z.+_-]+$//')
+          [[ -n "$ver" ]] || { echo "Error: no '** <version> — <date>' heading in CHANGELOG.org" >&2; exit 1; }
+          tag="v$ver"
+          # A tag push must agree with the changelog; a manual run (no tag)
+          # creates the release from the changelog version.
+          if [[ "${GITHUB_REF_NAME:-}" == v* && "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo "Error: pushed tag is $GITHUB_REF_NAME but CHANGELOG.org says $ver" >&2
+            exit 1
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --clobber
+          else
+            gh release create "$tag" dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
+              --title "james $ver" \
+              --notes "Portable james builds: Linux (x86_64 / aarch64 / x86, static musl), Windows (x86_64 / x86, plus the taskbar-pinning .lnk), macOS (aarch64 / x86_64), FreeBSD (x86_64 / x86). SHA256SUMS included for verifying your copies."
+          fi
