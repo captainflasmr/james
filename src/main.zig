@@ -2969,6 +2969,32 @@ fn runTool(io: std.Io, argv: []const []const u8) bool {
     return (runToolCode(io, argv) orelse return false) == 0;
 }
 
+/// Run `argv` to completion, stdout ignored, stderr appended into `err`;
+/// the exit code, or null when it can't run. The Windows trash path needs
+/// the stderr text to report *why* a recycle failed rather than swallow
+/// it (see trashFile).
+fn runToolCapture(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8, err: *std.ArrayList(u8)) ?u8 {
+    var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .pipe }) catch return null;
+    if (child.stderr) |f| {
+        // The pipe must not be closed here: child.wait's cleanup closes
+        // the handles, and closing the fd twice panics (BADF) in Debug
+        // builds and corrupts the descriptor table in Release ones.
+        var buf: [256]u8 = undefined;
+        var r = f.reader(io, &buf);
+        var chunk: [256]u8 = undefined;
+        while (true) {
+            const n = r.interface.readSliceShort(&chunk) catch break;
+            if (n == 0) break;
+            err.appendSlice(gpa, chunk[0..n]) catch break;
+        }
+    }
+    const term = child.wait(io) catch return null;
+    return switch (term) {
+        .exited => |code| code,
+        else => null,
+    };
+}
+
 /// The base name and last extension of `name`, the way the author's
 /// Emacs config's file-name-base / file-name-extension see them — a
 /// leading dot is not an extension (".bashrc" is all base) — for the
@@ -3006,20 +3032,66 @@ fn trashDeletionDate(buf: []u8, io: std.Io) []const u8 {
 /// in XDG_DATA_HOME/Trash/files (or ~/.local/share/Trash/files) with a
 /// .trashinfo sidecar in Trash/info and a name-collision counter
 /// (foo.tar.gz → foo.tar.1.gz), exactly like the config's Linux branch.
-/// Returns true on success.
-fn trashFile(io: std.Io, gpa: std.mem.Allocator, environ_map: *std.process.Environ.Map, path: []const u8) bool {
+/// On Windows the delete is verified against the Recycle Bin afterwards
+/// (see the branch below); a failure of any kind writes a NUL-terminated
+/// reason into `reason` (512 bytes, "" on success) for the caller's
+/// modeline message. Returns true on success.
+fn trashFile(io: std.Io, gpa: std.mem.Allocator, environ_map: *std.process.Environ.Map, path: []const u8, reason: *[512]u8) bool {
     if (comptime builtin.os.tag == .windows) {
         // The same VisualBasic FileSystem API the config calls:
-        // DeleteFile / DeleteDirectory with SendToRecycleBin.
+        // DeleteFile / DeleteDirectory with SendToRecycleBin. A failure
+        // to delete (a locked file, no permission, a path too long) makes
+        // the script exit nonzero, which the caller reports. That call has
+        // two silent holes, though: the Recycle Bin disabled for the
+        // volume, or an entry larger than the volume's bin size limit,
+        // both of which permanently delete without throwing — so after
+        // the delete the script also asks the Shell whether the item is
+        // actually in the Recycle Bin, and reports and exits nonzero when
+        // it is not rather than let james claim a recycle that destroyed
+        // the file. (The check queries the bin by the original path, which
+        // the Shell keeps on its items; PowerShell -eq is case-insensitive.)
         const q = psQuote(gpa, path) catch return false;
         defer gpa.free(q);
         const ps = std.fmt.allocPrint(
             gpa,
-            "Add-Type -AssemblyName Microsoft.VisualBasic; $ErrorActionPreference='Stop'; $p={s}; try {{ if (Test-Path -LiteralPath $p -PathType Container) {{ [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p,'OnlyErrorDialogs','SendToRecycleBin') }} else {{ [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p,'OnlyErrorDialogs','SendToRecycleBin') }} }} catch {{ Write-Error $_; exit 1 }}",
+            \\$ErrorActionPreference='Stop'
+            \\Add-Type -AssemblyName Microsoft.VisualBasic
+            \\$p={s}
+            \\$full = [System.IO.Path]::GetFullPath($p)
+            \\try {{
+            \\  if (Test-Path -LiteralPath $p -PathType Container) {{
+            \\    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p,'OnlyErrorDialogs','SendToRecycleBin')
+            \\  }} else {{
+            \\    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p,'OnlyErrorDialogs','SendToRecycleBin')
+            \\  }}
+            \\}} catch {{
+            \\  [Console]::Error.WriteLine($_.Exception.Message)
+            \\  exit 1
+            \\}}
+            \\$shell = New-Object -ComObject Shell.Application
+            \\foreach ($item in $shell.Namespace(10).Items()) {{
+            \\  if ($item.Path -eq $full) {{ exit 0 }}
+            \\}}
+            \\[Console]::Error.WriteLine('not in the Recycle Bin (disabled or larger than the bin''s size limit?): ' + $p)
+            \\exit 3
+            \\
+            ,
             .{q},
         ) catch return false;
         defer gpa.free(ps);
-        return runTool(io, &.{ "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps });
+        var err: std.ArrayList(u8) = .empty;
+        defer err.deinit(gpa);
+        const code = runToolCapture(io, gpa, &.{ "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps }, &err) orelse return false;
+        if (code == 0) return true;
+        const why = std.mem.trim(u8, err.items, " \t\r\n");
+        if (why.len > 0) {
+            const n = @min(why.len, reason.len - 1);
+            @memcpy(reason[0..n], why[0..n]);
+            reason[n] = 0;
+        } else {
+            reason[0] = 0;
+        }
+        return false;
     }
 
     // freedesktop.org trash: XDG_DATA_HOME/Trash, or the default
@@ -7571,18 +7643,30 @@ pub fn main(init: std.process.Init) !void {
                             diredOpIndices(gpa, d, &idxs);
                             var any = false;
                             var failed = false;
+                            // The reason for a failed trash — the locked
+                            // file, or the Windows check that found the
+                            // entry was not actually in the Recycle Bin —
+                            // composed into the modeline message below.
+                            var trash_reason: [512]u8 = undefined;
                             for (idxs.items) |i| {
                                 const en = d.entries.items[i];
                                 const path = try std.fs.path.join(gpa, &.{ d.path.items, en.name });
                                 defer gpa.free(path);
-                                if (trashFile(io, gpa, init.environ_map, path)) {
+                                if (trashFile(io, gpa, init.environ_map, path, &trash_reason)) {
                                     any = true;
                                 } else {
                                     failed = true;
                                 }
                             }
                             if (any) refreshDired(gpa, io, &buffers, &direds, current);
-                            if (failed) status_msg = "Trash failed";
+                            if (failed) {
+                                const why = std.mem.sliceTo(&trash_reason, 0);
+                                if (why.len > 0) {
+                                    status_msg = std.fmt.bufPrint(&status_buf, "Trash failed: {s}", .{why}) catch "Trash failed";
+                                } else {
+                                    status_msg = "Trash failed";
+                                }
+                            }
                         }
                     } else if (key.matches('n', .{}) or key.matches('n', .{ .ctrl = true }) or key.matches('g', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
                         confirming_delete = false;
