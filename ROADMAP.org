@@ -9,76 +9,15 @@ TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =to
 
 * Near term
 
-** DONE query-replace — M-%
-- Emacs: =query-replace= on =M-%= — ask for the string to find, then its replacement, then walk the matches confirming each one — and =isearch-query-replace=, =M-%= inside a search using the search string.
-- Done in 0.55.0: =M-%= prompts =Query replace: = (prefilled with the word at point) then =Query replace foo with: =, and walks the matches asking =y= / =n= per match — = != replaces all the rest, =.= replaces this one and quits, =^= steps back, =q= / =C-g= / Esc quits, and the walk stops at the end of the buffer (it never re-asks about replaced text, so =a= → =aa= terminates). The current candidate highlights like an isearch match, the replacement carries the match's capitalization (FOO→BAR, Foo→Bar) like Emacs's case-replace, the whole session is one undo step, and =M-%= inside a search (=C-s= / =C-r=) starts from the search string. Editing buffers only.
-- Effort: medium.
-
-** DONE dired get full path / file
-- Emacs: =dired-copy-filename-as-kill= on =w= (the names of the marked files, or the current line's when nothing is marked), and =0 w= — a prefix argument of 0 — copying the absolute file names.
-- Done in 0.53.0: =w= in dired copies the marked entries' file names to the kill ring (the selected one when nothing is marked, ".." never), so =C-y= pastes them anywhere; =0 w= copies the absolute file names instead — a leading =~= expands to the home directory and relative dired paths resolve against the process cwd, like Emacs's expand-file-name. Several names are newline-joined, a following kill appends like =C-k= after =M-w=, and the copied text is echoed on the modeline until the next keypress.
-- Effort: small.
-
-** DONE occur — M-c
-- Emacs: =occur= on =M-c=, and =my/occur-from-isearch= (M-c inside isearch turns the search string into an occur).
-- Done in 0.51.0: every matching line of the current buffer lands in an =*occur*= buffer built on the =*grep*= machinery — =n= / =p= step, Enter jumps to the match in the source (split to the right when alone, window reused otherwise, transient highlight on the term), =F= follows, =g= re-runs over the source picking up edits, =q= / =C-g= closes; =M-c= during isearch starts from the search string.
-- Effort: small-to-medium (clone of the results-buffer path).
-
-** DONE Dired: compress
-- Emacs: =my/dired-compress-transient= formats (xz / gzip / tar.gz / bzip2 / zstd / lzip / 7z) with async progress.
-- Done in 0.56.0: =z= in dired compresses the marked entries (or the selected one, ".." never) — a file that already carries a compression suffix is decompressed instead. Anything else opens a one-key format menu in the modeline offering *only the tools this platform actually has*: a single file gets gzip / xz / bzip2 / zstd / lzip / zip / 7z, a directory or several files the tar-style tar.gz / tar.xz / tar.bz2 / tar.zst / tar.lz / zip / 7z (several files prompt for the archive name, defaulting to the directory name). The single-file tools replace the file like =gzip -9=; archives are named after the entry. Windows — which ships =tar.exe= (bsdtar) and PowerShell's =Compress-Archive= / =Expand-Archive= but no gzip — sees zip / tar.gz / tar.xz / tar.bz2 / 7z, and decompresses through those same tools; suffixes with no standard tool on the platform (a bare =gz= on Windows) report failure. The dired refreshes and the modeline reports =Compressed foo.tar.gz (1.2K)=.
-- Effort: medium.
-
-** DONE Deleted files to trash
-
-- Put deleted files into the Trash folder.
-
 * Medium term
-
-** DONE Quick window jump — M-o
-- Emacs: =my/quick-window-jump= — each window gets a one-char label (j/k/l/;/a/s/d/f), typing it jumps; direct jump when two windows.
-- Transposes cleanly to a TUI (overlay labels in the corners like ace-window). james only cycles with =M-n= / =M-p= today.
-- Effort: small-to-medium.
-- Done: =M-o= with two windows jumps straight across; with more, each window draws its one-char label (=j= =k= =l= =;= =a= =s= =d= =f=, in render order) in its top-left corner and the label key jumps to its window, =C-g= / Esc cancelling the labels.
 
 * Quick wins
 
-** DONE M-h mark block
-- Emacs: =my/mark-block= — mark the text between surrounding blank lines. Trivial in james (scan rows, set mark).
-- Done in 0.60.0: =M-h= (Emacs =mark-paragraph=) marks the block around the cursor — the run of non-blank lines bounded by blank lines, mark at the paragraph's start, cursor at its end, so the region is the whole paragraph for =M-w= / =C-w=; on a blank line the following paragraph is marked (falling back to the previous one).
-
-** DONE Isearch lazy count
-- Emacs: =isearch-lazy-count= with the =(%s/%s)= format; show match position / total in the modeline while searching.
-- Done in 0.54.0: while searching, the modeline's =I-search:= prompt trails the query with = (N/M)= — the current match's 1-based position and the query's total, like Emacs's isearch-lazy-count. In buffers and direds the count covers the buffer's lines (the dired mirror included); in the pickers, the visible rows. A failing search shows =(0/0)=, and an empty query shows no count. The count is recomputed once per search keystroke, not per frame.
-- Effort: small.
-
-** DONE Isearch lazy highlight
-- Emacs: =isearch-lazy-highlight= — while searching, every match of the query in the buffer is highlighted, not just the one under the cursor.
-- Done in 0.81.0: an active search highlights every match of the query in the searched buffer — file buffers, direds' names, and the results buffers alike — computed per visible row at render time with the same per-line, ASCII case-insensitive scan as the lazy count, so the glowing set and the =(N/M)= totals always agree; the block cursor and bold current line mark the match being walked, a failing search still shows where all the matches are, and confirming or cancelling leaves the buffer exactly as before. The pickers keep their own single-row highlight.
-- Effort: small.
-
-** DONE Mouse wheel scroll
-- Emacs: =mouse-wheel-scroll-amount=-style scrolling, here three lines per notch, under the pointer rather than moving the focus.
-- Done in 0.82.0: the mouse wheel (and a touchpad's two-finger swipe, which terminals report as wheel events) scrolls the pane under the pointer — the cursor walks three lines per notch, the view following — the focused pane keeping its focus, so stepping over the other side of a split reads it without losing your place. Over a dired the selection steps instead (three entries per notch, the trailing newline row included, like =n= / =p=), and over a docked picker's rows it steps the picker's selection through the visible candidates. An active isearch confirms first, exactly as any other key would; the confirm prompts and the query-replace walk ignore the wheel entirely. Mouse reporting is requested from the terminal at startup, restored on exit, and re-enabled after the =C-x j= shell swap, which resets it; the scroll target comes from the same per-pane geometry the renderer uses.
-- Effort: small.
-
-** DONE Dired trash delete
-- Emacs: =my/dired-async-do-delete= (trash instead of =D='s hard delete, with a confirm prompt like james's existing y/n) and =delete-by-moving-to-trash=.
-- Done in 0.57.0: =D= never hard-deletes — the confirm prompt now reads =Move X to the trash?= and the entries go to the platform trash: the Windows Recycle Bin through PowerShell's =Microsoft.VisualBasic= =FileSystem.DeleteFile/DeleteDirectory= with =SendToRecycleBin= (the same API the config's Windows branch calls), and the freedesktop.org trash elsewhere — =XDG_DATA_HOME=/Trash/files (or =~/.local/share/Trash/files=) with a =.trashinfo= sidecar in =Trash/info= (Path + UTC ISO 8601 DeletionDate) and the config's name-collision counter (=foo.tar.gz= → =foo.tar.1.gz=). A failed trash leaves the file alone and reports =Trash failed=.
-
-** DONE Dired duplicate file
-- Emacs: =my/dired-duplicate-file= (=_NNN= incremented names, async).
-- Done in 0.58.0: =C-c d= in dired duplicates the selected entry with the config's name scheme — =foo.txt= → =foo_001.txt=, =foo.tar.gz= → =foo.tar_001.gz=, the first free number (a prefix arg sets the starting counter in Emacs; james always starts at 1) — directories recursively. The copy uses the built-in tools: =cp -a= (the twin of the config's =rsync -a=) on POSIX, =robocopy= for directories and PowerShell =Copy-Item= for files on Windows (robocopy's 0-7 exit codes count as success, like the config). The dired refreshes and the modeline reports =Duplicated: foo_001.txt=.
-
 * Deferred
 
-- **Go-to-definition (M-.)** — Emacs has the xref memoization + live-preview stack and etags for C-family code; james would need a dumb rg/etags-based index. Valuable for a coder's editor, but the largest item here.
-- **Folding** — Emacs =my/selective-display-fold= folds by indentation; james has no folding at all.
-- **Centered buffer** — Emacs =my/center-buffer-mode= (olivetti-style margins); aesthetic, no editing payoff.
-- **Named shell buffers + popup manager** — Emacs =my/shell-menu= with popper-style popups; james's =C-x j= real-shell drop covers most of the need.
-- **Rainbow color overlays** — Emacs =my/rainbow-mode=; needs rendering-layer support beyond current styles.
-- **Org publish / RSS / picture tagging / gh-release** — genuinely useful in Emacs but too domain-specific for a mini editor.
-
-* Already in james
-
-=recentf= (=M-l l=), grep (=C-c g=), find files (=C-c f=), tabs (=M-l ==, =M-l -=, =M-1..9=, =M-i=, =M-u=), winner-mode window history (=C-c j= / =C-c k=) with sticky repeat (=j= / =k=, and =M-n= / =M-p= / =C-x o= → =n= / =p= / =o=), dired sorting (3/4/5/6, =s=) and dwim-target copy/rename, dired compress (=z=), dired trash delete (=D=) and duplicate (=C-c d=), window resize (=C-M-h/j/k/l=), quarter-page and page scrolling (=M-j/k=, =M-J/K=), jump keys (=M-l= prefix), comment/uncomment (=C-;=), copy line / buffer / region (=M-w=, =C-c b=, =C-c w=), mark block (=M-h=), query-replace (=M-%=), shell drop (=C-x j= / =C-x c=).
+- *Go-to-definition (M-.)* — Emacs has the xref memoization + live-preview stack and etags for C-family code; james would need a dumb rg/etags-based index. Valuable for a coder's editor, but the largest item here.
+- *Folding* — Emacs =my/selective-display-fold= folds by indentation; james has no folding at all.
+- *Centered buffer* — Emacs =my/center-buffer-mode= (olivetti-style margins); aesthetic, no editing payoff.
+- *Named shell buffers + popup manager* — Emacs =my/shell-menu= with popper-style popups; james's =C-x j= real-shell drop covers most of the need.
+- *Rainbow color overlays* — Emacs =my/rainbow-mode=; needs rendering-layer support beyond current styles.
+- *Org publish / RSS / picture tagging / gh-release* — genuinely useful in Emacs but too domain-specific for a mini editor.
