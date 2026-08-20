@@ -21,16 +21,51 @@ A plain =zig build= already produces a ReleaseSmall, stripped binary (james is m
 
 * Cross-compiling
 
-No extra toolchains, no Docker. Confirmed working targets:
+No extra toolchains, no Docker. Everything happens from one host via =build.sh=, the one-stop wrapper around the =zig build -Dtarget=...= lines (a raw Zig triple also works: =-t x86_64-linux-gnu=):
 
 #+begin_src sh
-zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSmall
-zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSmall
-zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSmall
-zig build   # native, already ReleaseSmall and stripped
+./build.sh -t windows        # x86_64-windows
+./build.sh -t windows32      # x86-windows (32-bit — XP and later)
+./build.sh -t macos          # aarch64-macos
+./build.sh -t intel-macos    # x86_64-macos
+./build.sh -t linux          # x86_64-linux-musl (statically linked)
+./build.sh -t linux32        # x86-linux-musl (32-bit, statically linked)
+./build.sh -t aarch64-linux  # aarch64-linux-musl (statically linked)
+./build.sh -t freebsd        # x86_64-freebsd
+./build.sh -t freebsd32      # x86-freebsd (32-bit)
+./build.sh -t all            # every target in one go
+./build.sh                   # native, already ReleaseSmall and stripped
 #+end_src
 
-Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes to its own folder (=zig-out/windows/=, =zig-out/macos/=, =zig-out/linux/=) so it never overwrites the native binary — running one of those on the wrong host fails with an "exec format error". Use =-p some/dir= to override the output folder.
+Binaries land in =zig-out/bin/= for native builds; a cross-compiled preset goes to its own folder (=zig-out/windows/=, =zig-out/macos/=, ...) so it never overwrites the native binary — running one of those on the wrong host fails with an "exec format error". Use =-p some/dir= to override the output folder.
+
+The 32-bit Linux build is compiled for a baseline i386 and statically linked against musl, so it runs on *any* 32-bit x86 distro that has a terminal — a 2009 openSUSE 11.2 (i586), an old Debian, a rescue LiveCD — since there is no glibc or library dependency to mismatch, and nothing newer than the kernel's own syscalls is required. 32-bit Windows is a PE32 console exe that runs unchanged from Windows XP up.
+
+** Portable release set (=dist=)
+
+=./build.sh -t dist= builds the full portable set — the set to carry on a stick — into =dist/=: one archive per (OS, arch) for the targets below (the Linux pair statically linked against musl, the Windows pairs carrying the =james.lnk=), each archived happily enough, plus a =SHA256SUMS= file to verify the copies. By default only the archives (and the checksum file) survive in =dist/=; pass =--keep= to also keep the staged folders the archives were built from:
+
+#+begin_src sh
+./build.sh -t dist        # dist/ has the archives + SHA256SUMS only
+./build.sh -t dist -k     # ... plus the dist/james-<version>-<label>/ folders
+#+end_src
+
+#+begin_src sh
+dist/james-0.82.0-windows-x86_64.zip
+dist/james-0.82.0-windows-x86.zip
+dist/james-0.82.0-macos-aarch64.tar.gz
+dist/james-0.82.0-macos-x86_64.tar.gz
+dist/james-0.82.0-linux-x86_64.tar.gz
+dist/james-0.82.0-linux-x86.tar.gz
+dist/james-0.82.0-linux-aarch64.tar.gz
+dist/james-0.82.0-freebsd-x86_64.tar.gz
+dist/james-0.82.0-freebsd-x86.tar.gz
+dist/SHA256SUMS
+#+end_src
+
+The folder name carries the version parsed from the newest =CHANGELOG.org= heading. macOS binaries are ad-hoc codesigned (=$ codesign --force --deep -s -$=) when the build host is macOS, so Gatekeeper is quieter when the binary is shared.
+
+A GitHub Action (=.github/workflows/release.yml=) does all of this automatically: push a =v<version>= tag — matching the newest =CHANGELOG.org= heading — and it builds the full set on a Linux runner, attaches the archives and =SHA256SUMS= to the release for that tag, and updates them on re-push. It can also be run by hand from the Actions tab (which creates the release for the changelog version). The workflow's Zig cache is persisted between runs, so re-releases only recompile what changed.
 
 * Pinning to the Windows taskbar
 

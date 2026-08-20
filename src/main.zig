@@ -2400,9 +2400,9 @@ fn drawHLine(win: vaxis.Window, col: u16, row: u16, width: u16) void {
 // suspended with C-z, which brings the editor back with the shell still
 // stopped — C-x j then resumes that same session.
 
-// Zig 0.16's std.c has no tcsetpgrp/tcgetpgrp bindings on darwin; libc
-// does. Only called from the macOS paths (Linux uses std.posix, which
-// goes through raw syscalls).
+// Zig 0.16's std.c has no tcsetpgrp/tcgetpgrp bindings on darwin or the
+// BSDs; libc does. Only called from those paths (Linux uses std.posix,
+// which goes through raw syscalls).
 extern "c" fn tcsetpgrp(fd: c_int, pgrp: c_int) c_int;
 extern "c" fn tcgetpgrp(fd: c_int) c_int;
 
@@ -2445,8 +2445,8 @@ fn shellWait(pid: std.posix.pid_t) ShellWait {
 /// shell's exec, so nothing leaks into it.
 fn setForeground(tty: *vaxis.Tty, pgrp: std.posix.pid_t) void {
     if (comptime builtin.os.tag == .windows) return;
-    if (comptime builtin.os.tag == .macos) {
-        // Zig 0.16's std.c has no tcsetpgrp binding on darwin; libc does.
+    if (comptime builtin.os.tag == .macos or builtin.os.tag == .freebsd) {
+        // Zig 0.16's std.c has no tcsetpgrp binding on darwin/BSD; libc does.
         _ = tcsetpgrp(tty.fd.handle, pgrp);
         return;
     }
@@ -2463,7 +2463,7 @@ fn setForeground(tty: *vaxis.Tty, pgrp: std.posix.pid_t) void {
 /// can hand the terminal back to it.
 fn shellForegroundPgrp(tty: *vaxis.Tty) ?std.posix.pid_t {
     if (comptime builtin.os.tag == .windows) return null;
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime builtin.os.tag == .macos or builtin.os.tag == .freebsd) {
         const pgrp = tcgetpgrp(tty.fd.handle);
         if (pgrp == -1) return null;
         return pgrp;
@@ -10033,7 +10033,7 @@ pub fn main(init: std.process.Init) !void {
             // it, so the spinner always ticks.
             const now = std.Io.Clock.now(.real, io).nanoseconds;
             const elapsed_ms: u64 = @intCast(@max(now - run.started, 0) / 1_000_000);
-            const frame = "|/-\\"[@mod(@divTrunc(elapsed_ms, 120), 4)];
+            const frame = "|/-\\"[@as(usize, @intCast(@mod(@divTrunc(elapsed_ms, 120), 4)))];
             const count = run.lines.load(.acquire);
             const n: ?[]const u8 = if (run.kind == .copy)
                 (std.fmt.bufPrint(&status_buf, "{c} {s}: {s} — {d}/{d} entr{s}, {d}.{d:0>1}s", .{
