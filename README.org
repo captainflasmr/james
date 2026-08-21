@@ -220,10 +220,6 @@ Open buffers live in =main.zig= as =std.ArrayList(*Buffer)= — a list of *point
 
 * Roadmap
 
-Ideas for james, drawn from the author's Emacs configs (=~/.emacs.d/Emacs-vanilla= and =~/.emacs.d/Emacs-DIYer=): features that see real daily use in Emacs and would slot into james's architecture — the platform-facing layer already shells out to external tools (ripgrep, =xdg-open=, =wl-paste= / =xsel=), so anything that runs a command and shows the output fits the existing =runCapture= / results-buffer pattern.
-
-TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =todo.org= keeps the worklog.
-
 ** Near term
 
 ** Medium term
