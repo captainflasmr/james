@@ -71,24 +71,6 @@ The folder name carries the version parsed from the newest =CHANGELOG.org= headi
 
 A GitHub Action (=.github/workflows/release.yml=) does all of this automatically: push a =v<version>= tag — matching the newest =CHANGELOG.org= heading — and it builds the full set on a Linux runner, attaches the archives and =SHA256SUMS= to the release for that tag, and updates them on re-push. It can also be run by hand from the Actions tab (which creates the release for the changelog version). The workflow's Zig cache is persisted between runs, so re-releases only recompile what changed.
 
-* Pinning to the Windows taskbar
-
-Windows groups taskbar buttons by an =AppUserModelID=: a string the running process reports, and that a pinned =.lnk= shortcut can carry. When the two don't match, launching a pinned terminal app spawns a *separate* button at the end of the taskbar (a =cmd.exe= button, since the console host is what Windows sees) instead of grouping under the pinned one — so =Super+1= / =Super+2= / =...= no longer activates it. james fixes both sides: the binary calls =SetCurrentProcessExplicitAppUserModelID(L"JamesDyer.James")= at the top of =main()= (in =src/main.zig=, gated on =builtin.os.tag == .windows=) before anything creates a window, and the build generates a =james.lnk= shortcut with that same ID already baked into its property store — no PowerShell, no COM, no access-denied from read-only VM shared folders.
-
-The =.lnk= is produced by =tools/make-lnk.zig=, a host-side Zig tool that writes the MS-SHLLINK binary directly (a =PropertyStoreDataBlock= with the =AppUserModel_ID= key). =build.sh= runs it automatically after a Windows cross-compile:
-
-#+begin_src sh
-./build.sh -t windows     # -> zig-out/windows/bin/james.exe + james.lnk
-#+end_src
-
-Or manually:
-
-#+begin_src sh
-zig run tools/make-lnk.zig -- james.lnk [target=james.exe] [icon=target] [appid=JamesDyer.James]
-#+end_src
-
-The =.lnk= uses a relative target path (=james.exe=), so it resolves wherever the two files are copied together — copy both to the same directory on Windows, pin =james.lnk= to the taskbar, and launching it groups the running button under the pinned one with =Super+N= activating it. To use a custom icon, set the =icon= argument to an =.ico= path (the =.lnk= and =.ico= must travel together); to change the AppID, pass the same string to =make-lnk= and update the literal in =src/main.zig= so the two sides match.
-
 * Current keybindings
 
 | Keys                 | Action                                                                                                                                                                |
@@ -238,10 +220,21 @@ Open buffers live in =main.zig= as =std.ArrayList(*Buffer)= — a list of *point
 
 * Roadmap
 
-1. +*Kill ring + yank*+ — done (=C-space=, =C-k=, =C-x C-k=, =M-w=, =C-y=). =Buffer.mark= is a plain snapshot, not a self-adjusting marker, so it can go stale if you edit the buffer between setting mark and using the region — acceptable for now, worth revisiting if it bites you.
-2. +*Undo*+ — done (=C-x u=), whole-buffer snapshots with same-kind coalescing. Adding redo would mean pushing undone states onto a second stack that gets cleared on any new edit — a natural follow-up, not done yet.
-3. +*Incremental search*+ — done (=C-s= / =C-r=). Search never crosses a line boundary and wraps around the buffer when it runs off either end. The =isearch_active= branch at the top of the key-dispatch loop in =main.zig= is the "mode" plumbing mentioned above — when =M-x= arrives, it's a second branch of the same shape, not a redesign.
-4. +Unsaved-changes confirmation on =C-x C-c=+ — done. A save that fails (disk full, permissions, etc.) is still silently swallowed either way, same as =C-x C-s= today — worth real error reporting eventually.
-5. +*Multiple buffers*+ — done (=C-x b=, =C-x C-f=). Every open buffer is its own heap-allocated =Buffer=; only the kill ring is shared. =C-x k= kills (closes) the current buffer — a modified file buffer asks first (y saves and kills, n kills without saving, =C-g= cancels), the last buffer is never killed, and any window that showed the killed buffer falls back to the next one.
-6. +*Directory browser (dired)*+ — done (=C-x d=). =src/Dired.zig= holds all directory state with no knowledge of the terminal or of buffers, the same split as =Buffer.zig=; =main.zig= just wires keys and rendering. =n= / =p= move, =^= goes to the parent, Enter opens a file (reusing the =C-x b= / =C-x C-f= open-or-switch path) or descends into a directory, =C-g= / =q= leaves. =m= marks the entry under the cursor and steps down, =u= unmarks one, =U= unmarks everything, =t= toggles the whole set (nothing marked marks everything, otherwise the marks invert), and =%= =m= (Emacs =dired-mark-files-regexp=) prompts for a regexp and marks every entry whose name matches it — the prompt takes a small strict-Emacs-syntax regexp (=^=, =$=, =.=, =[...]= classes, =*= =+= =?=, =\(...\)= groups and =\\|= alternation — a bare =(= =)= =|= is a literal, so names containing them match as-is — plus =\\d= =\\w= =\\s= and literal escapes), and the modeline reports how many were marked — marked entries show a =*= in column 0, and =C= copies, =R= renames (moves) and =D= deletes every marked entry at once — a copy or move runs in the background (=copying:= on the modeline with live progress, =C-g= cancels, and any open dired showing the source or destination directory refreshes when it lands; a rename across filesystems copies then deletes, like Emacs). Copy and rename each default to the directory of another dired window when one exists (Emacs =dired-dwim-target=): with a two-window split — a source dired on one side, a destination on the other — =C= or =R= then Enter copies or moves the marked entries (or the selected one, when nothing is marked) into the other pane's directory, whichever side holds the cursor. =+= creates a directory and =_= an empty file in the current directory (Emacs =dired-create-directory=), leaving the selection on the new entry. Entries sort with =..= first then case-insensitive; directories and files are interleaved (not grouped) and directories get a trailing =/=. =Dired.parentOf= doesn't canonicalise — once =dirname= can't go further up a relative path it just accumulates literal =..= components, which the OS resolves fine; it returns null only at the absolute filesystem root.
-7. Config: start with a plain keymap-override file, consider embedded Lua later if you want real elisp-like programmability.
+Ideas for james, drawn from the author's Emacs configs (=~/.emacs.d/Emacs-vanilla= and =~/.emacs.d/Emacs-DIYer=): features that see real daily use in Emacs and would slot into james's architecture — the platform-facing layer already shells out to external tools (ripgrep, =xdg-open=, =wl-paste= / =xsel=), so anything that runs a command and shows the output fits the existing =runCapture= / results-buffer pattern.
+
+TODO items from =todo.org= (=occur=, sticky keys) are folded into this list; =todo.org= keeps the worklog.
+
+** Near term
+
+** Medium term
+
+** Quick wins
+
+** Deferred
+
+- *Go-to-definition (M-.)* — Emacs has the xref memoization + live-preview stack and etags for C-family code; james would need a dumb rg/etags-based index. Valuable for a coder's editor, but the largest item here.
+- *Folding* — Emacs =my/selective-display-fold= folds by indentation; james has no folding at all.
+- *Centered buffer* — Emacs =my/center-buffer-mode= (olivetti-style margins); aesthetic, no editing payoff.
+- *Named shell buffers + popup manager* — Emacs =my/shell-menu= with popper-style popups; james's =C-x j= real-shell drop covers most of the need.
+- *Rainbow color overlays* — Emacs =my/rainbow-mode=; needs rendering-layer support beyond current styles.
+- *Org publish / RSS / picture tagging / gh-release* — genuinely useful in Emacs but too domain-specific for a mini editor.
