@@ -3,6 +3,10 @@
 #+options: ':t toc:nil num:nil
 #+startup: showall
 
+#+attr_org: :width 300px
+#+attr_html: :width 100%
+[[file:img/james-banner.jpg]]
+
 A very minimal, Emacs/MicroEmacs-inspired text editor, written in Zig on top of [[https://github.com/rockorager/libvaxis][libvaxis]]. This is a starting point, not a finished editor — see Roadmap below.
 
 * Requirements
