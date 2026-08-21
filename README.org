@@ -9,6 +9,10 @@
 
 A very minimal, Emacs/MicroEmacs-inspired text editor, written in Zig on top of [[https://github.com/rockorager/libvaxis][libvaxis]]. This is a starting point, not a finished editor — see Roadmap below.
 
+#+attr_org: :width 300px
+#+attr_html: :width 100%
+[[file:img/james-screen-recording_001.gif]]
+
 * Requirements
 
 - Zig *0.16.0* exactly (pinned in =build.zig.zon=; libvaxis tracks this version closely and older/newer Zig will likely fail to compile it)
@@ -221,6 +225,8 @@ Open buffers live in =main.zig= as =std.ArrayList(*Buffer)= — a list of *point
 * Roadmap
 
 ** Near term
+
+*** TODO Add some kind of testing framework
 
 ** Medium term
 
