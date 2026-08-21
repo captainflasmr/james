@@ -13,3 +13,5 @@ dist/
 # OS cruft
 .DS_Store
 Thumbs.db
+
+scratch.txt
